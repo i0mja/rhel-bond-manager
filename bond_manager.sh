@@ -13,7 +13,7 @@ shopt -s nullglob
 VERSION="1.0.0"
 LOG_FILE="/var/log/bond_manager.log"
 BACKUP_DIR="/var/backups/bond_manager"
-BACKUP_PREFIX="conn-$(date +%Y%m%d_%H%M%S)"
+BACKUP_PREFIX="conn"  # timestamp appended in backup_configs
 TIMEOUT=15
 MAX_RETRIES=2
 BOND_MODES=("balance-rr" "active-backup" "balance-xor" "broadcast" "802.3ad" "balance-tlb" "balance-alb")
@@ -79,7 +79,9 @@ log() {
 
 # Backup NetworkManager configs
 backup_configs() {
-    local backup_file="$BACKUP_DIR/$BACKUP_PREFIX.tar.gz"
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_file="$BACKUP_DIR/${BACKUP_PREFIX}-${timestamp}.tar.gz"
     log "Backing up NetworkManager configs to $backup_file"
     tar -czf "$backup_file" /etc/NetworkManager/system-connections/ 2>/dev/null || {
         log "Warning: Backup failed"
