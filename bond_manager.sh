@@ -869,8 +869,9 @@ repair_bond() {
         echo "Dry run complete"
         return 0
     fi
-    if nmcli con up "$bond_nametx
+    if nmcli con up "$bond_name" &>>"$LOG_FILE"; then
         echo "Bond $bond_name repaired and activated"
+        log "Bond $bond_name repaired and activated"
         echo "Bond $bond_name repaired successfully"
     else
         log "Failed to activate bond $bond_name"
