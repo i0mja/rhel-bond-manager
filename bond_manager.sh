@@ -184,6 +184,7 @@ display_nics() {
                 break
             fi
         done
+        local IFS=' '
         read -r speed status < <(get_nic_info "${nics[$i]}")
         printf "%d) %s (%s, %s)%s\n" $((i+1)) "${nics[$i]}" "$speed" "$status" "$slave_mark"
     done
