@@ -240,7 +240,7 @@ read_input() {
         /bin/echo -n "$prompt" >&2
         if read -t $TIMEOUT -r input < /dev/tty 2>/dev/null; then
             # Sanitize input
-            input=$(echo "$input" | tr -d '\r\n' | sed 's/[^a-zA-Z0-9._\- ]//g')
+            input=$(echo "$input" | tr -d '\r\n' | sed 's/[^a-zA-Z0-9._ -]//g')
             if [[ -n "$input" ]]; then
                 eval "$var_name='$input'"
                 return 0
