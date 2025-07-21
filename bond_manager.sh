@@ -111,39 +111,50 @@ rollback() {
 # Get available Ethernet NICs
 get_available_nics() {
     local nics=()
+    local enslaved_nics=()
     local exclude_nics=()
-    # Get enslaved NICs
+
+    # Collect NICs currently enslaved in bonds
     for bond in /proc/net/bonding/*; do
         if [[ -f "$bond" ]]; then
             while IFS= read -r line; do
-                if [[ "$line" =~ ^Slave\ Interface:\ (.*)$ ]]; then
-                    exclude_nics+=("${BASH_REMATCH[1]}")
+                if [[ $line =~ ^Slave\ Interface:\ (.*)$ ]]; then
+                    enslaved_nics+=("${BASH_REMATCH[1]}")
                 fi
             done < "$bond"
         fi
     done
-    # Get NICs with standalone connections
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^([^:]+):.*type\ ethernet ]]; then
-            exclude_nics+=("${BASH_REMATCH[1]}")
+
+    # Collect active standalone Ethernet interfaces
+    while IFS=: read -r dev type; do
+        if [[ $type == "ethernet" ]]; then
+            local is_slave=0
+            for slave in "${enslaved_nics[@]}"; do
+                if [[ $dev == "$slave" ]]; then
+                    is_slave=1
+                    break
+                fi
+            done
+            [[ $is_slave -eq 0 ]] && exclude_nics+=("$dev")
         fi
-    done < <(nmcli -t -f NAME,TYPE con show --active)
-    # Get all Ethernet NICs
+    done < <(nmcli -t -f DEVICE,TYPE connection show --active)
+
+    # Parse all Ethernet interfaces from ip -o link show
     while IFS= read -r line; do
-        if [[ "$line" =~ ^([0-9]+):\ (en|eth|ens|eno)[^:]+ ]]; then
-            local nic="${BASH_REMATCH[2]}${line#*: }"
-            nic=${nic%%:*} # Remove trailing colon and beyond
-            # Exclude enslaved or connected NICs
+        if [[ $line =~ ^[0-9]+:\s+(\S+): ]]; then
+            local nic="${BASH_REMATCH[1]}"
+            [[ $nic =~ ^(en|eth|ens|eno).* ]] || continue
             local skip=0
-            for exclude in "${exclude_nics[@]}"; do
-                if [[ "$nic" == "$exclude" ]]; then
+            for exclude in "${enslaved_nics[@]}" "${exclude_nics[@]}"; do
+                if [[ $nic == "$exclude" ]]; then
                     skip=1
                     break
                 fi
             done
             [[ $skip -eq 0 ]] && nics+=("$nic")
         fi
-    done < <(ip link show)
+    done < <(ip -o link show)
+
     echo "${nics[@]}"
 }
 
