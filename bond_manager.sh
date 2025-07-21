@@ -328,6 +328,18 @@ validate_gateway() {
     return 1
 }
 
+# Retrieve current bonding mode. Works across NetworkManager versions.
+get_bond_mode() {
+    local bn=$1
+    local mode
+    mode=$(nmcli -t -f bond.mode con show "$bn" 2>/dev/null | cut -d: -f2)
+    if [[ -z "$mode" ]]; then
+        mode=$(nmcli -t -f bond.options con show "$bn" 2>/dev/null | \
+            grep -o 'mode=[^,]*' | cut -d= -f2)
+    fi
+    echo "$mode"
+}
+
 # Create bond
 create_bond() {
     local bond_name mode vlan ipv4 ipv6 gateway primary_nic
@@ -553,7 +565,7 @@ edit_bond() {
     fi
     bond_name=${bonds[$((bond_num-1))]}
     echo "Editing bond $bond_name"
-    echo "Select bonding mode (current: $(nmcli -t -f bond.mode con show "$bond_name" | cut -d: -f2)):"
+    echo "Select bonding mode (current: $(get_bond_mode "$bond_name")):"
     for i in "${!BOND_MODES[@]}"; do
         printf "%d) %s\n" $((i+1)) "${BOND_MODES[$i]}"
     done
@@ -632,7 +644,8 @@ edit_bond() {
     fi
     backup_configs
     if [[ -n "$mode" ]]; then
-        local cmd=("nmcli" "con" "mod" "$bond_name" "bond.mode" "$mode")
+        # Use bond.options to set the bonding mode for better NM compatibility
+        local cmd=("nmcli" "con" "mod" "$bond_name" "bond.options" "mode=$mode")
         [[ -n "$primary_nic" ]] && cmd+=("bond.options" "primary=$primary_nic")
         if [[ "$DRY_RUN" == "true" ]]; then
             echo "${cmd[*]}"
@@ -921,7 +934,8 @@ repair_bond_10gb_ab() {
     fi
     bond_name=${bonds[$((bond_num-1))]}
     backup_configs
-    local mode_cmd=("nmcli" "con" "mod" "$bond_name" "bond.mode" "active-backup")
+    # Set the bonding mode explicitly using bond.options for broader compatibility
+    local mode_cmd=("nmcli" "con" "mod" "$bond_name" "bond.options" "mode=active-backup")
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "${mode_cmd[*]}"
     else
@@ -1245,7 +1259,7 @@ ten_gb_migration() {
         return 0
     fi
     backup_configs
-    local mode=$(nmcli -t -f bond.mode con show "$old_bond" | cut -d: -f2)
+    local mode=$(get_bond_mode "$old_bond")
     local vlan=$(nmcli -t -f 802-3-ethernet.vlan con show "$old_bond" | cut -d: -f2)
     local ipv4=$(nmcli -t -f ipv4.addresses con show "$old_bond" | cut -d: -f2)
     local gateway=$(nmcli -t -f ipv4.gateway con show "$old_bond" | cut -d: -f2)
