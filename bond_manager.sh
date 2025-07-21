@@ -897,6 +897,94 @@ repair_bond() {
     fi
 }
 
+# Repair bond (10Gb Active-Backup)
+repair_bond_10gb_ab() {
+    local bond_name
+    clear_screen
+    echo "Repair Bond (10Gb Active-Backup)"
+    local bonds=()
+    mapfile -t bonds < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="bond"{print $1}')
+    if [[ ${#bonds[@]} -eq 0 ]]; then
+        echo "No bonds found" >&2
+        return 1
+    fi
+    echo "Available bonds:"
+    for i in "${!bonds[@]}"; do
+        printf "%d) %s\n" $((i+1)) "${bonds[$i]}"
+    done
+    if ! read_input "Enter bond number to repair (1-${#bonds[@]}): " bond_num; then
+        return 1
+    fi
+    if [[ ! "$bond_num" =~ ^[0-9]+$ ]] || ((bond_num < 1 || bond_num > ${#bonds[@]})); then
+        echo "Error: Invalid bond number" >&2
+        return 1
+    fi
+    bond_name=${bonds[$((bond_num-1))]}
+    backup_configs
+    local mode_cmd=("nmcli" "con" "mod" "$bond_name" "bond.mode" "active-backup")
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "${mode_cmd[*]}"
+    else
+        if "${mode_cmd[@]}" &>>"$LOG_FILE"; then
+            log "Set bond $bond_name to active-backup"
+        else
+            log "Failed to set bond $bond_name to active-backup"
+            echo "Error: Failed to set bond mode" >&2
+            rollback
+            return 1
+        fi
+    fi
+    local slaves=()
+    if [[ -f "/proc/net/bonding/$bond_name" ]]; then
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^Slave\ Interface:\ (.*)$ ]]; then
+                slaves+=("${BASH_REMATCH[1]}")
+            fi
+        done < "/proc/net/bonding/$bond_name"
+    fi
+    for slave in "${slaves[@]}"; do
+        if ! ethtool "$slave" 2>/dev/null | grep -q "Speed: 10000Mb/s"; then
+            echo "Skipping $slave: not 10Gb" >&2
+            continue
+        fi
+        if ! nmcli con show | grep -q "ethernet.*$bond_name.*$slave"; then
+            local slave_cmd=("nmcli" "con" "add" "type" "ethernet" "ifname" "$slave" "master" "$bond_name")
+            if [[ "$DRY_RUN" == "true" ]]; then
+                echo "${slave_cmd[*]}"
+            else
+                if "${slave_cmd[@]}" &>>"$LOG_FILE"; then
+                    log "Re-added slave $slave to bond $bond_name"
+                else
+                    log "Failed to re-add slave $slave to bond $bond_name"
+                    echo "Error: Failed to re-add slave $slave" >&2
+                    rollback
+                    return 1
+                fi
+            fi
+        fi
+        if [[ "$DRY_RUN" != "true" ]]; then
+            nmcli con up "$slave" &>>"$LOG_FILE" || {
+                log "Failed to bring up slave $slave"
+                echo "Warning: Failed to bring up slave $slave" >&2
+            }
+        fi
+    done
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "Dry run complete"
+        return 0
+    fi
+    if nmcli con up "$bond_name" &>>"$LOG_FILE"; then
+        echo "Bond $bond_name repaired and activated"
+        log "Bond $bond_name repaired and activated"
+        echo "Bond $bond_name repaired successfully"
+    else
+        log "Failed to activate bond $bond_name"
+        echo "Error: Failed to activate bond" >&2
+        rollback
+        return 1
+    fi
+}
+
 # Diagnose bond
 diagnose_bond() {
     local bond_name
@@ -1308,13 +1396,14 @@ main_menu() {
         echo "1) Switch migration helper"
         echo "2) 10Gb migration wizard"
         echo "3) Repair bond"
-        echo "4) Diagnose bond"
-        echo "5) Extended diagnostics"
-        echo "6) Create bond"
-        echo "7) Edit bond"
-        echo "8) Remove bond"
-        echo "9) Show version"
-        echo "10) Exit"
+        echo "4) Repair bond (10GB A/B)"
+        echo "5) Diagnose bond"
+        echo "6) Extended diagnostics"
+        echo "7) Create bond"
+        echo "8) Edit bond"
+        echo "9) Remove bond"
+        echo "10) Show version"
+        echo "11) Exit"
         if ! read_input "Select an option: " option; then
             continue
         fi
@@ -1332,25 +1421,28 @@ main_menu() {
                 repair_bond
                 ;;
             4)
-                diagnose_bond
+                repair_bond_10gb_ab
                 ;;
             5)
-                extended_diagnostics
+                diagnose_bond
                 ;;
             6)
-                create_bond
+                extended_diagnostics
                 ;;
             7)
-                edit_bond
+                create_bond
                 ;;
             8)
-                remove_bond
+                edit_bond
                 ;;
             9)
+                remove_bond
+                ;;
+            10)
                 clear_screen
                 echo "Bond Manager v$VERSION"
                 ;;
-            10)
+            11)
                 clear_screen
                 exit 0
                 ;;
