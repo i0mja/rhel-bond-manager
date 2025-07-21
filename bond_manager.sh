@@ -491,7 +491,8 @@ edit_bond() {
     local nics=()
     clear
     echo "Edit Bond"
-    local bonds=($(nmcli -t -f NAME con show | grep bond))
+    local bonds=()
+    mapfile -t bonds < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="bond"{print $1}')
     if [[ ${#bonds[@]} -eq 0 ]]; then
         echo "No bonds found" >&2
         return 1
@@ -724,7 +725,8 @@ remove_bond() {
     local bond_name
     clear
     echo "Remove Bond"
-    local bonds=($(nmcli -t -f NAME con show | grep bond))
+    local bonds=()
+    mapfile -t bonds < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="bond"{print $1}')
     if [[ ${#bonds[@]} -eq 0 ]]; then
         echo "No bonds found" >&2
         return 1
@@ -786,7 +788,8 @@ repair_bond() {
     local bond_name
     clear
     echo "Repair Bond"
-    local bonds=($(nmcli -t -f NAME con show | grep bond))
+    local bonds=()
+    mapfile -t bonds < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="bond"{print $1}')
     if [[ ${#bonds[@]} -eq 0 ]]; then
         echo "No bonds found" >&2
         return 1
@@ -855,7 +858,8 @@ diagnose_bond() {
     local bond_name
     clear
     echo "Diagnose Bond"
-    local bonds=($(nmcli -t -f NAME con show | grep bond))
+    local bonds=()
+    mapfile -t bonds < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="bond"{print $1}')
     if [[ ${#bonds[@]} -eq 0 ]]; then
         echo "No bonds found" >&2
         return 1
@@ -894,7 +898,8 @@ switch_migration() {
     local bond_name new_nics=()
     clear
     echo "Switch Migration Helper"
-    local bonds=($(nmcli -t -f NAME con show | grep bond))
+    local bonds=()
+    mapfile -t bonds < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="bond"{print $1}')
     if [[ ${#bonds[@]} -eq 0 ]]; then
         echo "No bonds found" >&2
         return 1
@@ -1003,7 +1008,8 @@ ten_gb_migration() {
     local old_bond new_bond new_nics=()
     clear
     echo "10Gb Migration Wizard"
-    local bonds=($(nmcli -t -f NAME con show | grep bond))
+    local bonds=()
+    mapfile -t bonds < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="bond"{print $1}')
     if [[ ${#bonds[@]} -eq 0 ]]; then
         echo "No bonds found" >&2
         return 1
