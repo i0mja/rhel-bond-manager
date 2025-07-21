@@ -1,4 +1,3 @@
-
 #!/bin/bash
 
 # Network Manager Bond Script v1.0.0
@@ -106,13 +105,16 @@ backup_configs() {
 
 # Rollback to last backup
 rollback() {
-    local last_backup
-    last_backup=$(ls -t "$BACKUP_DIR"/conn-*.tar.gz 2>/dev/null | head -n1)
-    if [[ -z "$last_backup" ]]; then
+    trap - ERR  # prevent recursive trap
+    local backups=("$BACKUP_DIR"/conn-*.tar.gz)
+    if (( ${#backups[@]} == 0 )); then
         log "Rollback failed: No backups found"
         echo "Error: No backups available for rollback" >&2
+        trap rollback ERR
         return 1
     fi
+    local last_backup
+    last_backup=$(ls -t "${backups[@]}" 2>/dev/null | head -n1)
     log "Restoring from $last_backup"
     if tar -xzf "$last_backup" -C /etc/NetworkManager/system-connections/; then
         nmcli con reload
@@ -121,8 +123,10 @@ rollback() {
     else
         log "Rollback failed"
         echo "Error: Rollback failed" >&2
+        trap rollback ERR
         return 1
     fi
+    trap rollback ERR
 }
 
 # Remove temporary files and reset state
