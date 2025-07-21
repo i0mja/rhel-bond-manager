@@ -1186,7 +1186,7 @@ main_menu() {
     DEBUG=false
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --dry-run)
+            -n|--dry-run)
                 DRY_RUN=true
                 shift
                 ;;
@@ -1195,8 +1195,8 @@ main_menu() {
                 shift
                 ;;
             --help)
-                echo "Usage: $0 [--dry-run] [--debug] [--help]"
-                echo "  --dry-run: Echo commands without executing"
+                echo "Usage: $0 [-n|--dry-run] [--debug] [--help]"
+                echo "  -n, --dry-run: Echo commands without executing"
                 echo "  --debug: Enable verbose output"
                 echo "  --help: Show this help message"
                 exit 0
