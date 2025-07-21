@@ -889,6 +889,49 @@ diagnose_bond() {
     done
 }
 
+# Extended diagnostics
+extended_diagnostics() {
+    local bond_name
+    clear
+    echo "Extended Diagnostics"
+    local bonds=$(nmcli -t -f NAME con show | grep bond)
+    if [[ -z "$bonds" ]]; then
+        echo "No bonds found" >&2
+        return 1
+    fi
+    bonds=( $bonds )
+    echo "Available bonds:"
+    for i in "${!bonds[@]}"; do
+        printf "%d) %s\n" $((i+1)) "${bonds[$i]}"
+    done
+    if ! read_input "Enter bond number for diagnostics (1-${#bonds[@]}): " bond_num; then
+        return 1
+    fi
+    if [[ ! "$bond_num" =~ ^[0-9]+$ ]] || ((bond_num < 1 || bond_num > ${#bonds[@]})); then
+        echo "Error: Invalid bond number" >&2
+        return 1
+    fi
+    bond_name=${bonds[$((bond_num-1))]}
+    echo "Bond Status for $bond_name:"
+    [[ -f "/proc/net/bonding/$bond_name" ]] && cat "/proc/net/bonding/$bond_name"
+    local slaves=$(nmcli -t -f NAME con show | grep "ethernet.*$bond_name")
+    slaves=( $slaves )
+    local gw=$(ip route show default | awk '/default/ {print $3; exit}')
+    for slave in "${slaves[@]}"; do
+        local nic=$(nmcli -t -f connection.interface-name con show "$slave" | cut -d: -f2)
+        echo ""
+        echo "Interface $nic:"
+        ethtool "$nic" 2>/dev/null | grep -E "Speed|Duplex|Port|Link detected"
+        if [[ -f "/sys/class/net/$nic/carrier" ]]; then
+            [[ $(cat "/sys/class/net/$nic/carrier") == "1" ]] && echo "Carrier: on" || echo "Carrier: off"
+        fi
+        local target="$gw"
+        [[ -z "$target" ]] && target="8.8.8.8"
+        echo "Latency test to $target via $nic:"
+        ping -I "$nic" -c 3 -w 5 "$target" | tail -n 2
+    done
+}
+
 # Switch migration
 switch_migration() {
     local bond_name new_nics=()
@@ -1242,7 +1285,7 @@ main_menu() {
                 diagnose_bond
                 ;;
             5)
-                diagnose_bond
+                extended_diagnostics
                 ;;
             6)
                 create_bond
