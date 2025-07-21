@@ -17,6 +17,11 @@ BACKUP_PREFIX="conn"  # timestamp appended in backup_configs
 TIMEOUT=15
 MAX_RETRIES=2
 BOND_MODES=("balance-rr" "active-backup" "balance-xor" "broadcast" "802.3ad" "balance-tlb" "balance-alb")
+TEMP_FILES=()
+
+# Set traps early
+trap cleanup EXIT
+trap rollback ERR
 
 # Ensure script runs as root
 if [[ $EUID -ne 0 ]]; then
@@ -108,6 +113,16 @@ rollback() {
         echo "Error: Rollback failed" >&2
         return 1
     fi
+}
+
+# Remove temporary files and reset state
+cleanup() {
+    set +x
+    for tmp in "${TEMP_FILES[@]}"; do
+        [[ -f "$tmp" ]] && rm -f "$tmp"
+    done
+    stty sane 2>/dev/null
+    tput init 2>/dev/null
 }
 
 # Get available Ethernet NICs
