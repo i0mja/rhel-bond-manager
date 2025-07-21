@@ -36,20 +36,21 @@ if [[ ! -t 0 ]]; then
 fi
 
 # Initialize terminal settings
-export TERM=xterm
-stty sane 2>/dev/null
-tput init 2>/dev/null
+export TERM=${TERM:-xterm}
+if command -v stty >/dev/null; then
+    stty sane 2>/dev/null
+fi
 
 # Log terminal settings for debugging
 {
     echo "=== Terminal Settings ==="
     echo "TERM=$TERM"
-    stty -a
+    command -v stty >/dev/null && stty -a
     echo "================="
 } >> "$LOG_FILE" 2>/dev/null
 
 # Check required commands
-REQUIRED_CMDS=("nmcli" "ip" "awk" "sed" "tar" "ping" "ethtool" "stdbuf" "tput")
+REQUIRED_CMDS=("nmcli" "ip" "awk" "sed" "tar" "ping" "ethtool")
 for cmd in "${REQUIRED_CMDS[@]}"; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "Error: Required command '$cmd' not found" >&2
@@ -80,6 +81,15 @@ log() {
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$timestamp] $*" >> "$LOG_FILE"
+}
+
+# Portable screen clear
+clear_screen() {
+    if command -v clear >/dev/null; then
+        clear
+    else
+        printf '\033[H\033[2J'
+    fi
 }
 
 # Backup NetworkManager configs
@@ -306,7 +316,7 @@ validate_gateway() {
 create_bond() {
     local bond_name mode vlan ipv4 ipv6 gateway primary_nic
     local nics=()
-    clear
+    clear_screen
     echo "Create Bond"
     if ! read_input "Enter bond name (e.g., bond0): " bond_name; then
         return 1
@@ -506,7 +516,7 @@ create_bond() {
 edit_bond() {
     local bond_name mode vlan ipv4 ipv6 gateway primary_nic
     local nics=()
-    clear
+    clear_screen
     echo "Edit Bond"
     local bonds=()
     mapfile -t bonds < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="bond"{print $1}')
@@ -740,7 +750,7 @@ edit_bond() {
 # Remove bond
 remove_bond() {
     local bond_name
-    clear
+    clear_screen
     echo "Remove Bond"
     local bonds=()
     mapfile -t bonds < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="bond"{print $1}')
@@ -803,7 +813,7 @@ remove_bond() {
 # Repair bond
 repair_bond() {
     local bond_name
-    clear
+    clear_screen
     echo "Repair Bond"
     local bonds=()
     mapfile -t bonds < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="bond"{print $1}')
@@ -873,7 +883,7 @@ repair_bond() {
 # Diagnose bond
 diagnose_bond() {
     local bond_name
-    clear
+    clear_screen
     echo "Diagnose Bond"
     local bonds=()
     mapfile -t bonds < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="bond"{print $1}')
@@ -913,7 +923,7 @@ diagnose_bond() {
 # Switch migration
 switch_migration() {
     local bond_name new_nics=()
-    clear
+    clear_screen
     echo "Switch Migration Helper"
     local bonds=()
     mapfile -t bonds < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="bond"{print $1}')
@@ -1023,7 +1033,7 @@ switch_migration() {
 # 10Gb migration wizard
 ten_gb_migration() {
     local old_bond new_bond new_nics=()
-    clear
+    clear_screen
     echo "10Gb Migration Wizard"
     local bonds=()
     mapfile -t bonds < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="bond"{print $1}')
@@ -1232,19 +1242,19 @@ main_menu() {
     done
     [[ "$DEBUG" == "true" ]] && set -x
     while true; do
-        clear
-        stdbuf -oL echo "Bond Manager v$VERSION"
-        stdbuf -oL echo "0) Rollback last change"
-        stdbuf -oL echo "1) Switch migration helper"
-        stdbuf -oL echo "2) 10Gb migration wizard"
-        stdbuf -oL echo "3) Repair bond"
-        stdbuf -oL echo "4) Diagnose bond"
-        stdbuf -oL echo "5) Extended diagnostics"
-        stdbuf -oL echo "6) Create bond"
-        stdbuf -oL echo "7) Edit bond"
-        stdbuf -oL echo "8) Remove bond"
-        stdbuf -oL echo "9) Show version"
-        stdbuf -oL echo "10) Exit"
+        clear_screen
+        echo "Bond Manager v$VERSION"
+        echo "0) Rollback last change"
+        echo "1) Switch migration helper"
+        echo "2) 10Gb migration wizard"
+        echo "3) Repair bond"
+        echo "4) Diagnose bond"
+        echo "5) Extended diagnostics"
+        echo "6) Create bond"
+        echo "7) Edit bond"
+        echo "8) Remove bond"
+        echo "9) Show version"
+        echo "10) Exit"
         if ! read_input "Select an option: " option; then
             continue
         fi
@@ -1277,11 +1287,11 @@ main_menu() {
                 remove_bond
                 ;;
             9)
-                clear
+                clear_screen
                 echo "Bond Manager v$VERSION"
                 ;;
             10)
-                clear
+                clear_screen
                 exit 0
                 ;;
             *)
