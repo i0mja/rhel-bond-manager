@@ -18,15 +18,39 @@ TIMEOUT=15
 MAX_RETRIES=2
 BOND_MODES=("balance-rr" "active-backup" "balance-xor" "broadcast" "802.3ad" "balance-tlb" "balance-alb")
 
+# Color constants
+GREEN="$(tput setaf 2)"
+RED="$(tput setaf 1)"
+YELLOW="$(tput setaf 3)"
+CYAN="$(tput setaf 6)"
+RESET="$(tput sgr0)"
+
+# Output helpers
+info() {
+    echo -e "${GREEN}$*${RESET}"
+}
+
+warn() {
+    echo -e "${YELLOW}$*${RESET}" >&2
+}
+
+error_msg() {
+    echo -e "${RED}$*${RESET}" >&2
+}
+
+dry_run() {
+    echo -e "${CYAN}$*${RESET}"
+}
+
 # Ensure script runs as root
 if [[ $EUID -ne 0 ]]; then
-    echo "Error: This script must be run as root" >&2
+    error_msg "Error: This script must be run as root"
     exit 1
 fi
 
 # Check for interactive terminal
 if [[ ! -t 0 ]]; then
-    echo "Error: This script requires an interactive terminal" >&2
+    error_msg "Error: This script requires an interactive terminal"
     exit 1
 fi
 
@@ -47,7 +71,7 @@ tput init 2>/dev/null
 REQUIRED_CMDS=("nmcli" "ip" "awk" "sed" "tar" "ping" "ethtool" "stdbuf" "tput")
 for cmd in "${REQUIRED_CMDS[@]}"; do
     if ! command -v "$cmd" &>/dev/null; then
-        echo "Error: Required command '$cmd' not found" >&2
+        error_msg "Error: Required command '$cmd' not found"
         exit 1
     fi
 done
@@ -83,7 +107,7 @@ backup_configs() {
     log "Backing up NetworkManager configs to $backup_file"
     tar -czf "$backup_file" /etc/NetworkManager/system-connections/ 2>/dev/null || {
         log "Warning: Backup failed"
-        echo "Warning: Failed to create backup" >&2
+        warn "Warning: Failed to create backup"
     }
 }
 
@@ -93,17 +117,17 @@ rollback() {
     last_backup=$(ls -t "$BACKUP_DIR"/conn-*.tar.gz 2>/dev/null | head -n1)
     if [[ -z "$last_backup" ]]; then
         log "Rollback failed: No backups found"
-        echo "Error: No backups available for rollback" >&2
+        error_msg "Error: No backups available for rollback"
         return 1
     fi
     log "Restoring from $last_backup"
     if tar -xzf "$last_backup" -C /etc/NetworkManager/system-connections/; then
         nmcli con reload
         log "Rollback successful"
-        echo "Rollback successful"
+        info "Rollback successful"
     else
         log "Rollback failed"
-        echo "Error: Rollback failed" >&2
+        error_msg "Error: Rollback failed"
         return 1
     fi
 }
@@ -175,7 +199,7 @@ display_nics() {
             fi
         done < "/proc/net/bonding/$bond_name"
     fi
-    echo "Available NICs (select at least two for new bonds):"
+    info "Available NICs (select at least two for new bonds):"
     for i in "${!nics[@]}"; do
         local slave_mark=""
         for slave in "${slaves[@]}"; do
@@ -214,7 +238,7 @@ read_input() {
         fi
     done
     log "Input timed out after $MAX_RETRIES retries"
-    echo "Error: Input timed out" >&2
+    error_msg "Error: Input timed out"
     return 1
 }
 
@@ -222,7 +246,7 @@ read_input() {
 validate_bond_name() {
     local name=$1
     if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-        echo "Error: Bond name must be alphanumeric with hyphens or underscores" >&2
+        error_msg "Error: Bond name must be alphanumeric with hyphens or underscores"
         return 1
     fi
     return 0
@@ -235,7 +259,7 @@ validate_vlan_id() {
         return 0
     fi
     if [[ ! "$vlan" =~ ^[0-9]+$ ]] || ((vlan < 1 || vlan > 4094)); then
-        echo "Error: VLAN ID must be between 1 and 4094" >&2
+        error_msg "Error: VLAN ID must be between 1 and 4094"
         return 1
     fi
     return 0
@@ -268,7 +292,7 @@ validate_ip() {
         echo "$ip"
         return 0
     fi
-    echo "Error: Invalid IP address format" >&2
+    error_msg "Error: Invalid IP address format"
     return 1
 }
 
@@ -281,7 +305,7 @@ validate_gateway() {
     if ping -c3 -W2 "$gw" &>/dev/null; then
         return 0
     fi
-    echo "Error: Gateway $gw is not reachable" >&2
+    error_msg "Error: Gateway $gw is not reachable"
     return 1
 }
 
@@ -290,14 +314,14 @@ create_bond() {
     local bond_name mode vlan ipv4 ipv6 gateway primary_nic
     local nics=()
     clear
-    echo "Create Bond"
+    info "Create Bond"
     if ! read_input "Enter bond name (e.g., bond0): " bond_name; then
         return 1
     fi
     if ! validate_bond_name "$bond_name"; then
         return 1
     fi
-    echo "Select bonding mode:"
+    info "Select bonding mode:"
     for i in "${!BOND_MODES[@]}"; do
         printf "%d) %s\n" $((i+1)) "${BOND_MODES[$i]}"
     done
@@ -305,13 +329,13 @@ create_bond() {
         return 1
     fi
     if [[ ! "$mode_num" =~ ^[0-9]+$ ]] || ((mode_num < 1 || mode_num > ${#BOND_MODES[@]})); then
-        echo "Error: Invalid mode number" >&2
+        error_msg "Error: Invalid mode number"
         return 1
     fi
     mode=${BOND_MODES[$((mode_num-1))]}
     local available_nics=($(get_available_nics))
     if [[ ${#available_nics[@]} -lt 2 ]]; then
-        echo "Error: At least two available NICs required" >&2
+        error_msg "Error: At least two available NICs required"
         return 1
     fi
     display_nics "" "${available_nics[@]}"
@@ -319,26 +343,26 @@ create_bond() {
         return 1
     fi
     if [[ "$nic_selection" == "q" || -z "$nic_selection" ]]; then
-        echo "Bond creation cancelled"
+        info "Bond creation cancelled"
         return 0
     fi
     for num in $nic_selection; do
         if [[ ! "$num" =~ ^[0-9]+$ ]] || ((num < 1 || num > ${#available_nics[@]})); then
-            echo "Error: Invalid NIC number: $num" >&2
+            error_msg "Error: Invalid NIC number: $num"
             return 1
         fi
         nics+=("${available_nics[$((num-1))]}")
     done
     if [[ ${#nics[@]} -lt 2 ]]; then
-        echo "Error: At least two NICs must be selected" >&2
+        error_msg "Error: At least two NICs must be selected"
         return 1
     fi
-    echo "Selected NICs: ${nics[*]}"
+    info "Selected NICs: ${nics[*]}"
     if ! read_input "Confirm selection? (y/n): " confirm; then
         return 1
     fi
     if [[ "$confirm" != "y" ]]; then
-        echo "Bond creation cancelled"
+        info "Bond creation cancelled"
         return 0
     fi
     if ! read_input "Enter VLAN ID (1-4094, optional, press Enter to skip): " vlan; then
@@ -370,7 +394,7 @@ create_bond() {
             return 1
         fi
         if [[ -n "$primary_nic" ]] && ! [[ " ${nics[*]} " =~ " $primary_nic " ]]; then
-            echo "Error: Primary NIC must be one of the selected NICs" >&2
+            error_msg "Error: Primary NIC must be one of the selected NICs"
             return 1
         fi
     fi
@@ -378,13 +402,13 @@ create_bond() {
     local cmd=("nmcli" "con" "add" "type" "bond" "ifname" "$bond_name" "mode" "$mode")
     [[ -n "$primary_nic" ]] && cmd+=("bond.options" "primary=$primary_nic")
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo "${cmd[*]}"
+        dry_run "${cmd[*]}"
     else
         if "${cmd[@]}" &>>"$LOG_FILE"; then
             log "Created bond $bond_name with mode $mode"
         else
             log "Failed to create bond $bond_name"
-            echo "Error: Failed to create bond" >&2
+            error_msg "Error: Failed to create bond"
             rollback
             return 1
         fi
@@ -392,13 +416,13 @@ create_bond() {
     for nic in "${nics[@]}"; do
         local slave_cmd=("nmcli" "con" "add" "type" "ethernet" "ifname" "$nic" "master" "$bond_name")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${slave_cmd[*]}"
+            dry_run "${slave_cmd[*]}"
         else
             if "${slave_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Added slave $nic to bond $bond_name"
             else
                 log "Failed to add slave $nic to bond $bond_name"
-                echo "Error: Failed to add slave $nic" >&2
+                error_msg "Error: Failed to add slave $nic"
                 rollback
                 return 1
             fi
@@ -407,13 +431,13 @@ create_bond() {
     if [[ -n "$vlan" ]]; then
         local vlan_cmd=("nmcli" "con" "mod" "$bond_name" "802-3-ethernet.vlan" "$vlan")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${vlan_cmd[*]}"
+            dry_run "${vlan_cmd[*]}"
         else
             if "${vlan_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Set VLAN $vlan for bond $bond_name"
             else
                 log "Failed to set VLAN $vlan for bond $bond_name"
-                echo "Error: Failed to set VLAN" >&2
+                error_msg "Error: Failed to set VLAN"
                 rollback
                 return 1
             fi
@@ -422,13 +446,13 @@ create_bond() {
     if [[ -n "$ipv4" ]]; then
         local ip4_cmd=("nmcli" "con" "mod" "$bond_name" "ipv4.addresses" "$ipv4" "ipv4.method" "manual")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${ip4_cmd[*]}"
+            dry_run "${ip4_cmd[*]}"
         else
             if "${ip4_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Set IPv4 $ipv4 for bond $bond_name"
             else
                 log "Failed to set IPv4 $ipv4 for bond $bond_name"
-                echo "Error: Failed to set IPv4" >&2
+                error_msg "Error: Failed to set IPv4"
                 rollback
                 return 1
             fi
@@ -437,13 +461,13 @@ create_bond() {
     if [[ -n "$gateway" ]]; then
         local gw_cmd=("nmcli" "con" "mod" "$bond_name" "ipv4.gateway" "$gateway")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${gw_cmd[*]}"
+            dry_run "${gw_cmd[*]}"
         else
             if "${gw_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Set gateway $gateway for bond $bond_name"
             else
                 log "Failed to set gateway $gateway for bond $bond_name"
-                echo "Error: Failed to set gateway" >&2
+                error_msg "Error: Failed to set gateway"
                 rollback
                 return 1
             fi
@@ -452,34 +476,34 @@ create_bond() {
     if [[ -n "$ipv6" ]]; then
         local ip6_cmd=("nmcli" "con" "mod" "$bond_name" "ipv6.addresses" "$ipv6" "ipv6.method" "manual")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${ip6_cmd[*]}"
+            dry_run "${ip6_cmd[*]}"
         else
             if "${ip6_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Set IPv6 $ipv6 for bond $bond_name"
             else
                 log "Failed to set IPv6 $ipv6 for bond $bond_name"
-                echo "Error: Failed to set IPv6" >&2
+                error_msg "Error: Failed to set IPv6"
                 rollback
                 return 1
             fi
         fi
     fi
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo "Dry run complete"
+        info "Dry run complete"
         return 0
     fi
     if nmcli con up "$bond_name" &>>"$LOG_FILE"; then
         if [[ -n "$gateway" ]] && ! ping -c3 -W2 "$gateway" &>/dev/null; then
             log "Gateway $gateway not reachable after bond creation"
-            echo "Error: Gateway not reachable after bond creation" >&2
+            error_msg "Error: Gateway not reachable after bond creation"
             rollback
             return 1
         fi
         log "Bond $bond_name created and activated successfully"
-        echo "Bond $bond_name created successfully"
+        info "Bond $bond_name created successfully"
     else
         log "Failed to activate bond $bond_name"
-        echo "Error: Failed to activate bond" >&2
+        error_msg "Error: Failed to activate bond"
         rollback
         return 1
     fi
@@ -490,13 +514,13 @@ edit_bond() {
     local bond_name mode vlan ipv4 ipv6 gateway primary_nic
     local nics=()
     clear
-    echo "Edit Bond"
+    info "Edit Bond"
     local bonds=($(nmcli -t -f NAME con show | grep bond))
     if [[ ${#bonds[@]} -eq 0 ]]; then
-        echo "No bonds found" >&2
+        error_msg "No bonds found"
         return 1
     fi
-    echo "Available bonds:"
+    info "Available bonds:"
     for i in "${!bonds[@]}"; do
         printf "%d) %s\n" $((i+1)) "${bonds[$i]}"
     done
@@ -504,12 +528,12 @@ edit_bond() {
         return 1
     fi
     if [[ ! "$bond_num" =~ ^[0-9]+$ ]] || ((bond_num < 1 || bond_num > ${#bonds[@]})); then
-        echo "Error: Invalid bond number" >&2
+        error_msg "Error: Invalid bond number"
         return 1
     fi
     bond_name=${bonds[$((bond_num-1))]}
-    echo "Editing bond $bond_name"
-    echo "Select bonding mode (current: $(nmcli -t -f bond.mode con show "$bond_name" | cut -d: -f2)):"
+    info "Editing bond $bond_name"
+    info "Select bonding mode (current: $(nmcli -t -f bond.mode con show "$bond_name" | cut -d: -f2)):"
     for i in "${!BOND_MODES[@]}"; do
         printf "%d) %s\n" $((i+1)) "${BOND_MODES[$i]}"
     done
@@ -518,7 +542,7 @@ edit_bond() {
     fi
     if [[ -n "$mode_num" ]]; then
         if [[ ! "$mode_num" =~ ^[0-9]+$ ]] || ((mode_num < 1 || mode_num > ${#BOND_MODES[@]})); then
-            echo "Error: Invalid mode number" >&2
+            error_msg "Error: Invalid mode number"
             return 1
         fi
         mode=${BOND_MODES[$((mode_num-1))]}
@@ -529,27 +553,27 @@ edit_bond() {
         return 1
     fi
     if [[ "$nic_selection" == "q" ]]; then
-        echo "Bond edit cancelled"
+        info "Bond edit cancelled"
         return 0
     fi
     if [[ -n "$nic_selection" ]]; then
         for num in $nic_selection; do
             if [[ ! "$num" =~ ^[0-9]+$ ]] || ((num < 1 || num > ${#available_nics[@]})); then
-                echo "Error: Invalid NIC number: $num" >&2
+                error_msg "Error: Invalid NIC number: $num"
                 return 1
             fi
             nics+=("${available_nics[$((num-1))]}")
         done
         if [[ ${#nics[@]} -lt 2 ]]; then
-            echo "Error: At least two NICs must be selected" >&2
+            error_msg "Error: At least two NICs must be selected"
             return 1
         fi
-        echo "Selected NICs: ${nics[*]}"
+        info "Selected NICs: ${nics[*]}"
         if ! read_input "Confirm selection? (y/n): " confirm; then
             return 1
         fi
         if [[ "$confirm" != "y" ]]; then
-            echo "Bond edit cancelled"
+            info "Bond edit cancelled"
             return 0
         fi
     fi
@@ -582,7 +606,7 @@ edit_bond() {
             return 1
         fi
         if [[ -n "$primary_nic" ]] && ! [[ " ${nics[*]} " =~ " $primary_nic " ]]; then
-            echo "Error: Primary NIC must be one of the selected NICs" >&2
+            error_msg "Error: Primary NIC must be one of the selected NICs"
             return 1
         fi
     fi
@@ -591,13 +615,13 @@ edit_bond() {
         local cmd=("nmcli" "con" "mod" "$bond_name" "bond.mode" "$mode")
         [[ -n "$primary_nic" ]] && cmd+=("bond.options" "primary=$primary_nic")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${cmd[*]}"
+        dry_run "${cmd[*]}"
         else
             if "${cmd[@]}" &>>"$LOG_FILE"; then
                 log "Updated bond $bond_name mode to $mode"
             else
                 log "Failed to update bond $bond_name mode"
-                echo "Error: Failed to update bond mode" >&2
+                error_msg "Error: Failed to update bond mode"
                 rollback
                 return 1
             fi
@@ -609,13 +633,13 @@ edit_bond() {
         for slave in "${current_slaves[@]}"; do
             local slave_cmd=("nmcli" "con" "del" "$slave")
             if [[ "$DRY_RUN" == "true" ]]; then
-                echo "${slave_cmd[*]}"
+        dry_run "${slave_cmd[*]}"
             else
                 if "${slave_cmd[@]}" &>>"$LOG_FILE"; then
                     log "Removed slave $slave from bond $bond_name"
                 else
                     log "Failed to remove slave $slave from bond $bond_name"
-                    echo "Error: Failed to remove slave $slave" >&2
+                    error_msg "Error: Failed to remove slave $slave"
                     rollback
                     return 1
                 fi
@@ -625,13 +649,13 @@ edit_bond() {
         for nic in "${nics[@]}"; do
             local slave_cmd=("nmcli" "con" "add" "type" "ethernet" "ifname" "$nic" "master" "$bond_name")
             if [[ "$DRY_RUN" == "true" ]]; then
-                echo "${slave_cmd[*]}"
+        dry_run "${slave_cmd[*]}"
             else
                 if "${slave_cmd[@]}" &>>"$LOG_FILE"; then
                     log "Added slave $nic to bond $bond_name"
                 else
                     log "Failed to add slave $nic to bond $bond_name"
-                    echo "Error: Failed to add slave $nic" >&2
+                    error_msg "Error: Failed to add slave $nic"
                     rollback
                     return 1
                 fi
@@ -641,13 +665,13 @@ edit_bond() {
     if [[ -n "$vlan" ]]; then
         local vlan_cmd=("nmcli" "con" "mod" "$bond_name" "802-3-ethernet.vlan" "$vlan")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${vlan_cmd[*]}"
+        dry_run "${vlan_cmd[*]}"
         else
             if "${vlan_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Updated VLAN $vlan for bond $bond_name"
             else
                 log "Failed to update VLAN $vlan for bond $bond_name"
-                echo "Error: Failed to update VLAN" >&2
+                error_msg "Error: Failed to update VLAN"
                 rollback
                 return 1
             fi
@@ -656,13 +680,13 @@ edit_bond() {
     if [[ -n "$ipv4" ]]; then
         local ip4_cmd=("nmcli" "con" "mod" "$bond_name" "ipv4.addresses" "$ipv4" "ipv4.method" "manual")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${ip4_cmd[*]}"
+        dry_run "${ip4_cmd[*]}"
         else
             if "${ip4_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Updated IPv4 $ipv4 for bond $bond_name"
             else
                 log "Failed to update IPv4 $ipv4 for bond $bond_name"
-                echo "Error: Failed to update IPv4" >&2
+                error_msg "Error: Failed to update IPv4"
                 rollback
                 return 1
             fi
@@ -671,13 +695,13 @@ edit_bond() {
     if [[ -n "$gateway" ]]; then
         local gw_cmd=("nmcli" "con" "mod" "$bond_name" "ipv4.gateway" "$gateway")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${gw_cmd[*]}"
+        dry_run "${gw_cmd[*]}"
         else
             if "${gw_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Updated gateway $gateway for bond $bond_name"
             else
                 log "Failed to update gateway $gateway for bond $bond_name"
-                echo "Error: Failed to update gateway" >&2
+                error_msg "Error: Failed to update gateway"
                 rollback
                 return 1
             fi
@@ -686,34 +710,34 @@ edit_bond() {
     if [[ -n "$ipv6" ]]; then
         local ip6_cmd=("nmcli" "con" "mod" "$bond_name" "ipv6.addresses" "$ipv6" "ipv6.method" "manual")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${ip6_cmd[*]}"
+        dry_run "${ip6_cmd[*]}"
         else
             if "${ip6_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Updated IPv6 $ipv6 for bond $bond_name"
             else
                 log "Failed to update IPv6 $ipv6 for bond $bond_name"
-                echo "Error: Failed to update IPv6" >&2
+                error_msg "Error: Failed to update IPv6"
                 rollback
                 return 1
             fi
         fi
     fi
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo "Dry run complete"
+        info "Dry run complete"
         return 0
     fi
     if nmcli con up "$bond_name" &>>"$LOG_FILE"; then
         if [[ -n "$gateway" ]] && ! ping -c3 -W2 "$gateway" &>/dev/null; then
             log "Gateway $gateway not reachable after bond edit"
-            echo "Error: Gateway not reachable after bond edit" >&2
+            error_msg "Error: Gateway not reachable after bond edit"
             rollback
             return 1
         fi
         log "Bond $bond_name edited and activated successfully"
-        echo "Bond $bond_name edited successfully"
+        info "Bond $bond_name edited successfully"
     else
         log "Failed to activate bond $bond_name"
-        echo "Error: Failed to activate bond" >&2
+        error_msg "Error: Failed to activate bond"
         rollback
         return 1
     fi
@@ -723,13 +747,13 @@ edit_bond() {
 remove_bond() {
     local bond_name
     clear
-    echo "Remove Bond"
+    info "Remove Bond"
     local bonds=($(nmcli -t -f NAME con show | grep bond))
     if [[ ${#bonds[@]} -eq 0 ]]; then
-        echo "No bonds found" >&2
+        error_msg "No bonds found"
         return 1
     fi
-    echo "Available bonds:"
+    info "Available bonds:"
     for i in "${!bonds[@]}"; do
         printf "%d) %s\n" $((i+1)) "${bonds[$i]}"
     done
@@ -737,7 +761,7 @@ remove_bond() {
         return 1
     fi
     if [[ ! "$bond_num" =~ ^[0-9]+$ ]] || ((bond_num < 1 || bond_num > ${#bonds[@]})); then
-        echo "Error: Invalid bond number" >&2
+        error_msg "Error: Invalid bond number"
         return 1
     fi
     bond_name=${bonds[$((bond_num-1))]}
@@ -745,7 +769,7 @@ remove_bond() {
         return 1
     fi
     if [[ "$confirm" != "y" ]]; then
-        echo "Bond removal cancelled"
+        info "Bond removal cancelled"
         return 0
     fi
     backup_configs
@@ -753,13 +777,13 @@ remove_bond() {
     for slave in "${slaves[@]}"; do
         local slave_cmd=("nmcli" "con" "del" "$slave")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${slave_cmd[*]}"
+            dry_run "${slave_cmd[*]}"
         else
             if "${slave_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Removed slave $slave from bond $bond_name"
             else
                 log "Failed to remove slave $slave from bond $bond_name"
-                echo "Error: Failed to remove slave $slave" >&2
+                error_msg "Error: Failed to remove slave $slave"
                 rollback
                 return 1
             fi
@@ -767,14 +791,14 @@ remove_bond() {
     done
     local bond_cmd=("nmcli" "con" "del" "$bond_name")
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo "${bond_cmd[*]}"
+        dry_run "${bond_cmd[*]}"
     else
         if "${bond_cmd[@]}" &>>"$LOG_FILE"; then
             log "Removed bond $bond_name"
-            echo "Bond $bond_name removed successfully"
+            info "Bond $bond_name removed successfully"
         else
             log "Failed to remove bond $bond_name"
-            echo "Error: Failed to remove bond" >&2
+            error_msg "Error: Failed to remove bond"
             rollback
             return 1
         fi
@@ -785,13 +809,13 @@ remove_bond() {
 repair_bond() {
     local bond_name
     clear
-    echo "Repair Bond"
+    info "Repair Bond"
     local bonds=($(nmcli -t -f NAME con show | grep bond))
     if [[ ${#bonds[@]} -eq 0 ]]; then
-        echo "No bonds found" >&2
+        error_msg "No bonds found"
         return 1
     fi
-    echo "Available bonds:"
+    info "Available bonds:"
     for i in "${!bonds[@]}"; do
         printf "%d) %s\n" $((i+1)) "${bonds[$i]}"
     done
@@ -799,7 +823,7 @@ repair_bond() {
         return 1
     fi
     if [[ ! "$bond_num" =~ ^[0-9]+$ ]] || ((bond_num < 1 || bond_num > ${#bonds[@]})); then
-        echo "Error: Invalid bond number" >&2
+        error_msg "Error: Invalid bond number"
         return 1
     fi
     bond_name=${bonds[$((bond_num-1))]}
@@ -816,13 +840,13 @@ repair_bond() {
         if ! nmcli con show | grep -q "ethernet.*$bond_name.*$slave"; then
             local slave_cmd=("nmcli" "con" "add" "type" "ethernet" "ifname" "$slave" "master" "$bond_name")
             if [[ "$DRY_RUN" == "true" ]]; then
-                echo "${slave_cmd[*]}"
+                dry_run "${slave_cmd[*]}"
             else
                 if "${slave_cmd[@]}" &>>"$LOG_FILE"; then
                     log "Re-added slave $slave to bond $bond_name"
                 else
                     log "Failed to re-add slave $slave to bond $bond_name"
-                    echo "Error: Failed to re-add slave $slave" >&2
+                    error_msg "Error: Failed to re-add slave $slave"
                     rollback
                     return 1
                 fi
@@ -831,20 +855,20 @@ repair_bond() {
         if [[ "$DRY_RUN" != "true" ]]; then
             nmcli con up "$slave" &>>"$LOG_FILE" || {
                 log "Failed to bring up slave $slave"
-                echo "Warning: Failed to bring up slave $slave" >&2
+                warn "Warning: Failed to bring up slave $slave"
             }
         fi
     done
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo "Dry run complete"
+        info "Dry run complete"
         return 0
     fi
-    if nmcli con up "$bond_nametx
-        echo "Bond $bond_name repaired and activated"
-        echo "Bond $bond_name repaired successfully"
+    if nmcli con up "$bond_name" &>>"$LOG_FILE"; then
+        info "Bond $bond_name repaired and activated"
+        info "Bond $bond_name repaired successfully"
     else
         log "Failed to activate bond $bond_name"
-        echo "Error: Failed to activate bond" >&2
+        error_msg "Error: Failed to activate bond"
         rollback
         return 1
     fi
@@ -854,13 +878,13 @@ repair_bond() {
 diagnose_bond() {
     local bond_name
     clear
-    echo "Diagnose Bond"
+    info "Diagnose Bond"
     local bonds=($(nmcli -t -f NAME con show | grep bond))
     if [[ ${#bonds[@]} -eq 0 ]]; then
-        echo "No bonds found" >&2
+        error_msg "No bonds found"
         return 1
     fi
-    echo "Available bonds:"
+    info "Available bonds:"
     for i in "${!bonds[@]}"; do
         printf "%d) %s\n" $((i+1)) "${bonds[$i]}"
     done
@@ -868,21 +892,21 @@ diagnose_bond() {
         return 1
     fi
     if [[ ! "$bond_num" =~ ^[0-9]+$ ]] || ((bond_num < 1 || bond_num > ${#bonds[@]})); then
-        echo "Error: Invalid bond number" >&2
+        error_msg "Error: Invalid bond number"
         return 1
     fi
     bond_name=${bonds[$((bond_num-1))]}
-    echo "Bond Status for $bond_name:"
+    info "Bond Status for $bond_name:"
     if [[ -f "/proc/net/bonding/$bond_name" ]]; then
         cat "/proc/net/bonding/$bond_name"
     else
-        echo "Bond $bond_name not found in /proc/net/bonding/"
+        info "Bond $bond_name not found in /proc/net/bonding/"
     fi
-    echo -e "\nDetailed Slave Information:"
+    info "\nDetailed Slave Information:"
     local slaves=($(nmcli -t -f NAME con show | grep "ethernet.*$bond_name"))
     for slave in "${slaves[@]}"; do
         local nic=$(nmcli -t -f connection.interface-name con show "$slave" | cut -d: -f2)
-        echo "Slave: $nic"
+        info "Slave: $nic"
         ethtool "$nic" | grep -E "Speed|Duplex|Link detected"
         ip -s link show "$nic"
         echo
@@ -893,13 +917,13 @@ diagnose_bond() {
 switch_migration() {
     local bond_name new_nics=()
     clear
-    echo "Switch Migration Helper"
+    info "Switch Migration Helper"
     local bonds=($(nmcli -t -f NAME con show | grep bond))
     if [[ ${#bonds[@]} -eq 0 ]]; then
-        echo "No bonds found" >&2
+        error_msg "No bonds found"
         return 1
     fi
-    echo "Available bonds:"
+    info "Available bonds:"
     for i in "${!bonds[@]}"; do
         printf "%d) %s\n" $((i+1)) "${bonds[$i]}"
     done
@@ -907,13 +931,13 @@ switch_migration() {
         return 1
     fi
     if [[ ! "$bond_num" =~ ^[0-9]+$ ]] || ((bond_num < 1 || bond_num > ${#bonds[@]})); then
-        echo "Error: Invalid bond number" >&2
+        error_msg "Error: Invalid bond number"
         return 1
     fi
     bond_name=${bonds[$((bond_num-1))]}
     local available_nics=($(get_available_nics))
     if [[ ${#available_nics[@]} -lt 2 ]]; then
-        echo "Error: At least two available NICs required" >&2
+        error_msg "Error: At least two available NICs required"
         return 1
     fi
     display_nics "$bond_name" "${available_nics[@]}"
@@ -921,53 +945,53 @@ switch_migration() {
         return 1
     fi
     if [[ "$nic_selection" == "q" ]]; then
-        echo "Switch migration cancelled"
+        info "Switch migration cancelled"
         return 0
     fi
     for num in $nic_selection; do
         if [[ ! "$num" =~ ^[0-9]+$ ]] || ((num < 1 || num > ${#available_nics[@]})); then
-            echo "Error: Invalid NIC number: $num" >&2
+            error_msg "Error: Invalid NIC number: $num"
             return 1
         fi
         new_nics+=("${available_nics[$((num-1))]}")
     done
     if [[ ${#new_nics[@]} -lt 2 ]]; then
-        echo "Error: At least two NICs must be selected" >&2
+        error_msg "Error: At least two NICs must be selected"
         return 1
     fi
-    echo "Selected new NICs: ${new_nics[*]}"
+    info "Selected new NICs: ${new_nics[*]}"
     if ! read_input "Confirm migration to new NICs? (y/n): " confirm; then
         return 1
     fi
     if [[ "$confirm" != "y" ]]; then
-        echo "Switch migration cancelled"
+        info "Switch migration cancelled"
         return 0
     fi
     backup_configs
     for nic in "${new_nics[@]}"; do
         local slave_cmd=("nmcli" "con" "add" "type" "ethernet" "ifname" "$nic" "master" "$bond_name")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${slave_cmd[*]}"
+        dry_run "${slave_cmd[*]}"
         else
             if "${slave_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Added new slave $nic to bond $bond_name"
             else
                 log "Failed to add new slave $nic to bond $bond_name"
-                echo "Error: Failed to add new slave $nic" >&2
+                error_msg "Error: Failed to add new slave $nic"
                 rollback
                 return 1
             fi
         fi
     done
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo "Dry run complete"
+        info "Dry run complete"
         return 0
     fi
     if nmcli con up "$bond_name" &>>"$LOG_FILE"; then
         local gateway=$(nmcli -t -f ipv4.gateway con show "$bond_name" | cut -d: -f2)
         if [[ -n "$gateway" ]] && ! ping -c3 -W2 "$gateway" &>/dev/null; then
             log "Gateway $gateway not reachable after adding new slaves"
-            echo "Error: Gateway not reachable after migration" >&2
+            error_msg "Error: Gateway not reachable after migration"
             rollback
             return 1
         fi
@@ -976,23 +1000,23 @@ switch_migration() {
         for slave in "${old_slaves[@]}"; do
             local slave_cmd=("nmcli" "con" "del" "$slave")
             if [[ "$DRY_RUN" == "true" ]]; then
-                echo "${slave_cmd[*]}"
+        dry_run "${slave_cmd[*]}"
             else
                 if "${slave_cmd[@]}" &>>"$LOG_FILE"; then
                     log "Removed old slave $slave from bond $bond_name"
                 else
                     log "Failed to remove old slave $slave from bond $bond_name"
-                    echo "Error: Failed to remove old slave $slave" >&2
+                    error_msg "Error: Failed to remove old slave $slave"
                     rollback
                     return 1
                 fi
             fi
         done
         log "Switch migration for bond $bond_name completed"
-        echo "Switch migration for bond $bond_name completed successfully"
+         info "Switch migration for bond $bond_name completed successfully"
     else
         log "Failed to activate bond $bond_name after migration"
-        echo "Error: Failed to activate bond after migration" >&2
+        error_msg "Error: Failed to activate bond after migration"
         rollback
         return 1
     fi
@@ -1002,13 +1026,13 @@ switch_migration() {
 ten_gb_migration() {
     local old_bond new_bond new_nics=()
     clear
-    echo "10Gb Migration Wizard"
+    info "10Gb Migration Wizard"
     local bonds=($(nmcli -t -f NAME con show | grep bond))
     if [[ ${#bonds[@]} -eq 0 ]]; then
-        echo "No bonds found" >&2
+        error_msg "No bonds found"
         return 1
     fi
-    echo "Available bonds:"
+    info "Available bonds:"
     for i in "${!bonds[@]}"; do
         printf "%d) %s\n" $((i+1)) "${bonds[$i]}"
     done
@@ -1016,7 +1040,7 @@ ten_gb_migration() {
         return 1
     fi
     if [[ ! "$bond_num" =~ ^[0-9]+$ ]] || ((bond_num < 1 || bond_num > ${#bonds[@]})); then
-        echo "Error: Invalid bond number" >&2
+        error_msg "Error: Invalid bond number"
         return 1
     fi
     old_bond=${bonds[$((bond_num-1))]}
@@ -1033,7 +1057,7 @@ ten_gb_migration() {
         fi
     done
     if [[ ${#available_nics[@]} -lt 2 ]]; then
-        echo "Error: At least two 10Gb NICs required" >&2
+        error_msg "Error: At least two 10Gb NICs required"
         return 1
     fi
     display_nics "" "${available_nics[@]}"
@@ -1041,18 +1065,18 @@ ten_gb_migration() {
         return 1
     fi
     if [[ "$nic_selection" == "q" ]]; then
-        echo "10Gb migration cancelled"
+        info "10Gb migration cancelled"
         return 0
     fi
     for num in $nic_selection; do
         if [[ ! "$num" =~ ^[0-9]+$ ]] || ((num < 1 || num > ${#available_nics[@]})); then
-            echo "Error: Invalid NIC number: $num" >&2
+            error_msg "Error: Invalid NIC number: $num"
             return 1
         fi
         new_nics+=("${available_nics[$((num-1))]}")
     done
     if [[ ${#new_nics[@]} -lt 2 ]]; then
-        echo "Error: At least two NICs must be selected" >&2
+        error_msg "Error: At least two NICs must be selected"
         return 1
     fi
     echo "Selected 10Gb NICs: ${new_nics[*]}"
@@ -1060,7 +1084,7 @@ ten_gb_migration() {
         return 1
     fi
     if [[ "$confirm" != "y" ]]; then
-        echo "10Gb migration cancelled"
+        info "10Gb migration cancelled"
         return 0
     fi
     backup_configs
@@ -1073,13 +1097,13 @@ ten_gb_migration() {
     local cmd=("nmcli" "con" "add" "type" "bond" "ifname" "$new_bond" "mode" "$mode")
     [[ -n "$primary_nic" ]] && cmd+=("bond.options" "primary=$primary_nic")
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo "${cmd[*]}"
+        dry_run "${cmd[*]}"
     else
         if "${cmd[@]}" &>>"$LOG_FILE"; then
             log "Created new 10Gb bond $new_bond with mode $mode"
         else
             log "Failed to create new 10Gb bond $new_bond"
-            echo "Error: Failed to create new bond" >&2
+            error_msg "Error: Failed to create new bond"
             rollback
             return 1
         fi
@@ -1087,13 +1111,13 @@ ten_gb_migration() {
     for nic in "${new_nics[@]}"; do
         local slave_cmd=("nmcli" "con" "add" "type" "ethernet" "ifname" "$nic" "master" "$new_bond")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${slave_cmd[*]}"
+        dry_run "${slave_cmd[*]}"
         else
             if "${slave_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Added slave $nic to new bond $new_bond"
             else
                 log "Failed to add slave $nic to new bond $new_bond"
-                echo "Error: Failed to add slave $nic" >&2
+                error_msg "Error: Failed to add slave $nic"
                 rollback
                 return 1
             fi
@@ -1102,13 +1126,13 @@ ten_gb_migration() {
     if [[ -n "$vlan" && "$vlan" != "0" ]]; then
         local vlan_cmd=("nmcli" "con" "mod" "$new_bond" "802-3-ethernet.vlan" "$vlan")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${vlan_cmd[*]}"
+        dry_run "${vlan_cmd[*]}"
         else
             if "${vlan_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Set VLAN $vlan for new bond $new_bond"
             else
                 log "Failed to set VLAN $vlan for new bond $new_bond"
-                echo "Error: Failed to set VLAN" >&2
+                error_msg "Error: Failed to set VLAN"
                 rollback
                 return 1
             fi
@@ -1117,13 +1141,13 @@ ten_gb_migration() {
     if [[ -n "$ipv4" ]]; then
         local ip4_cmd=("nmcli" "con" "mod" "$new_bond" "ipv4.addresses" "$ipv4" "ipv4.method" "manual")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${ip4_cmd[*]}"
+        dry_run "${ip4_cmd[*]}"
         else
             if "${ip4_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Set IPv4 $ipv4 for new bond $new_bond"
             else
                 log "Failed to set IPv4 $ipv4 for new bond $new_bond"
-                echo "Error: Failed to set IPv4" >&2
+                error_msg "Error: Failed to set IPv4"
                 rollback
                 return 1
             fi
@@ -1132,13 +1156,13 @@ ten_gb_migration() {
     if [[ -n "$gateway" ]]; then
         local gw_cmd=("nmcli" "con" "mod" "$new_bond" "ipv4.gateway" "$gateway")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${gw_cmd[*]}"
+        dry_run "${gw_cmd[*]}"
         else
             if "${gw_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Set gateway $gateway for new bond $new_bond"
             else
                 log "Failed to set gateway $gateway for new bond $new_bond"
-                echo "Error: Failed to set gateway" >&2
+                error_msg "Error: Failed to set gateway"
                 rollback
                 return 1
             fi
@@ -1147,34 +1171,34 @@ ten_gb_migration() {
     if [[ -n "$ipv6" ]]; then
         local ip6_cmd=("nmcli" "con" "mod" "$new_bond" "ipv6.addresses" "$ipv6" "ipv6.method" "manual")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${ip6_cmd[*]}"
+        dry_run "${ip6_cmd[*]}"
         else
             if "${ip6_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Set IPv6 $ipv6 for new bond $new_bond"
             else
                 log "Failed to set IPv6 $ipv6 for new bond $new_bond"
-                echo "Error: Failed to set IPv6" >&2
+                error_msg "Error: Failed to set IPv6"
                 rollback
                 return 1
             fi
         fi
     fi
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo "Dry run complete"
+        info "Dry run complete"
         return 0
     fi
     if nmcli con up "$new_bond" &>>"$LOG_FILE"; then
         if [[ -n "$gateway" ]] && ! ping -c3 -W2 "$gateway" &>/dev/null; then
             log "Gateway $gateway not reachable after 10Gb migration"
-            echo "Error: Gateway not reachable after migration" >&2
+            error_msg "Error: Gateway not reachable after migration"
             rollback
             return 1
         fi
         log "10Gb migration to bond $new_bond completed"
-        echo "10Gb migration to bond $new_bond completed successfully"
+         info "10Gb migration to bond $new_bond completed successfully"
     else
         log "Failed to activate new bond $new_bond"
-        echo "Error: Failed to activate new bond" >&2
+        error_msg "Error: Failed to activate new bond"
         rollback
         return 1
     fi
@@ -1195,14 +1219,14 @@ main_menu() {
                 shift
                 ;;
             --help)
-                echo "Usage: $0 [--dry-run] [--debug] [--help]"
-                echo "  --dry-run: Echo commands without executing"
-                echo "  --debug: Enable verbose output"
-                echo "  --help: Show this help message"
+                info "Usage: $0 [--dry-run] [--debug] [--help]"
+                info "  --dry-run: Echo commands without executing"
+                info "  --debug: Enable verbose output"
+                info "  --help: Show this help message"
                 exit 0
                 ;;
             *)
-                echo "Unknown option: $1" >&2
+                error_msg "Unknown option: $1"
                 exit 1
                 ;;
         esac
@@ -1210,18 +1234,18 @@ main_menu() {
     [[ "$DEBUG" == "true" ]] && set -x
     while true; do
         clear
-        stdbuf -oL echo "Bond Manager v$VERSION"
-        stdbuf -oL echo "0) Rollback last change"
-        stdbuf -oL echo "1) Switch migration helper"
-        stdbuf -oL echo "2) 10Gb migration wizard"
-        stdbuf -oL echo "3) Repair bond"
-        stdbuf -oL echo "4) Diagnose bond"
-        stdbuf -oL echo "5) Extended diagnostics"
-        stdbuf -oL echo "6) Create bond"
-        stdbuf -oL echo "7) Edit bond"
-        stdbuf -oL echo "8) Remove bond"
-        stdbuf -oL echo "9) Show version"
-        stdbuf -oL echo "10) Exit"
+        stdbuf -oL info "Bond Manager v$VERSION"
+        stdbuf -oL info "0) Rollback last change"
+        stdbuf -oL info "1) Switch migration helper"
+        stdbuf -oL info "2) 10Gb migration wizard"
+        stdbuf -oL info "3) Repair bond"
+        stdbuf -oL info "4) Diagnose bond"
+        stdbuf -oL info "5) Extended diagnostics"
+        stdbuf -oL info "6) Create bond"
+        stdbuf -oL info "7) Edit bond"
+        stdbuf -oL info "8) Remove bond"
+        stdbuf -oL info "9) Show version"
+        stdbuf -oL info "10) Exit"
         if ! read_input "Select an option: " option; then
             continue
         fi
@@ -1255,14 +1279,14 @@ main_menu() {
                 ;;
             9)
                 clear
-                echo "Bond Manager v$VERSION"
+                info "Bond Manager v$VERSION"
                 ;;
             10)
                 clear
                 exit 0
                 ;;
             *)
-                echo "Invalid option: $option" >&2
+                error_msg "Invalid option: $option"
                 ;;
         esac
         read_input "Press Enter to continue..." _
