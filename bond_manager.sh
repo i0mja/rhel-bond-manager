@@ -128,7 +128,28 @@ rollback() {
     fi
     trap rollback ERR
 }
-
+# Remove stale slave connections for a bond
+remove_slave_connections() {
+    local bond=$1
+    local slaves=()
+    if ! mapfile -t slaves < <(nmcli -g NAME,connection.master connection show 2>/dev/null | awk -F: -v b="$bond" '$2==b{print $1}') ; then
+        log "Failed to list slave connections for bond $bond"
+        slaves=()
+    fi
+    for conn in "${slaves[@]}"; do
+        local del_cmd=("nmcli" "con" "del" "$conn")
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo "${del_cmd[*]}"
+        else
+            if "${del_cmd[@]}" &>>"$LOG_FILE"; then
+                log "Removed stale slave connection $conn from bond $bond"
+            else
+                log "Failed to remove stale slave connection $conn from bond $bond"
+                echo "Warning: Failed to remove stale slave $conn" >&2
+            fi
+        fi
+    done
+}
 # Remove temporary files and reset state
 cleanup() {
     set +x
@@ -896,8 +917,9 @@ repair_bond() {
             fi
         done < "/proc/net/bonding/$bond_name"
     fi
+    remove_slave_connections "$bond_name"
     for slave in "${slaves[@]}"; do
-        if ! nmcli con show | grep -q "ethernet.*$bond_name.*$slave"; then
+        if ! nmcli -g connection.interface-name,connection.master connection show | grep -q "^$slave:$bond_name$"; then
             local slave_cmd=("nmcli" "con" "add" "type" "ethernet" "ifname" "$slave" "master" "$bond_name")
             if [[ "$DRY_RUN" == "true" ]]; then
                 echo "${slave_cmd[*]}"
@@ -981,12 +1003,13 @@ repair_bond_10gb_ab() {
             fi
         done < "/proc/net/bonding/$bond_name"
     fi
+    remove_slave_connections "$bond_name"
     for slave in "${slaves[@]}"; do
         if ! ethtool "$slave" 2>/dev/null | grep -q "Speed: 10000Mb/s"; then
             echo "Skipping $slave: not 10Gb" >&2
             continue
         fi
-        if ! nmcli con show | grep -q "ethernet.*$bond_name.*$slave"; then
+        if ! nmcli -g connection.interface-name,connection.master connection show | grep -q "^$slave:$bond_name$"; then
             local slave_cmd=("nmcli" "con" "add" "type" "ethernet" "ifname" "$slave" "master" "$bond_name")
             if [[ "$DRY_RUN" == "true" ]]; then
                 echo "${slave_cmd[*]}"
