@@ -896,8 +896,30 @@ repair_bond() {
             fi
         done < "/proc/net/bonding/$bond_name"
     fi
+    # Remove any existing slave connections for the bond to avoid duplicates
+    local current_slaves=()
+    if ! mapfile -t current_slaves < <(
+            nmcli -t -f NAME,MASTER con show 2>/dev/null |
+            awk -F: -v b="$bond_name" '$2==b{print $1}'
+        ); then
+        log "Failed to list slave connections for bond $bond_name"
+        current_slaves=()
+    fi
+    for conn in "${current_slaves[@]}"; do
+        local del_cmd=("nmcli" "con" "del" "$conn")
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo "${del_cmd[*]}"
+        else
+            if "${del_cmd[@]}" &>>"$LOG_FILE"; then
+                log "Removed stale slave connection $conn from bond $bond_name"
+            else
+                log "Failed to remove stale slave connection $conn from bond $bond_name"
+                echo "Warning: Failed to remove stale slave $conn" >&2
+            fi
+        fi
+    done
     for slave in "${slaves[@]}"; do
-        if ! nmcli con show | grep -q "ethernet.*$bond_name.*$slave"; then
+        if ! nmcli -t -f NAME,MASTER con show | grep -q "$slave.*:$bond_name$"; then
             local slave_cmd=("nmcli" "con" "add" "type" "ethernet" "ifname" "$slave" "master" "$bond_name")
             if [[ "$DRY_RUN" == "true" ]]; then
                 echo "${slave_cmd[*]}"
@@ -981,12 +1003,34 @@ repair_bond_10gb_ab() {
             fi
         done < "/proc/net/bonding/$bond_name"
     fi
+    # Remove any existing slave connections for the bond to avoid duplicates
+    local current_slaves=()
+    if ! mapfile -t current_slaves < <(
+            nmcli -t -f NAME,MASTER con show 2>/dev/null |
+            awk -F: -v b="$bond_name" '$2==b{print $1}'
+        ); then
+        log "Failed to list slave connections for bond $bond_name"
+        current_slaves=()
+    fi
+    for conn in "${current_slaves[@]}"; do
+        local del_cmd=("nmcli" "con" "del" "$conn")
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo "${del_cmd[*]}"
+        else
+            if "${del_cmd[@]}" &>>"$LOG_FILE"; then
+                log "Removed stale slave connection $conn from bond $bond_name"
+            else
+                log "Failed to remove stale slave connection $conn from bond $bond_name"
+                echo "Warning: Failed to remove stale slave $conn" >&2
+            fi
+        fi
+    done
     for slave in "${slaves[@]}"; do
         if ! ethtool "$slave" 2>/dev/null | grep -q "Speed: 10000Mb/s"; then
             echo "Skipping $slave: not 10Gb" >&2
             continue
         fi
-        if ! nmcli con show | grep -q "ethernet.*$bond_name.*$slave"; then
+        if ! nmcli -t -f NAME,MASTER con show | grep -q "$slave.*:$bond_name$"; then
             local slave_cmd=("nmcli" "con" "add" "type" "ethernet" "ifname" "$slave" "master" "$bond_name")
             if [[ "$DRY_RUN" == "true" ]]; then
                 echo "${slave_cmd[*]}"
