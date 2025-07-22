@@ -905,6 +905,9 @@ repair_bond() {
         else
             if "${del_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Removed stale slave connection $conn from bond $bond_name"
+                local iface=$(nmcli -t -f connection.interface-name con show "$conn" | cut -d: -f2)
+                ip link set "$iface" down 2>/dev/null || true
+                ip link set "$iface" nomaster 2>/dev/null || true
             else
                 log "Failed to remove stale slave connection $conn from bond $bond_name"
                 echo "Warning: Failed to remove stale slave $conn" >&2
@@ -1005,6 +1008,9 @@ repair_bond_10gb_ab() {
         else
             if "${del_cmd[@]}" &>>"$LOG_FILE"; then
                 log "Removed stale slave connection $conn from bond $bond_name"
+                local iface=$(nmcli -t -f connection.interface-name con show "$conn" | cut -d: -f2)
+                ip link set "$iface" down 2>/dev/null || true
+                ip link set "$iface" nomaster 2>/dev/null || true
             else
                 log "Failed to remove stale slave connection $conn from bond $bond_name"
                 echo "Warning: Failed to remove stale slave $conn" >&2
