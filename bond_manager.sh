@@ -132,7 +132,10 @@ rollback() {
 remove_slave_connections() {
     local bond=$1
     local slaves=()
-    if ! mapfile -t slaves < <(nmcli -g NAME,connection.master connection show 2>/dev/null | awk -F: -v b="$bond" '$2==b{print $1}') ; then
+    if ! mapfile -t slaves < <(
+            nmcli -t -f NAME,MASTER connection show 2>/dev/null |
+            awk -F: -v b="$bond" '$2==b{print $1}'
+        ); then
         log "Failed to list slave connections for bond $bond"
         slaves=()
     fi
