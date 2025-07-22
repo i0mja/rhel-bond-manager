@@ -231,8 +231,9 @@ get_nic_info() {
 
 # Display NICs with indices
 display_nics() {
-    local nics=("$@")
     local bond_name=$1
+    shift
+    local nics=("$@")
     local slaves=()
     if [[ -n "$bond_name" && -f "/proc/net/bonding/$bond_name" ]]; then
         while IFS= read -r line; do
