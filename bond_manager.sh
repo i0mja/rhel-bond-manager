@@ -365,6 +365,13 @@ get_bond_mode() {
     echo "$mode"
 }
 
+# Return slave connection names for the specified bond
+get_bond_slaves() {
+    local bn=$1
+    nmcli -t -f NAME,TYPE,connection.master con show |
+        awk -F: -v bn="$bn" '$2=="ethernet" && $3==bn {print $1}'
+}
+
 # Create bond
 create_bond() {
     local bond_name mode vlan ipv4 ipv6 gateway primary_nic
@@ -687,7 +694,8 @@ edit_bond() {
     fi
     if [[ ${#nics[@]} -gt 0 ]]; then
         # Remove existing slaves
-        local current_slaves=($(nmcli -t -f NAME con show | grep "ethernet.*$bond_name"))
+        local current_slaves=()
+        mapfile -t current_slaves < <(get_bond_slaves "$bond_name")
         for slave in "${current_slaves[@]}"; do
             local slave_cmd=("nmcli" "con" "del" "$slave")
             if [[ "$DRY_RUN" == "true" ]]; then
@@ -832,7 +840,8 @@ remove_bond() {
         return 0
     fi
     backup_configs
-    local slaves=($(nmcli -t -f NAME con show | grep "ethernet.*$bond_name"))
+    local slaves=()
+    mapfile -t slaves < <(get_bond_slaves "$bond_name")
     for slave in "${slaves[@]}"; do
         local slave_cmd=("nmcli" "con" "del" "$slave")
         if [[ "$DRY_RUN" == "true" ]]; then
@@ -897,7 +906,8 @@ repair_bond() {
         done < "/proc/net/bonding/$bond_name"
     fi
     # Remove any existing slave connections for the bond to avoid duplicates
-    local current_slaves=($(nmcli -t -f NAME con show | grep "ethernet.*$bond_name"))
+    local current_slaves=()
+    mapfile -t current_slaves < <(get_bond_slaves "$bond_name")
     for conn in "${current_slaves[@]}"; do
         local del_cmd=("nmcli" "con" "del" "$conn")
         if [[ "$DRY_RUN" == "true" ]]; then
@@ -915,7 +925,7 @@ repair_bond() {
         fi
     done
     for slave in "${slaves[@]}"; do
-        if ! nmcli con show | grep -q "ethernet.*$bond_name.*$slave"; then
+        if ! get_bond_slaves "$bond_name" | grep -q "^.*$slave$"; then
             local slave_cmd=("nmcli" "con" "add" "type" "ethernet" "ifname" "$slave" "master" "$bond_name")
             if [[ "$DRY_RUN" == "true" ]]; then
                 echo "${slave_cmd[*]}"
@@ -1000,7 +1010,8 @@ repair_bond_10gb_ab() {
         done < "/proc/net/bonding/$bond_name"
     fi
     # Remove any existing slave connections for the bond to avoid duplicates
-    local current_slaves=($(nmcli -t -f NAME con show | grep "ethernet.*$bond_name"))
+    local current_slaves=()
+    mapfile -t current_slaves < <(get_bond_slaves "$bond_name")
     for conn in "${current_slaves[@]}"; do
         local del_cmd=("nmcli" "con" "del" "$conn")
         if [[ "$DRY_RUN" == "true" ]]; then
@@ -1022,7 +1033,7 @@ repair_bond_10gb_ab() {
             echo "Skipping $slave: not 10Gb" >&2
             continue
         fi
-        if ! nmcli con show | grep -q "ethernet.*$bond_name.*$slave"; then
+        if ! get_bond_slaves "$bond_name" | grep -q "^.*$slave$"; then
             local slave_cmd=("nmcli" "con" "add" "type" "ethernet" "ifname" "$slave" "master" "$bond_name")
             if [[ "$DRY_RUN" == "true" ]]; then
                 echo "${slave_cmd[*]}"
@@ -1090,7 +1101,8 @@ diagnose_bond() {
         echo "Bond $bond_name not found in /proc/net/bonding/"
     fi
     echo -e "\nDetailed Slave Information:"
-    local slaves=($(nmcli -t -f NAME con show | grep "ethernet.*$bond_name"))
+    local slaves=()
+    mapfile -t slaves < <(get_bond_slaves "$bond_name")
     for slave in "${slaves[@]}"; do
         local nic=$(nmcli -t -f connection.interface-name con show "$slave" | cut -d: -f2)
         echo "Slave: $nic"
@@ -1125,8 +1137,8 @@ extended_diagnostics() {
     bond_name=${bonds[$((bond_num-1))]}
     echo "Bond Status for $bond_name:"
     [[ -f "/proc/net/bonding/$bond_name" ]] && cat "/proc/net/bonding/$bond_name"
-    local slaves=$(nmcli -t -f NAME con show | grep "ethernet.*$bond_name")
-    slaves=( $slaves )
+    local slaves=()
+    mapfile -t slaves < <(get_bond_slaves "$bond_name")
     local gw=$(ip route show default | awk '/default/ {print $3; exit}')
     for slave in "${slaves[@]}"; do
         local nic=$(nmcli -t -f connection.interface-name con show "$slave" | cut -d: -f2)
@@ -1227,7 +1239,10 @@ switch_migration() {
             return 1
         fi
         # Remove old slaves
-        local old_slaves=($(nmcli -t -f NAME con show | grep "ethernet.*$bond_name" | grep -v "$(echo "${new_nics[*]}" | tr ' ' '|')"))
+        local old_slaves=()
+        mapfile -t old_slaves < <(
+            get_bond_slaves "$bond_name" | grep -v "$(echo "${new_nics[*]}" | tr ' ' '|')"
+        )
         for slave in "${old_slaves[@]}"; do
             local slave_cmd=("nmcli" "con" "del" "$slave")
             if [[ "$DRY_RUN" == "true" ]]; then
