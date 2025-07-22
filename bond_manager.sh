@@ -139,6 +139,30 @@ cleanup() {
     tput init 2>/dev/null
 }
 
+# Prompt user for rollback after successful operations
+prompt_rollback() {
+    local prev_timeout=$TIMEOUT
+    local response=""
+    TIMEOUT=60
+    if read_input "Rollback? (y/N): " response; then
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            rollback
+        fi
+    else
+        echo "No response within $TIMEOUT seconds, rolling back..."
+        rollback
+    fi
+    TIMEOUT=$prev_timeout
+}
+
+# Pause without triggering rollback on timeout
+pause_continue() {
+    local prev_timeout=$TIMEOUT
+    TIMEOUT=15
+    read_input "Press Enter to continue..." _ || true
+    TIMEOUT=$prev_timeout
+}
+
 # Get available Ethernet NICs
 get_available_nics() {
     local nics=()
@@ -1464,7 +1488,12 @@ main_menu() {
                 echo "Invalid option: $option" >&2
                 ;;
         esac
-        read_input "Press Enter to continue..." _
+        case $option in
+            1|2|3|4|5|6|7|8|9)
+                prompt_rollback
+                ;;
+        esac
+        pause_continue
     done
 }
 
