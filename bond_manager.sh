@@ -119,7 +119,7 @@ rollback() {
     if tar -xzf "$last_backup" -C /etc/NetworkManager/system-connections/; then
         nmcli con reload
         log "Rollback successful"
-        echo "Rollback successful"
+        echo "Rollback successful" >&2
     else
         log "Rollback failed"
         echo "Error: Rollback failed" >&2
@@ -364,6 +364,22 @@ get_bond_mode() {
     fi
     echo "$mode"
 }
+# Set bonding mode with fallback to bond.options
+set_bond_mode() {
+    local bn="$1"
+    local mode="$2"
+    local primary="${3:-}"
+    if nmcli con mod "$bn" bond.mode "$mode" &>>"$LOG_FILE"; then
+        [[ -n "$primary" ]] && nmcli con mod "$bn" bond.options "primary=$primary" &>>"$LOG_FILE"
+        return 0
+    fi
+    if nmcli con mod "$bn" bond.options "mode=$mode" &>>"$LOG_FILE"; then
+        [[ -n "$primary" ]] && nmcli con mod "$bn" bond.options "primary=$primary" &>>"$LOG_FILE"
+        return 0
+    fi
+    return 1
+}
+
 
 # Return slave connection names for the specified bond
 get_bond_slaves() {
@@ -676,13 +692,10 @@ edit_bond() {
     fi
     backup_configs
     if [[ -n "$mode" ]]; then
-        # Use bond.options to set the bonding mode for better NM compatibility
-        local cmd=("nmcli" "con" "mod" "$bond_name" "bond.options" "mode=$mode")
-        [[ -n "$primary_nic" ]] && cmd+=("bond.options" "primary=$primary_nic")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "${cmd[*]}"
+            echo "set_bond_mode $bond_name $mode ${primary_nic:-}"
         else
-            if "${cmd[@]}" &>>"$LOG_FILE"; then
+            if set_bond_mode "$bond_name" "$mode" "$primary_nic"; then
                 log "Updated bond $bond_name mode to $mode"
             else
                 log "Failed to update bond $bond_name mode"
@@ -987,12 +1000,10 @@ repair_bond_10gb_ab() {
     fi
     bond_name=${bonds[$((bond_num-1))]}
     backup_configs
-    # Set the bonding mode explicitly using bond.options for broader compatibility
-    local mode_cmd=("nmcli" "con" "mod" "$bond_name" "bond.options" "mode=active-backup")
     if [[ "$DRY_RUN" == "true" ]]; then
-        echo "${mode_cmd[*]}"
+        echo "set_bond_mode $bond_name active-backup"
     else
-        if "${mode_cmd[@]}" &>>"$LOG_FILE"; then
+        if set_bond_mode "$bond_name" "active-backup"; then
             log "Set bond $bond_name to active-backup"
         else
             log "Failed to set bond $bond_name to active-backup"
