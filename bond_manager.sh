@@ -384,8 +384,12 @@ set_bond_mode() {
 # Return slave connection names for the specified bond
 get_bond_slaves() {
     local bn=$1
-    nmcli -t -f NAME,TYPE,connection.master con show |
-        awk -F: -v bn="$bn" '$2=="ethernet" && $3==bn {print $1}'
+    local conn type master
+    while IFS=: read -r conn type; do
+        [[ $type == "ethernet" ]] || continue
+        master=$(nmcli -t -f connection.master con show "$conn" 2>/dev/null | cut -d: -f2)
+        [[ "$master" == "$bn" ]] && echo "$conn"
+    done < <(nmcli -t -f NAME,TYPE con show)
 }
 
 # Create bond
