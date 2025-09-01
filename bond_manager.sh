@@ -182,7 +182,7 @@ get_available_nics() {
 
     # Collect active standalone Ethernet interfaces
     while IFS=: read -r dev type; do
-        if [[ $type == "ethernet" ]]; then
+        if [[ $type == "ethernet" || $type == "802-3-ethernet" ]]; then
             local is_slave=0
             for slave in "${enslaved_nics[@]}"; do
                 if [[ $dev == "$slave" ]]; then
@@ -386,7 +386,7 @@ get_bond_slaves() {
     local bn=$1
     local conn type master
     while IFS=: read -r conn type; do
-        [[ $type == "ethernet" ]] || continue
+        [[ $type == "ethernet" || $type == "802-3-ethernet" ]] || continue
         master=$(nmcli -t -f connection.master con show "$conn" 2>/dev/null | cut -d: -f2)
         [[ "$master" == "$bn" ]] && echo "$conn"
     done < <(nmcli -t -f NAME,TYPE con show)
