@@ -13,10 +13,25 @@ VERSION="1.0.0"
 LOG_FILE="/var/log/bond_manager.log"
 BACKUP_DIR="/var/backups/bond_manager"
 BACKUP_PREFIX="conn"  # timestamp appended in backup_configs
+BACKUP_RETENTION=10
 TIMEOUT=15
 MAX_RETRIES=2
 BOND_MODES=("balance-rr" "active-backup" "balance-xor" "broadcast" "802.3ad" "balance-tlb" "balance-alb")
 TEMP_FILES=()
+SUPPORT_DIR="/var/log/bond_manager/support"
+
+# Global state flags
+DEBUG=false
+DRY_RUN=false
+STATUS_MODE=false
+EXPORT_JSON_PATH=""
+ALLOW_NON_INTERACTIVE=false
+for arg in "$@"; do
+    if [[ $arg == "--status" || $arg == "--export-json" || $arg == "--help" ]]; then
+        ALLOW_NON_INTERACTIVE=true
+        break
+    fi
+done
 
 # Set traps early
 trap cleanup EXIT
@@ -28,8 +43,8 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# Check for interactive terminal
-if [[ ! -t 0 ]]; then
+# Check for interactive terminal unless running in explicit non-interactive mode
+if [[ ! -t 0 && "$ALLOW_NON_INTERACTIVE" != "true" ]]; then
     echo "Error: This script requires an interactive terminal" >&2
     exit 1
 fi
@@ -77,9 +92,622 @@ chmod 644 /etc/logrotate.d/bond_manager
 
 # Logging function
 log() {
+    local level="INFO"
+    if [[ $# -gt 1 && $1 =~ ^(INFO|WARN|ERROR|DEBUG)$ ]]; then
+        level=$1
+        shift
+    fi
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] $*" >> "$LOG_FILE"
+    echo "[$timestamp] [$level] $*" >> "$LOG_FILE"
+    if [[ "$DEBUG" == "true" ]]; then
+        echo "[$level] $*" >&2
+    fi
+}
+
+preflight_checks() {
+    log INFO "Starting preflight checks"
+    local os_id="" os_version=""
+    if [[ -r /etc/os-release ]]; then
+        os_id=$(awk -F= '$1=="ID" {gsub("\"", "", $2); print tolower($2)}' /etc/os-release)
+        os_version=$(awk -F= '$1=="VERSION_ID" {gsub("\"", "", $2); print $2}' /etc/os-release)
+        if [[ ! "$os_id" =~ ^(rhel|centos|rocky|almalinux)$ || ! "$os_version" =~ ^(8|9) ]]; then
+            log WARN "Detected unsupported OS combination: ${os_id:-unknown} ${os_version:-unknown}"
+            echo "Warning: Script is optimized for RHEL-compatible 8/9 hosts. Detected ${os_id:-unknown} ${os_version:-unknown}." >&2
+        else
+            log DEBUG "Detected supported OS: $os_id $os_version"
+        fi
+    else
+        log WARN "Unable to read /etc/os-release"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl is-active --quiet NetworkManager; then
+            log ERROR "NetworkManager service is not active"
+            echo "Error: NetworkManager service is not active" >&2
+            exit 1
+        fi
+    else
+        log WARN "systemctl not available; skipping NetworkManager service check"
+    fi
+
+    if ! nmcli general status &>>"$LOG_FILE"; then
+        log ERROR "Unable to query NetworkManager status"
+        echo "Error: Unable to query NetworkManager status via nmcli" >&2
+        exit 1
+    else
+        local nm_state
+        nm_state=$(nmcli -t -f STATE general status 2>/dev/null | cut -d: -f2)
+        if [[ -n "$nm_state" && "$nm_state" != "connected" && "$nm_state" != "connected (global)" ]]; then
+            log WARN "NetworkManager general state: ${nm_state}" 
+            echo "Warning: NetworkManager general state is '${nm_state}'." >&2
+        fi
+    fi
+
+    if ! lsmod | grep -q '^bonding'; then
+        if command -v modprobe >/dev/null 2>&1; then
+            if modprobe bonding 2>>"$LOG_FILE"; then
+                log INFO "Loaded bonding kernel module"
+            else
+                log ERROR "Failed to load bonding kernel module"
+                echo "Error: Failed to load bonding kernel module" >&2
+                exit 1
+            fi
+        else
+            log WARN "modprobe not available; unable to ensure bonding module is loaded"
+        fi
+    else
+        log DEBUG "Bonding module already loaded"
+    fi
+}
+
+prune_old_backups() {
+    local backups=()
+    mapfile -t backups < <(ls -1t "$BACKUP_DIR"/${BACKUP_PREFIX}-*.tar.gz 2>/dev/null || true)
+    if (( ${#backups[@]} > BACKUP_RETENTION )); then
+        for ((i=BACKUP_RETENTION; i<${#backups[@]}; i++)); do
+            if rm -f "${backups[$i]}" 2>/dev/null; then
+                log INFO "Pruned old backup ${backups[$i]}"
+            fi
+        done
+    fi
+}
+
+restore_selinux_context() {
+    [[ "$DRY_RUN" == "true" ]] && return 0
+    if command -v restorecon >/dev/null 2>&1; then
+        if restorecon -Rv /etc/NetworkManager/system-connections &>>"$LOG_FILE"; then
+            log INFO "Restored SELinux context for NetworkManager profiles"
+        else
+            log WARN "restorecon reported errors while fixing SELinux context"
+        fi
+    else
+        log DEBUG "restorecon not available; skipping SELinux context restore"
+    fi
+}
+
+validate_nic_ready() {
+    local nic=$1
+    if [[ -z "$nic" ]]; then
+        return 1
+    fi
+    if ip -o addr show dev "$nic" 2>/dev/null | grep -qE ' inet| inet6'; then
+        log WARN "NIC $nic has existing IP configuration"
+        echo "Error: NIC $nic has existing IP configuration. Please clean up addresses before bonding." >&2
+        return 1
+    fi
+    if [[ -f "/sys/class/net/$nic/carrier" ]]; then
+        local carrier
+        carrier=$(<"/sys/class/net/$nic/carrier")
+        if [[ "$carrier" == "0" ]]; then
+            log WARN "NIC $nic currently reports no carrier"
+            echo "Warning: NIC $nic currently reports no carrier" >&2
+        fi
+    fi
+    return 0
+}
+
+confirm_prompt() {
+    local prompt=$1
+    local default=${2:-N}
+    local response=""
+    local prompt_text="$prompt"
+    if [[ "$default" =~ ^[Yy]$ ]]; then
+        prompt_text+=" (Y/n): "
+    else
+        prompt_text+=" (y/N): "
+    fi
+    if read_input "$prompt_text" response; then
+        :
+    else
+        response="${response:-}"
+    fi
+    if [[ -z "$response" ]]; then
+        if [[ "$default" =~ ^[Yy]$ ]]; then
+            return 0
+        fi
+        return 1
+    fi
+    if [[ "$response" =~ ^[Yy]$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+get_bond_option_value() {
+    local options=$1
+    local key=$2
+    local value=""
+    IFS=',' read -ra opts <<< "$options"
+    for opt in "${opts[@]}"; do
+        if [[ $opt == $key=* ]]; then
+            value=${opt#*=}
+            break
+        fi
+    done
+    echo "$value"
+}
+
+nmcli_get_field() {
+    local field=$1
+    local connection=$2
+    local output
+    if output=$(nmcli -t -f "$field" con show "$connection" 2>/dev/null); then
+        output=${output#*:}
+        output=${output//$'\n'/, }
+        echo "$output"
+    fi
+}
+
+list_bonds() {
+    while IFS=: read -r name type; do
+        [[ $type == "bond" ]] && echo "$name"
+    done < <(nmcli -t -f NAME,TYPE con show 2>/dev/null)
+}
+
+json_escape() {
+    local s=$1
+    local backslash='\\'
+    local esc_backslash='\\\\'
+    local dq='"'
+    local esc_dq='\"'
+    local newline=$'\n'
+    s=${s//${backslash}/${esc_backslash}}
+    s=${s//${dq}/${esc_dq}}
+    s=${s//${newline}/\n}
+    echo "$s"
+}
+
+to_json_array() {
+    local list=$1
+    if [[ -z "$list" ]]; then
+        echo "[]"
+        return
+    fi
+    local normalized=${list//, /,}
+    IFS=',' read -ra items <<< "$normalized"
+    local parts=()
+    for item in "${items[@]}"; do
+        [[ -z "$item" ]] && continue
+        parts+=("\"$(json_escape "$item")\"")
+    done
+    if (( ${#parts[@]} == 0 )); then
+        echo "[]"
+    else
+        local IFS=','
+        echo "[${parts[*]}]"
+    fi
+}
+
+configure_bond_options() {
+    local bond_name=$1
+    local mode=$2
+    if [[ -z "$bond_name" ]]; then
+        return 0
+    fi
+    if ! confirm_prompt "Configure advanced bond options for $bond_name?" "N"; then
+        return 0
+    fi
+    local current_opts=""
+    local nm_output=""
+    if nm_output=$(nmcli -t -f bond.options con show "$bond_name" 2>/dev/null); then
+        current_opts=$(echo "$nm_output" | cut -d: -f2)
+    fi
+    declare -A options_map=()
+    if [[ -n "$current_opts" ]]; then
+        IFS=',' read -ra opts <<< "$current_opts"
+        for opt in "${opts[@]}"; do
+            [[ -z "$opt" ]] && continue
+            if [[ "$opt" == *=* ]]; then
+                local key=${opt%%=*}
+                local value=${opt#*=}
+                options_map[$key]=$value
+            else
+                options_map[$opt]=""
+            fi
+        done
+    fi
+
+    local miimon=${options_map[miimon]:-100}
+    local updelay=${options_map[updelay]:-0}
+    local downdelay=${options_map[downdelay]:-0}
+    local lacp_rate=${options_map[lacp_rate]:-slow}
+    local xmit_hash_policy=${options_map[xmit_hash_policy]:-layer2}
+    local arp_interval=${options_map[arp_interval]:-${options_map[arp_interval]:-0}}
+    local arp_ip_target=${options_map[arp_ip_target]:-}
+    local response=""
+
+    if read_input "Set miimon (current: $miimon, Enter to keep): " response true; then
+        if [[ -n "$response" ]]; then
+            if [[ "$response" =~ ^[0-9]+$ ]]; then
+                miimon=$response
+            else
+                echo "Warning: miimon must be numeric" >&2
+                log WARN "Invalid miimon value '$response' provided"
+            fi
+        fi
+    fi
+    if read_input "Set updelay (current: $updelay, Enter to keep): " response true; then
+        if [[ -n "$response" ]]; then
+            if [[ "$response" =~ ^[0-9]+$ ]]; then
+                updelay=$response
+            else
+                echo "Warning: updelay must be numeric" >&2
+                log WARN "Invalid updelay value '$response' provided"
+            fi
+        fi
+    fi
+    if read_input "Set downdelay (current: $downdelay, Enter to keep): " response true; then
+        if [[ -n "$response" ]]; then
+            if [[ "$response" =~ ^[0-9]+$ ]]; then
+                downdelay=$response
+            else
+                echo "Warning: downdelay must be numeric" >&2
+                log WARN "Invalid downdelay value '$response' provided"
+            fi
+        fi
+    fi
+    if [[ "$mode" == "802.3ad" ]]; then
+        if read_input "Set lacp_rate (slow/fast, current: $lacp_rate): " response true; then
+            if [[ -n "$response" ]]; then
+                if [[ "$response" =~ ^(slow|fast)$ ]]; then
+                    lacp_rate=$response
+                else
+                    echo "Warning: lacp_rate must be 'slow' or 'fast'" >&2
+                    log WARN "Invalid lacp_rate value '$response' provided"
+                fi
+            fi
+        fi
+    fi
+    if [[ "$mode" == "802.3ad" || "$mode" == "balance-xor" || "$mode" == "balance-tlb" || "$mode" == "balance-alb" ]]; then
+        if read_input "Set xmit_hash_policy (layer2/layer2+3/layer3+4, current: $xmit_hash_policy): " response true; then
+            if [[ -n "$response" ]]; then
+                case "$response" in
+                    layer2|layer2+3|layer3+4)
+                        xmit_hash_policy=$response
+                        ;;
+                    *)
+                        echo "Warning: Unsupported xmit_hash_policy" >&2
+                        log WARN "Invalid xmit_hash_policy value '$response' provided"
+                        ;;
+                esac
+            fi
+        fi
+    fi
+    if read_input "Set arp_interval in ms (current: $arp_interval, 0 to disable): " response true; then
+        if [[ -n "$response" ]]; then
+            if [[ "$response" =~ ^[0-9]+$ ]]; then
+                arp_interval=$response
+            else
+                echo "Warning: arp_interval must be numeric" >&2
+                log WARN "Invalid arp_interval value '$response' provided"
+            fi
+        fi
+    fi
+    if [[ "$arp_interval" =~ ^[0-9]+$ && "$arp_interval" -gt 0 ]]; then
+        if read_input "Set arp_ip_target list (comma separated, current: ${arp_ip_target:-none}): " response true; then
+            if [[ -n "$response" ]]; then
+                arp_ip_target=$response
+            fi
+        fi
+    else
+        arp_ip_target=""
+    fi
+
+    options_map[miimon]=$miimon
+    options_map[updelay]=$updelay
+    options_map[downdelay]=$downdelay
+    if [[ "$mode" == "802.3ad" ]]; then
+        options_map[lacp_rate]=$lacp_rate
+    else
+        unset options_map[lacp_rate]
+    fi
+    if [[ "$mode" == "802.3ad" || "$mode" == "balance-xor" || "$mode" == "balance-tlb" || "$mode" == "balance-alb" ]]; then
+        options_map[xmit_hash_policy]=$xmit_hash_policy
+    else
+        unset options_map[xmit_hash_policy]
+    fi
+    if [[ "$arp_interval" =~ ^[0-9]+$ && "$arp_interval" -gt 0 ]]; then
+        options_map[arp_interval]=$arp_interval
+        if [[ -n "$arp_ip_target" ]]; then
+            options_map[arp_ip_target]=$arp_ip_target
+        else
+            unset options_map[arp_ip_target]
+        fi
+    else
+        options_map[arp_interval]=0
+        unset options_map[arp_ip_target]
+    fi
+
+    local -a option_pairs=()
+    local ordered_keys=(mode primary miimon updelay downdelay lacp_rate xmit_hash_policy arp_interval arp_ip_target)
+    for key in "${ordered_keys[@]}"; do
+        if [[ -n ${options_map[$key]+_} ]]; then
+            if [[ -n ${options_map[$key]} ]]; then
+                option_pairs+=("$key=${options_map[$key]}")
+            else
+                option_pairs+=("$key")
+            fi
+            unset options_map[$key]
+        fi
+    done
+    for key in "${!options_map[@]}"; do
+        if [[ -n ${options_map[$key]} ]]; then
+            option_pairs+=("$key=${options_map[$key]}")
+        else
+            option_pairs+=("$key")
+        fi
+    done
+
+    if (( ${#option_pairs[@]} == 0 )); then
+        return 0
+    fi
+
+    local options_string
+    (IFS=','; options_string="${option_pairs[*]}")
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "nmcli con mod $bond_name bond.options $options_string"
+        return 0
+    fi
+    if nmcli con mod "$bond_name" bond.options "$options_string" &>>"$LOG_FILE"; then
+        log INFO "Configured advanced bond options for $bond_name: $options_string"
+        return 0
+    fi
+    log ERROR "Failed to configure advanced options for $bond_name"
+    echo "Error: Failed to configure advanced bond options" >&2
+    return 1
+}
+
+show_bond_summary() {
+    local skip_clear=$1
+    if [[ "$skip_clear" != "--no-clear" ]]; then
+        clear_screen
+    fi
+    echo "Bond Summary"
+    local bonds=()
+    mapfile -t bonds < <(list_bonds)
+    if (( ${#bonds[@]} == 0 )); then
+        echo "No bonds configured."
+        return 0
+    fi
+    for bond in "${bonds[@]}"; do
+        local mode=$(get_bond_mode "$bond")
+        local options=$(nmcli_get_field bond.options "$bond")
+        local vlan=$(nmcli_get_field 802-3-ethernet.vlan "$bond")
+        local ipv4=$(nmcli_get_field ipv4.addresses "$bond")
+        local gateway=$(nmcli_get_field ipv4.gateway "$bond")
+        local ipv6=$(nmcli_get_field ipv6.addresses "$bond")
+        local primary=$(get_bond_option_value "$options" "primary")
+        echo ""
+        echo "Bond: $bond"
+        echo "  Mode: ${mode:-unknown}"
+        [[ -n "$primary" ]] && echo "  Primary: $primary"
+        if [[ -n "$vlan" && "$vlan" != "0" ]]; then
+            echo "  VLAN: $vlan"
+        fi
+        echo "  IPv4: ${ipv4:-none}"
+        [[ -n "$gateway" ]] && echo "  Gateway: $gateway"
+        echo "  IPv6: ${ipv6:-none}"
+        echo "  Options: ${options:-none}"
+        local slaves=()
+        mapfile -t slaves < <(get_bond_slaves "$bond")
+        if (( ${#slaves[@]} == 0 )); then
+            echo "  Slaves: none"
+            continue
+        fi
+        echo "  Slaves:"
+        for slave in "${slaves[@]}"; do
+            local iface=$(nmcli_get_field connection.interface-name "$slave")
+            [[ -z "$iface" ]] && iface="$slave"
+            local info=($(get_nic_info "$iface"))
+            local speed="${info[0]:-Unknown}"
+            local status="${info[1]:-DOWN}"
+            echo "    - $iface (connection: $slave) speed: $speed link: $status"
+        done
+    done
+}
+
+export_bond_summary() {
+    local target_path=$1
+    local mode_flag=${2:-}
+    if [[ -z "$target_path" ]]; then
+        if [[ "$mode_flag" != "--no-clear" ]]; then
+            clear_screen
+        fi
+        echo "Export Bond Summary"
+        local default_path="/var/log/bond_manager/bond_summary.json"
+        local response=""
+        if read_input "Enter output path [$default_path]: " response true; then
+            target_path=${response:-$default_path}
+        else
+            target_path=$default_path
+        fi
+    fi
+    local bonds=()
+    mapfile -t bonds < <(list_bonds)
+    local tmp_file
+    tmp_file=$(mktemp)
+    TEMP_FILES+=("$tmp_file")
+    {
+        printf '{\n'
+        printf '  "generated_at": "%s",\n' "$(date -Iseconds)"
+        local host_name=$(hostname -f 2>/dev/null || hostname)
+        printf '  "host": "%s",\n' "$(json_escape "$host_name")"
+        printf '  "bonds": [\n'
+        for i in "${!bonds[@]}"; do
+            local bond="${bonds[$i]}"
+            local mode=$(get_bond_mode "$bond")
+            local options=$(nmcli_get_field bond.options "$bond")
+            local vlan=$(nmcli_get_field 802-3-ethernet.vlan "$bond")
+            local ipv4=$(nmcli_get_field ipv4.addresses "$bond")
+            local ipv6=$(nmcli_get_field ipv6.addresses "$bond")
+            local gateway=$(nmcli_get_field ipv4.gateway "$bond")
+            local primary=$(get_bond_option_value "$options" "primary")
+            printf '    {\n'
+            printf '      "name": "%s",\n' "$(json_escape "$bond")"
+            printf '      "mode": "%s",\n' "$(json_escape "${mode:-unknown}")"
+            if [[ -n "$primary" ]]; then
+                printf '      "primary": "%s",\n' "$(json_escape "$primary")"
+            else
+                printf '      "primary": null,\n'
+            fi
+            if [[ -n "$vlan" && "$vlan" != "0" ]]; then
+                printf '      "vlan": %s,\n' "$vlan"
+            else
+                printf '      "vlan": null,\n'
+            fi
+            printf '      "ipv4": %s,\n' "$(to_json_array "$ipv4")"
+            printf '      "ipv6": %s,\n' "$(to_json_array "$ipv6")"
+            if [[ -n "$gateway" ]]; then
+                printf '      "gateway": "%s",\n' "$(json_escape "$gateway")"
+            else
+                printf '      "gateway": null,\n'
+            fi
+            printf '      "options": %s,\n' "$(to_json_array "$options")"
+            local slaves=()
+            mapfile -t slaves < <(get_bond_slaves "$bond")
+            printf '      "slaves": [\n'
+            for j in "${!slaves[@]}"; do
+                local slave="${slaves[$j]}"
+                local iface=$(nmcli_get_field connection.interface-name "$slave")
+                [[ -z "$iface" ]] && iface="$slave"
+                local info=($(get_nic_info "$iface"))
+                local speed="${info[0]:-Unknown}"
+                local status="${info[1]:-DOWN}"
+                printf '        {\n'
+                printf '          "connection": "%s",\n' "$(json_escape "$slave")"
+                printf '          "interface": "%s",\n' "$(json_escape "$iface")"
+                printf '          "speed": "%s",\n' "$(json_escape "$speed")"
+                printf '          "link": "%s"\n' "$(json_escape "$status")"
+                if (( j == ${#slaves[@]} - 1 )); then
+                    printf '        }\n'
+                else
+                    printf '        },\n'
+                fi
+            done
+            printf '      ]\n'
+            if (( i == ${#bonds[@]} - 1 )); then
+                printf '    }\n'
+            else
+                printf '    },\n'
+            fi
+        done
+        printf '  ]\n'
+        printf '}\n'
+    } > "$tmp_file"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "Dry run: would export bond summary to $target_path"
+        return 0
+    fi
+    local dir
+    dir=$(dirname "$target_path")
+    if ! mkdir -p "$dir" 2>/dev/null; then
+        log ERROR "Failed to create directory $dir for bond summary"
+        echo "Error: Failed to create directory $dir" >&2
+        return 1
+    fi
+    if mv "$tmp_file" "$target_path" 2>/dev/null; then
+        chmod 640 "$target_path" 2>/dev/null || true
+        log INFO "Exported bond summary to $target_path"
+        echo "Bond summary exported to $target_path"
+        return 0
+    fi
+    log ERROR "Failed to move bond summary to $target_path"
+    echo "Error: Failed to write bond summary" >&2
+    return 1
+}
+
+collect_support_bundle() {
+    clear_screen
+    echo "Collect Support Bundle"
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local workdir
+    workdir=$(mktemp -d)
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "Dry run: would collect support bundle at $SUPPORT_DIR/support_${timestamp}.tar.gz"
+        rm -rf "$workdir"
+        return 0
+    fi
+    mkdir -p "$SUPPORT_DIR"
+    show_bond_summary --no-clear > "$workdir/bond_summary.txt" 2>&1 || true
+    export_bond_summary "$workdir/bond_summary.json" "--no-clear" > /dev/null 2>&1 || true
+    nmcli general status > "$workdir/nmcli_general_status.txt" 2>&1 || true
+    nmcli device status > "$workdir/nmcli_device_status.txt" 2>&1 || true
+    nmcli con show > "$workdir/nmcli_connections.txt" 2>&1 || true
+    ip addr show > "$workdir/ip_addr.txt" 2>&1 || true
+    ip route show > "$workdir/ip_route.txt" 2>&1 || true
+    hostnamectl status > "$workdir/hostnamectl.txt" 2>&1 || true
+    cp /etc/os-release "$workdir/os-release" 2>/dev/null || true
+    if [[ -f "$LOG_FILE" ]]; then
+        cp "$LOG_FILE" "$workdir/bond_manager.log" 2>/dev/null || true
+    fi
+    local bonds=()
+    mapfile -t bonds < <(list_bonds)
+    for bond in "${bonds[@]}"; do
+        if [[ -f "/proc/net/bonding/$bond" ]]; then
+            cp "/proc/net/bonding/$bond" "$workdir/bonding_$bond.txt" 2>/dev/null || true
+        fi
+    done
+    local interfaces=()
+    for bond in "${bonds[@]}"; do
+        local slaves=()
+        mapfile -t slaves < <(get_bond_slaves "$bond")
+        for slave in "${slaves[@]}"; do
+            local iface=$(nmcli_get_field connection.interface-name "$slave")
+            [[ -z "$iface" ]] && iface="$slave"
+            interfaces+=("$iface")
+        done
+    done
+    local unique_interfaces=()
+    local seen=""
+    for iface in "${interfaces[@]}"; do
+        [[ -z "$iface" ]] && continue
+        if [[ ",$seen," != *",$iface,"* ]]; then
+            unique_interfaces+=("$iface")
+            seen+="${iface},"
+        fi
+    done
+    for iface in "${unique_interfaces[@]}"; do
+        ethtool "$iface" > "$workdir/ethtool_$iface.txt" 2>&1 || true
+        ip -s link show "$iface" > "$workdir/ip_link_$iface.txt" 2>&1 || true
+    done
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl -u NetworkManager -n 300 > "$workdir/journalctl_NetworkManager.txt" 2>&1 || true
+    fi
+    local bundle="$SUPPORT_DIR/support_${timestamp}.tar.gz"
+    if tar -czf "$bundle" -C "$workdir" .; then
+        chmod 640 "$bundle" 2>/dev/null || true
+        log INFO "Collected support bundle at $bundle"
+        echo "Support bundle created at $bundle"
+    else
+        log ERROR "Failed to create support bundle archive"
+        echo "Error: Failed to create support bundle" >&2
+        rm -rf "$workdir"
+        return 1
+    fi
+    rm -rf "$workdir"
+    return 0
 }
 
 # Portable screen clear
@@ -101,6 +729,7 @@ backup_configs() {
         log "Warning: Backup failed"
         echo "Warning: Failed to create backup" >&2
     }
+    prune_old_backups
 }
 
 # Rollback to last backup
@@ -118,6 +747,7 @@ rollback() {
     log "Restoring from $last_backup"
     if tar -xzf "$last_backup" -C /etc/NetworkManager/system-connections/; then
         nmcli con reload
+        restore_selinux_context
         log "Rollback successful"
         echo "Rollback successful" >&2
     else
@@ -261,6 +891,7 @@ display_nics() {
 read_input() {
     local prompt=$1
     local var_name=$2
+    local allow_empty=${3:-false}
     local retries=0
     local input=""
     # Clear input buffer
@@ -269,19 +900,19 @@ read_input() {
         /bin/echo -n "$prompt" >&2
         if read -t $TIMEOUT -r input < /dev/tty 2>/dev/null; then
             # Sanitize input
-            input=$(echo "$input" | tr -d '\r\n' | sed 's/[^a-zA-Z0-9._ -]//g')
-            if [[ -n "$input" ]]; then
+            input=$(echo "$input" | tr -d '\r\n' | sed 's/[^a-zA-Z0-9._,:\/ -]//g')
+            if [[ -n "$input" || "$allow_empty" == "true" ]]; then
                 eval "$var_name='$input'"
                 return 0
             fi
-            log "Input timed out or empty, retry $((retries+1))/$MAX_RETRIES"
+            log WARN "Input timed out or empty, retry $((retries+1))/$MAX_RETRIES"
             ((retries++))
         else
-            log "Input read failed, retry $((retries+1))/$MAX_RETRIES"
+            log WARN "Input read failed, retry $((retries+1))/$MAX_RETRIES"
             ((retries++))
         fi
     done
-    log "Input timed out after $MAX_RETRIES retries"
+    log ERROR "Input timed out after $MAX_RETRIES retries"
     echo "Error: Input timed out" >&2
     return 1
 }
@@ -422,7 +1053,7 @@ create_bond() {
         return 1
     fi
     display_nics "" "${available_nics[@]}"
-    if ! read_input "Enter NIC numbers (e.g., '1 2' for ${available_nics[0]} and ${available_nics[1]}), 'q' to cancel, or press Enter to cancel: " nic_selection; then
+    if ! read_input "Enter NIC numbers (e.g., '1 2' for ${available_nics[0]} and ${available_nics[1]}), 'q' to cancel, or press Enter to cancel: " nic_selection true; then
         return 1
     fi
     if [[ "$nic_selection" == "q" || -z "$nic_selection" ]]; then
@@ -434,7 +1065,11 @@ create_bond() {
             echo "Error: Invalid NIC number: $num" >&2
             return 1
         fi
-        nics+=("${available_nics[$((num-1))]}")
+        local selected_nic="${available_nics[$((num-1))]}"
+        if ! validate_nic_ready "$selected_nic"; then
+            return 1
+        fi
+        nics+=("$selected_nic")
     done
     if [[ ${#nics[@]} -lt 2 ]]; then
         echo "Error: At least two NICs must be selected" >&2
@@ -448,32 +1083,32 @@ create_bond() {
         echo "Bond creation cancelled"
         return 0
     fi
-    if ! read_input "Enter VLAN ID (1-4094, optional, press Enter to skip): " vlan; then
+    if ! read_input "Enter VLAN ID (1-4094, optional, press Enter to skip): " vlan true; then
         return 1
     fi
     if ! validate_vlan_id "$vlan"; then
         return 1
     fi
-    if ! read_input "Enter IPv4 address (optional, press Enter to skip): " ipv4; then
+    if ! read_input "Enter IPv4 address (optional, press Enter to skip): " ipv4 true; then
         return 1
     fi
     if [[ -n "$ipv4" ]]; then
         ipv4=$(validate_ip "$ipv4") || return 1
     fi
-    if ! read_input "Enter IPv4 gateway (optional, press Enter to skip): " gateway; then
+    if ! read_input "Enter IPv4 gateway (optional, press Enter to skip): " gateway true; then
         return 1
     fi
     if ! validate_gateway "$gateway"; then
         return 1
     fi
-    if ! read_input "Enter IPv6 address (optional, press Enter to skip): " ipv6; then
+    if ! read_input "Enter IPv6 address (optional, press Enter to skip): " ipv6 true; then
         return 1
     fi
     if [[ -n "$ipv6" ]]; then
         ipv6=$(validate_ip "$ipv6") || return 1
     fi
     if [[ "$mode" == "active-backup" ]]; then
-        if ! read_input "Enter primary NIC (optional, press Enter to skip): " primary_nic; then
+        if ! read_input "Enter primary NIC (optional, press Enter to skip): " primary_nic true; then
             return 1
         fi
         if [[ -n "$primary_nic" ]] && ! [[ " ${nics[*]} " =~ " $primary_nic " ]]; then
@@ -495,6 +1130,10 @@ create_bond() {
             rollback
             return 1
         fi
+    fi
+    if ! configure_bond_options "$bond_name" "$mode"; then
+        rollback
+        return 1
     fi
     for nic in "${nics[@]}"; do
         local slave_cmd=("nmcli" "con" "add" "type" "ethernet" "ifname" "$nic" "master" "$bond_name")
@@ -584,6 +1223,7 @@ create_bond() {
         fi
         log "Bond $bond_name created and activated successfully"
         echo "Bond $bond_name created successfully"
+        restore_selinux_context
     else
         log "Failed to activate bond $bond_name"
         echo "Error: Failed to activate bond" >&2
@@ -621,7 +1261,7 @@ edit_bond() {
     for i in "${!BOND_MODES[@]}"; do
         printf "%d) %s\n" $((i+1)) "${BOND_MODES[$i]}"
     done
-    if ! read_input "Enter mode number (1-${#BOND_MODES[@]}, press Enter to keep current): " mode_num; then
+    if ! read_input "Enter mode number (1-${#BOND_MODES[@]}, press Enter to keep current): " mode_num true; then
         return 1
     fi
     if [[ -n "$mode_num" ]]; then
@@ -633,7 +1273,7 @@ edit_bond() {
     fi
     local available_nics=($(get_available_nics))
     display_nics "$bond_name" "${available_nics[@]}"
-    if ! read_input "Enter NIC numbers to add/remove (e.g., '1 2', press Enter to keep current, 'q' to cancel): " nic_selection; then
+    if ! read_input "Enter NIC numbers to add/remove (e.g., '1 2', press Enter to keep current, 'q' to cancel): " nic_selection true; then
         return 1
     fi
     if [[ "$nic_selection" == "q" ]]; then
@@ -646,7 +1286,11 @@ edit_bond() {
                 echo "Error: Invalid NIC number: $num" >&2
                 return 1
             fi
-            nics+=("${available_nics[$((num-1))]}")
+            local selected_nic="${available_nics[$((num-1))]}"
+            if ! validate_nic_ready "$selected_nic"; then
+                return 1
+            fi
+            nics+=("$selected_nic")
         done
         if [[ ${#nics[@]} -lt 2 ]]; then
             echo "Error: At least two NICs must be selected" >&2
@@ -661,32 +1305,32 @@ edit_bond() {
             return 0
         fi
     fi
-    if ! read_input "Enter VLAN ID (1-4094, optional, press Enter to keep current or skip): " vlan; then
+    if ! read_input "Enter VLAN ID (1-4094, optional, press Enter to keep current or skip): " vlan true; then
         return 1
     fi
     if ! validate_vlan_id "$vlan"; then
         return 1
     fi
-    if ! read_input "Enter IPv4 address (optional, press Enter to keep current or skip): " ipv4; then
+    if ! read_input "Enter IPv4 address (optional, press Enter to keep current or skip): " ipv4 true; then
         return 1
     fi
     if [[ -n "$ipv4" ]]; then
         ipv4=$(validate_ip "$ipv4") || return 1
     fi
-    if ! read_input "Enter IPv4 gateway (optional, press Enter to keep current or skip): " gateway; then
+    if ! read_input "Enter IPv4 gateway (optional, press Enter to keep current or skip): " gateway true; then
         return 1
     fi
     if ! validate_gateway "$gateway"; then
         return 1
     fi
-    if ! read_input "Enter IPv6 address (optional, press Enter to keep current or skip): " ipv6; then
+    if ! read_input "Enter IPv6 address (optional, press Enter to keep current or skip): " ipv6 true; then
         return 1
     fi
     if [[ -n "$ipv6" ]]; then
         ipv6=$(validate_ip "$ipv6") || return 1
     fi
     if [[ -n "$mode" && "$mode" == "active-backup" ]]; then
-        if ! read_input "Enter primary NIC (optional, press Enter to keep current or skip): " primary_nic; then
+        if ! read_input "Enter primary NIC (optional, press Enter to keep current or skip): " primary_nic true; then
             return 1
         fi
         if [[ -n "$primary_nic" ]] && ! [[ " ${nics[*]} " =~ " $primary_nic " ]]; then
@@ -744,6 +1388,14 @@ edit_bond() {
                 fi
             fi
         done
+    fi
+    local effective_mode="$mode"
+    if [[ -z "$effective_mode" ]]; then
+        effective_mode=$(get_bond_mode "$bond_name")
+    fi
+    if ! configure_bond_options "$bond_name" "$effective_mode"; then
+        rollback
+        return 1
     fi
     if [[ -n "$vlan" ]]; then
         local vlan_cmd=("nmcli" "con" "mod" "$bond_name" "802-3-ethernet.vlan" "$vlan")
@@ -818,6 +1470,7 @@ edit_bond() {
         fi
         log "Bond $bond_name edited and activated successfully"
         echo "Bond $bond_name edited successfully"
+        restore_selinux_context
     else
         log "Failed to activate bond $bond_name"
         echo "Error: Failed to activate bond" >&2
@@ -881,6 +1534,7 @@ remove_bond() {
         if "${bond_cmd[@]}" &>>"$LOG_FILE"; then
             log "Removed bond $bond_name"
             echo "Bond $bond_name removed successfully"
+            restore_selinux_context
         else
             log "Failed to remove bond $bond_name"
             echo "Error: Failed to remove bond" >&2
@@ -972,6 +1626,7 @@ repair_bond() {
         echo "Bond $bond_name repaired and activated"
         log "Bond $bond_name repaired and activated"
         echo "Bond $bond_name repaired successfully"
+        restore_selinux_context
     else
         log "Failed to activate bond $bond_name"
         echo "Error: Failed to activate bond" >&2
@@ -1078,6 +1733,7 @@ repair_bond_10gb_ab() {
         echo "Bond $bond_name repaired and activated"
         log "Bond $bond_name repaired and activated"
         echo "Bond $bond_name repaired successfully"
+        restore_selinux_context
     else
         log "Failed to activate bond $bond_name"
         echo "Error: Failed to activate bond" >&2
@@ -1199,7 +1855,7 @@ switch_migration() {
         return 1
     fi
     display_nics "$bond_name" "${available_nics[@]}"
-    if ! read_input "Enter new NIC numbers (e.g., '1 2'), 'q' to cancel: " nic_selection; then
+    if ! read_input "Enter new NIC numbers (e.g., '1 2'), 'q' to cancel: " nic_selection true; then
         return 1
     fi
     if [[ "$nic_selection" == "q" ]]; then
@@ -1211,7 +1867,11 @@ switch_migration() {
             echo "Error: Invalid NIC number: $num" >&2
             return 1
         fi
-        new_nics+=("${available_nics[$((num-1))]}")
+        local selected_nic="${available_nics[$((num-1))]}"
+        if ! validate_nic_ready "$selected_nic"; then
+            return 1
+        fi
+        new_nics+=("$selected_nic")
     done
     if [[ ${#new_nics[@]} -lt 2 ]]; then
         echo "Error: At least two NICs must be selected" >&2
@@ -1253,12 +1913,23 @@ switch_migration() {
             rollback
             return 1
         fi
-        # Remove old slaves
-        local old_slaves=()
-        mapfile -t old_slaves < <(
-            get_bond_slaves "$bond_name" | grep -v "$(echo "${new_nics[*]}" | tr ' ' '|')"
-        )
-        for slave in "${old_slaves[@]}"; do
+        # Remove old slaves not in the new selection
+        local current_slave_conns=()
+        mapfile -t current_slave_conns < <(get_bond_slaves "$bond_name")
+        local slaves_to_remove=()
+        for slave in "${current_slave_conns[@]}"; do
+            local iface=$(nmcli_get_field connection.interface-name "$slave")
+            [[ -z "$iface" ]] && iface="$slave"
+            local keep=0
+            for nic in "${new_nics[@]}"; do
+                if [[ "$iface" == "$nic" ]]; then
+                    keep=1
+                    break
+                fi
+            done
+            [[ $keep -eq 0 ]] && slaves_to_remove+=("$slave")
+        done
+        for slave in "${slaves_to_remove[@]}"; do
             local slave_cmd=("nmcli" "con" "del" "$slave")
             if [[ "$DRY_RUN" == "true" ]]; then
                 echo "${slave_cmd[*]}"
@@ -1275,6 +1946,7 @@ switch_migration() {
         done
         log "Switch migration for bond $bond_name completed"
         echo "Switch migration for bond $bond_name completed successfully"
+        restore_selinux_context
     else
         log "Failed to activate bond $bond_name after migration"
         echo "Error: Failed to activate bond after migration" >&2
@@ -1323,7 +1995,7 @@ ten_gb_migration() {
         return 1
     fi
     display_nics "" "${available_nics[@]}"
-    if ! read_input "Enter NIC numbers for new 10Gb bond (e.g., '1 2'), 'q' to cancel: " nic_selection; then
+    if ! read_input "Enter NIC numbers for new 10Gb bond (e.g., '1 2'), 'q' to cancel: " nic_selection true; then
         return 1
     fi
     if [[ "$nic_selection" == "q" ]]; then
@@ -1335,7 +2007,11 @@ ten_gb_migration() {
             echo "Error: Invalid NIC number: $num" >&2
             return 1
         fi
-        new_nics+=("${available_nics[$((num-1))]}")
+        local selected_nic="${available_nics[$((num-1))]}"
+        if ! validate_nic_ready "$selected_nic"; then
+            return 1
+        fi
+        new_nics+=("$selected_nic")
     done
     if [[ ${#new_nics[@]} -lt 2 ]]; then
         echo "Error: At least two NICs must be selected" >&2
@@ -1369,6 +2045,10 @@ ten_gb_migration() {
             rollback
             return 1
         fi
+    fi
+    if ! configure_bond_options "$new_bond" "$mode"; then
+        rollback
+        return 1
     fi
     for nic in "${new_nics[@]}"; do
         local slave_cmd=("nmcli" "con" "add" "type" "ethernet" "ifname" "$nic" "master" "$new_bond")
@@ -1458,6 +2138,7 @@ ten_gb_migration() {
         fi
         log "10Gb migration to bond $new_bond completed"
         echo "10Gb migration to bond $new_bond completed successfully"
+        restore_selinux_context
     else
         log "Failed to activate new bond $new_bond"
         echo "Error: Failed to activate new bond" >&2
@@ -1468,8 +2149,6 @@ ten_gb_migration() {
 
 # Main menu
 main_menu() {
-    DRY_RUN=false
-    DEBUG=false
     while [[ $# -gt 0 ]]; do
         case $1 in
             -n|--dry-run)
@@ -1480,10 +2159,24 @@ main_menu() {
                 DEBUG=true
                 shift
                 ;;
+            --status)
+                STATUS_MODE=true
+                shift
+                ;;
+            --export-json)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --export-json requires a path argument" >&2
+                    exit 1
+                fi
+                EXPORT_JSON_PATH=$2
+                shift 2
+                ;;
             --help)
                 echo "Usage: $0 [-n|--dry-run] [--debug] [--help]"
                 echo "  -n, --dry-run: Echo commands without executing"
                 echo "  --debug: Enable verbose output"
+                echo "  --status: Print bond summary and exit"
+                echo "  --export-json <path>: Export bond summary to JSON and exit"
                 echo "  --help: Show this help message"
                 exit 0
                 ;;
@@ -1494,6 +2187,17 @@ main_menu() {
         esac
     done
     [[ "$DEBUG" == "true" ]] && set -x
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        show_bond_summary --no-clear
+        if [[ -n "$EXPORT_JSON_PATH" ]]; then
+            export_bond_summary "$EXPORT_JSON_PATH" "--no-clear"
+        fi
+        exit 0
+    fi
+    if [[ -n "$EXPORT_JSON_PATH" ]]; then
+        export_bond_summary "$EXPORT_JSON_PATH" "--no-clear"
+        exit 0
+    fi
     while true; do
         clear_screen
         echo "Bond Manager v$VERSION"
@@ -1507,8 +2211,11 @@ main_menu() {
         echo "7) Create bond"
         echo "8) Edit bond"
         echo "9) Remove bond"
-        echo "10) Show version"
-        echo "11) Exit"
+        echo "10) Show bond summary"
+        echo "11) Export bond summary (JSON)"
+        echo "12) Collect support bundle"
+        echo "13) Show version"
+        echo "14) Exit"
         if ! read_input "Select an option: " option; then
             continue
         fi
@@ -1544,10 +2251,19 @@ main_menu() {
                 remove_bond
                 ;;
             10)
+                show_bond_summary
+                ;;
+            11)
+                export_bond_summary ""
+                ;;
+            12)
+                collect_support_bundle
+                ;;
+            13)
                 clear_screen
                 echo "Bond Manager v$VERSION"
                 ;;
-            11)
+            14)
                 clear_screen
                 exit 0
                 ;;
@@ -1565,4 +2281,5 @@ main_menu() {
 }
 
 # Run main menu
+preflight_checks
 main_menu "$@"
