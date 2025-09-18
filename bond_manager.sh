@@ -1168,28 +1168,42 @@ create_bond() {
         return 1
     fi
     display_nics "" "${available_nics[@]}"
-    if ! read_input "Enter NIC numbers (e.g., '1 2' for ${available_nics[0]} and ${available_nics[1]}), 'q' to cancel, or press Enter to cancel: " nic_selection true; then
-        return 1
-    fi
-    if [[ "$nic_selection" == "q" || -z "$nic_selection" ]]; then
-        echo "Bond creation cancelled"
-        return 0
-    fi
-    for num in $nic_selection; do
-        if [[ ! "$num" =~ ^[0-9]+$ ]] || ((num < 1 || num > ${#available_nics[@]})); then
-            echo "Error: Invalid NIC number: $num" >&2
+    while true; do
+        if ! read_input "Enter NIC numbers (e.g., '1 2' for ${available_nics[0]} and ${available_nics[1]}), 'q' to cancel, or press Enter to cancel: " nic_selection true; then
             return 1
         fi
-        local selected_nic="${available_nics[$((num-1))]}"
-        if ! validate_nic_ready "$selected_nic"; then
-            return 1
+        if [[ "$nic_selection" == "q" || -z "$nic_selection" ]]; then
+            echo "Bond creation cancelled"
+            return 0
         fi
-        nics+=("$selected_nic")
+        local nic_indexes=()
+        local old_ifs=$IFS
+        IFS=$' \t,'
+        read -r -a nic_indexes <<< "$nic_selection"
+        IFS=$old_ifs
+        if (( ${#nic_indexes[@]} < 2 )); then
+            echo "Error: At least two NICs must be selected" >&2
+            continue
+        fi
+        nics=()
+        local selection_valid=true
+        for num in "${nic_indexes[@]}"; do
+            if [[ ! "$num" =~ ^[0-9]+$ ]] || ((num < 1 || num > ${#available_nics[@]})); then
+                echo "Error: Invalid NIC number: $num" >&2
+                selection_valid=false
+                break
+            fi
+            local selected_nic="${available_nics[$((num-1))]}"
+            if ! validate_nic_ready "$selected_nic"; then
+                selection_valid=false
+                break
+            fi
+            nics+=("$selected_nic")
+        done
+        if [[ "$selection_valid" == "true" ]]; then
+            break
+        fi
     done
-    if [[ ${#nics[@]} -lt 2 ]]; then
-        echo "Error: At least two NICs must be selected" >&2
-        return 1
-    fi
     echo "Selected NICs: ${nics[*]}"
     if ! read_input "Confirm selection? (y/n): " confirm; then
         return 1
@@ -1396,20 +1410,32 @@ edit_bond() {
         return 0
     fi
     if [[ -n "$nic_selection" ]]; then
-        for num in $nic_selection; do
+        local nic_indexes=()
+        local old_ifs=$IFS
+        IFS=$' \t,'
+        read -r -a nic_indexes <<< "$nic_selection"
+        IFS=$old_ifs
+        if (( ${#nic_indexes[@]} < 2 )); then
+            echo "Error: At least two NICs must be selected" >&2
+            return 0
+        fi
+        nics=()
+        local selection_valid=true
+        for num in "${nic_indexes[@]}"; do
             if [[ ! "$num" =~ ^[0-9]+$ ]] || ((num < 1 || num > ${#available_nics[@]})); then
                 echo "Error: Invalid NIC number: $num" >&2
-                return 1
+                selection_valid=false
+                break
             fi
             local selected_nic="${available_nics[$((num-1))]}"
             if ! validate_nic_ready "$selected_nic"; then
-                return 1
+                selection_valid=false
+                break
             fi
             nics+=("$selected_nic")
         done
-        if [[ ${#nics[@]} -lt 2 ]]; then
-            echo "Error: At least two NICs must be selected" >&2
-            return 1
+        if [[ "$selection_valid" != "true" ]]; then
+            return 0
         fi
         echo "Selected NICs: ${nics[*]}"
         if ! read_input "Confirm selection? (y/n): " confirm; then
@@ -1977,20 +2003,32 @@ switch_migration() {
         echo "Switch migration cancelled"
         return 0
     fi
-    for num in $nic_selection; do
+    local nic_indexes=()
+    local old_ifs=$IFS
+    IFS=$' \t,'
+    read -r -a nic_indexes <<< "$nic_selection"
+    IFS=$old_ifs
+    if (( ${#nic_indexes[@]} < 2 )); then
+        echo "Error: At least two NICs must be selected" >&2
+        return 0
+    fi
+    new_nics=()
+    local selection_valid=true
+    for num in "${nic_indexes[@]}"; do
         if [[ ! "$num" =~ ^[0-9]+$ ]] || ((num < 1 || num > ${#available_nics[@]})); then
             echo "Error: Invalid NIC number: $num" >&2
-            return 1
+            selection_valid=false
+            break
         fi
         local selected_nic="${available_nics[$((num-1))]}"
         if ! validate_nic_ready "$selected_nic"; then
-            return 1
+            selection_valid=false
+            break
         fi
         new_nics+=("$selected_nic")
     done
-    if [[ ${#new_nics[@]} -lt 2 ]]; then
-        echo "Error: At least two NICs must be selected" >&2
-        return 1
+    if [[ "$selection_valid" != "true" ]]; then
+        return 0
     fi
     echo "Selected new NICs: ${new_nics[*]}"
     if ! read_input "Confirm migration to new NICs? (y/n): " confirm; then
@@ -2117,20 +2155,32 @@ ten_gb_migration() {
         echo "10Gb migration cancelled"
         return 0
     fi
-    for num in $nic_selection; do
+    local nic_indexes=()
+    local old_ifs=$IFS
+    IFS=$' \t,'
+    read -r -a nic_indexes <<< "$nic_selection"
+    IFS=$old_ifs
+    if (( ${#nic_indexes[@]} < 2 )); then
+        echo "Error: At least two NICs must be selected" >&2
+        return 0
+    fi
+    new_nics=()
+    local selection_valid=true
+    for num in "${nic_indexes[@]}"; do
         if [[ ! "$num" =~ ^[0-9]+$ ]] || ((num < 1 || num > ${#available_nics[@]})); then
             echo "Error: Invalid NIC number: $num" >&2
-            return 1
+            selection_valid=false
+            break
         fi
         local selected_nic="${available_nics[$((num-1))]}"
         if ! validate_nic_ready "$selected_nic"; then
-            return 1
+            selection_valid=false
+            break
         fi
         new_nics+=("$selected_nic")
     done
-    if [[ ${#new_nics[@]} -lt 2 ]]; then
-        echo "Error: At least two NICs must be selected" >&2
-        return 1
+    if [[ "$selection_valid" != "true" ]]; then
+        return 0
     fi
     echo "Selected 10Gb NICs: ${new_nics[*]}"
     if ! read_input "Confirm creation of new 10Gb bond? (y/n): " confirm; then
