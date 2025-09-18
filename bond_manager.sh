@@ -880,7 +880,9 @@ get_available_nics() {
     fi
     log DEBUG "Discovered NIC candidates: $summary"
 
-    echo "${available[@]}"
+    if (( ${#available[@]} > 0 )); then
+        printf '%s\n' "${available[@]}"
+    fi
 }
 
 # Get NIC speed and status
