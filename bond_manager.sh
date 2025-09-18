@@ -1420,7 +1420,7 @@ prompt_rollback() {
 pause_continue() {
     local prev_timeout=$TIMEOUT
     TIMEOUT=15
-    read_input "Press Enter to continue..." _ || true
+    read_input "Press Enter to continue..." _ true || true
     TIMEOUT=$prev_timeout
 }
 
