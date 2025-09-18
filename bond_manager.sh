@@ -20,6 +20,12 @@ BOND_MODES=("balance-rr" "active-backup" "balance-xor" "broadcast" "802.3ad" "ba
 TEMP_FILES=()
 SUPPORT_DIR="/var/log/bond_manager/support"
 
+# NetworkManager device metadata caches
+declare -Ag DEVICE_CONNECTION_MAP=()
+declare -Ag DEVICE_STATE_MAP=()
+CURRENT_PRIMARY_DEVICE=""
+CURRENT_PRIMARY_CONNECTION=""
+
 # Global state flags
 DEBUG=false
 DRY_RUN=false
@@ -800,9 +806,12 @@ get_available_nics() {
     local -a fallback=()
     declare -A skip_map=()
     declare -A seen=()
-    local bond line nic dev type state flags
+    local bond line nic dev type state flags connection
     local broadcast_re='^[^<]*<([^>]*)>'
     local summary="none"
+
+    DEVICE_CONNECTION_MAP=()
+    DEVICE_STATE_MAP=()
 
     # Track interfaces that are already enslaved in an existing bond
     for bond in /proc/net/bonding/*; do
@@ -815,10 +824,17 @@ get_available_nics() {
     done
 
     # Prefer idle Ethernet devices reported by NetworkManager
-    while IFS=: read -r dev type state; do
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        IFS=: read -r dev type state _ <<<"$line"
         [[ -z "$dev" ]] && continue
         [[ $type == "ethernet" || $type == "802-3-ethernet" ]] || continue
         [[ -n ${skip_map[$dev]+x} ]] && continue
+        connection=${line#"$dev:$type:$state"}
+        connection=${connection#:}
+        [[ -z "$connection" ]] && connection="--"
+        DEVICE_CONNECTION_MAP["$dev"]="$connection"
+        DEVICE_STATE_MAP["$dev"]="$state"
         if [[ $state == connected* || $state == connecting* || $state == activating* ]]; then
             if [[ -z ${seen[$dev]+x} ]]; then
                 busy+=("$dev")
@@ -830,7 +846,7 @@ get_available_nics() {
                 seen[$dev]=1
             fi
         fi
-    done < <(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null || true)
+    done < <(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>/dev/null || true)
 
     # Capture any additional active Ethernet devices so they can be offered as a fallback
     while IFS=: read -r dev type; do
@@ -872,8 +888,55 @@ get_available_nics() {
     fi
     log DEBUG "Discovered NIC candidates: $summary"
 
+    detect_primary_connection
+
+    if [[ -n "$CURRENT_PRIMARY_DEVICE" ]]; then
+        local active_conn="${CURRENT_PRIMARY_CONNECTION:-none}"
+        log DEBUG "Primary network path detected via $CURRENT_PRIMARY_DEVICE (connection: $active_conn)"
+    else
+        log DEBUG "Unable to determine primary network path"
+    fi
+
     if (( ${#available[@]} > 0 )); then
         printf '%s\n' "${available[@]}"
+    fi
+}
+
+detect_primary_connection() {
+    CURRENT_PRIMARY_DEVICE=""
+    CURRENT_PRIMARY_CONNECTION=""
+
+    local remote_info="${SSH_CONNECTION:-}"
+    local candidate_dev=""
+    if [[ -n "$remote_info" ]]; then
+        local remote_host="${remote_info%% *}"
+        if [[ -n "$remote_host" ]]; then
+            candidate_dev=$(ip route get "$remote_host" 2>/dev/null | \
+                awk '/ dev / {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+        fi
+    fi
+
+    if [[ -z "$candidate_dev" ]]; then
+        candidate_dev=$(ip route show default 2>/dev/null | \
+            awk '/default/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+    fi
+    if [[ -z "$candidate_dev" ]]; then
+        candidate_dev=$(ip -6 route show default 2>/dev/null | \
+            awk '/default/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+    fi
+
+    if [[ -n "$candidate_dev" ]]; then
+        CURRENT_PRIMARY_DEVICE="$candidate_dev"
+        local active_conn=""
+        if [[ -n ${DEVICE_CONNECTION_MAP[$candidate_dev]+x} ]]; then
+            active_conn="${DEVICE_CONNECTION_MAP[$candidate_dev]}"
+        else
+            active_conn=$(nmcli -t -f DEVICE,CONNECTION device status 2>/dev/null | \
+                awk -F: -v dev="$candidate_dev" '$1==dev {sub($1 FS, ""); print; exit}')
+        fi
+        if [[ -n "$active_conn" && "$active_conn" != "--" ]]; then
+            CURRENT_PRIMARY_CONNECTION="$active_conn"
+        fi
     fi
 }
 
@@ -917,7 +980,25 @@ display_nics() {
         done
         local IFS=' '
         read -r speed status < <(get_nic_info "${nics[$i]}")
-        printf "%d) %s (%s, %s)%s\n" $((i+1)) "${nics[$i]}" "$speed" "$status" "$slave_mark"
+        local nic="${nics[$i]}"
+        local nm_summary=""
+        if [[ -n ${DEVICE_STATE_MAP[$nic]+x} || -n ${DEVICE_CONNECTION_MAP[$nic]+x} ]]; then
+            local state_display="${DEVICE_STATE_MAP[$nic]:-unknown}"
+            local connection_display="none"
+            local nm_connection="${DEVICE_CONNECTION_MAP[$nic]:-}"
+            if [[ -n "$nm_connection" && "$nm_connection" != "--" ]]; then
+                connection_display="$nm_connection"
+            fi
+            nm_summary=" [NM: $state_display, conn: $connection_display]"
+        fi
+        if [[ "$nic" == "$CURRENT_PRIMARY_DEVICE" ]]; then
+            if [[ -n "$CURRENT_PRIMARY_CONNECTION" ]]; then
+                nm_summary+=" {primary route: $CURRENT_PRIMARY_CONNECTION}"
+            else
+                nm_summary+=" {primary route}"
+            fi
+        fi
+        printf "%d) %s (%s, %s)%s%s\n" $((i+1)) "$nic" "$speed" "$status" "$slave_mark" "$nm_summary"
     done
 }
 
