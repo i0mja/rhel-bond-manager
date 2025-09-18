@@ -795,52 +795,92 @@ pause_continue() {
 
 # Get available Ethernet NICs
 get_available_nics() {
-    local nics=()
-    local enslaved_nics=()
-    local exclude_nics=()
+    local -a available=()
+    local -a busy_candidates=()
+    declare -A skip_map=()
+    declare -A added_map=()
+    declare -A busy_seen=()
+    local bond line nic dev type state
+    local summary="none"
 
-    # Collect NICs currently enslaved in bonds
+    # Track interfaces that are already enslaved in an existing bond
     for bond in /proc/net/bonding/*; do
-        if [[ -f "$bond" ]]; then
-            while IFS= read -r line; do
-                if [[ $line =~ ^Slave\ Interface:\ (.*)$ ]]; then
-                    enslaved_nics+=("${BASH_REMATCH[1]}")
-                fi
-            done < "$bond"
-        fi
+        [[ -f "$bond" ]] || continue
+        while IFS= read -r line; do
+            if [[ $line =~ ^Slave\ Interface:\ (.*)$ ]]; then
+                skip_map["${BASH_REMATCH[1]}"]=1
+            fi
+        done < "$bond"
     done
 
-    # Collect active standalone Ethernet interfaces
-    while IFS=: read -r dev type; do
-        if [[ $type == "ethernet" || $type == "802-3-ethernet" ]]; then
-            local is_slave=0
-            for slave in "${enslaved_nics[@]}"; do
-                if [[ $dev == "$slave" ]]; then
-                    is_slave=1
-                    break
-                fi
-            done
-            [[ $is_slave -eq 0 ]] && exclude_nics+=("$dev")
+    # Prefer idle Ethernet devices reported by NetworkManager
+    while IFS=: read -r dev type state; do
+        [[ -z "$dev" ]] && continue
+        [[ $type == "ethernet" || $type == "802-3-ethernet" ]] || continue
+        [[ -n ${skip_map[$dev]+x} ]] && continue
+        if [[ -n ${added_map[$dev]+x} || -n ${busy_seen[$dev]+x} ]]; then
+            continue
         fi
-    done < <(nmcli -t -f DEVICE,TYPE connection show --active)
-
-    # Parse all Ethernet interfaces from ip -o link show
-    while IFS= read -r line; do
-        if [[ $line =~ ^[0-9]+:\s+(\S+): ]]; then
-            local nic="${BASH_REMATCH[1]}"
-            [[ $nic =~ ^(en|eth|ens|eno).* ]] || continue
-            local skip=0
-            for exclude in "${enslaved_nics[@]}" "${exclude_nics[@]}"; do
-                if [[ $nic == "$exclude" ]]; then
-                    skip=1
-                    break
-                fi
-            done
-            [[ $skip -eq 0 ]] && nics+=("$nic")
+        if [[ $state == connected* || $state == connecting* || $state == activating* ]]; then
+            busy_candidates+=("$dev")
+            busy_seen[$dev]=1
+        else
+            available+=("$dev")
+            added_map[$dev]=1
         fi
-    done < <(ip -o link show)
+    done < <(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null || true)
 
-    echo "${nics[@]}"
+    # Capture any additional active Ethernet devices so they can be offered as a fallback
+    if (( ${#available[@]} < 2 )); then
+        while IFS=: read -r dev type; do
+            [[ -z "$dev" ]] && continue
+            [[ $type == "ethernet" || $type == "802-3-ethernet" ]] || continue
+            [[ -n ${skip_map[$dev]+x} ]] && continue
+            if [[ -n ${added_map[$dev]+x} || -n ${busy_seen[$dev]+x} ]]; then
+                continue
+            fi
+            busy_candidates+=("$dev")
+            busy_seen[$dev]=1
+        done < <(nmcli -t -f DEVICE,TYPE connection show --active 2>/dev/null || true)
+    fi
+
+    # If fewer than two idle NICs are available, offer busy ones as a fallback choice
+    if (( ${#available[@]} < 2 )); then
+        for nic in "${busy_candidates[@]}"; do
+            if [[ -n ${added_map[$nic]+x} ]]; then
+                continue
+            fi
+            available+=("$nic")
+            added_map[$nic]=1
+            (( ${#available[@]} >= 2 )) && break
+        done
+    fi
+
+    # Fallback to ip(8) enumeration for NICs not managed by NetworkManager
+    if (( ${#available[@]} < 2 )); then
+        while IFS= read -r line; do
+            [[ $line == *"link/ether"* ]] || continue
+            if [[ $line =~ ^[0-9]+:\ ([^:@]+)[:@] ]]; then
+                nic="${BASH_REMATCH[1]}"
+            else
+                continue
+            fi
+            [[ $nic =~ ^(en|eth|em|p[0-9]).* ]] || continue
+            [[ -n ${skip_map[$nic]+x} ]] && continue
+            if [[ -n ${added_map[$nic]+x} ]]; then
+                continue
+            fi
+            available+=("$nic")
+            added_map[$nic]=1
+        done < <(ip -o link show 2>/dev/null || true)
+    fi
+
+    if (( ${#available[@]} > 0 )); then
+        summary="${available[*]}"
+    fi
+    log DEBUG "Discovered NIC candidates: $summary"
+
+    echo "${available[@]}"
 }
 
 # Get NIC speed and status
