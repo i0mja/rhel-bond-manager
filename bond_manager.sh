@@ -20,6 +20,111 @@ BOND_MODES=("balance-rr" "active-backup" "balance-xor" "broadcast" "802.3ad" "ba
 TEMP_FILES=()
 SUPPORT_DIR="/var/log/bond_manager/support"
 
+# Workload awareness metadata
+declare -a WORKLOAD_LIST=()
+declare -Ag WORKLOAD_RECOMMENDATIONS=()
+declare -Ag WORKLOAD_RATIONALES=()
+declare -Ag WORKLOAD_TUNING=()
+declare -Ag WORKLOAD_PITFALLS=()
+declare -Ag WORKLOAD_SWITCH_REQS=()
+declare -Ag MODE_WARNINGS=()
+declare -Ag MODE_TUNING=()
+declare -a DETECTED_WORKLOADS=()
+PRIMARY_WORKLOAD=""
+MANUAL_RECOMMENDATION_MODE=""
+MANUAL_RECOMMENDATION_SOURCE=""
+MANUAL_RECOMMENDATION_WORKLOAD=""
+MANUAL_RECOMMENDATION_NOTES=""
+MANUAL_RECOMMENDATION_PITFALLS=""
+declare -Ag SWITCH_CAPABILITIES_CACHE=()
+
+init_workload_profiles() {
+    WORKLOAD_LIST=(
+        "Elasticsearch"
+        "Cloudera Data Lake"
+        "Hadoop/HDFS"
+        "OLTP Database"
+        "Virtualization/VM Farm"
+        "Kubernetes/OpenShift"
+    )
+
+    WORKLOAD_RECOMMENDATIONS=(
+        ["Elasticsearch"]="802.3ad"
+        ["Cloudera Data Lake"]="802.3ad"
+        ["Hadoop/HDFS"]="balance-xor"
+        ["OLTP Database"]="active-backup"
+        ["Virtualization/VM Farm"]="balance-alb"
+        ["Kubernetes/OpenShift"]="802.3ad"
+    )
+
+    WORKLOAD_RATIONALES=(
+        ["Elasticsearch"]="Distributed indexing benefits from parallel uplinks with deterministic hashing."
+        ["Cloudera Data Lake"]="Cluster services stream replica traffic that thrives on LACP hashing across links."
+        ["Hadoop/HDFS"]="Static hashing keeps mapper/replica flows balanced without requiring full LACP."
+        ["OLTP Database"]="Predictable failover keeps latency-sensitive database sessions stable."
+        ["Virtualization/VM Farm"]="Adaptive load balancing feeds many guests without switch configuration."
+        ["Kubernetes/OpenShift"]="Container east-west chatter saturates multiple links when LACP is available."
+    )
+
+    WORKLOAD_TUNING=(
+        ["Elasticsearch"]="Use xmit_hash_policy=layer3+4 and lacp_rate=fast for balanced shard replication."
+        ["Cloudera Data Lake"]="Enable LACP fast rate, set miimon=100, and prefer layer3+4 hashing for HDFS pipelines."
+        ["Hadoop/HDFS"]="Apply xmit_hash_policy=layer3+4 with updelay/downdelay tuned for rack failover."
+        ["OLTP Database"]="Set miimon=100, define a primary interface, and monitor failover latency."
+        ["Virtualization/VM Farm"]="Ensure arp_interval=100 with reliable ARP targets to maintain guest connectivity."
+        ["Kubernetes/OpenShift"]="Pair with lacp_rate=fast and consistent MTU for pod overlay stability."
+    )
+
+    WORKLOAD_PITFALLS=(
+        ["Elasticsearch"]="Mixed NIC speeds cause shard hotspots; always pair identical ports."
+        ["Cloudera Data Lake"]="Switch misconfiguration leads to orphaned HDFS pipelines. Validate LACP on both ends."
+        ["Hadoop/HDFS"]="Uneven hashing produces reducer skew if NIC speeds differ."
+        ["OLTP Database"]="Parallel active paths can break session pinning; avoid load-sharing modes."
+        ["Virtualization/VM Farm"]="ARP negotiation fails if upstream firewalls drop gratuitous ARP traffic."
+        ["Kubernetes/OpenShift"]="Falling back to single links throttles pod egress; confirm LACP is stable."
+    )
+
+    WORKLOAD_SWITCH_REQS=(
+        ["Elasticsearch"]="Requires LACP-enabled upstream switch pair."
+        ["Cloudera Data Lake"]="Requires multi-chassis LACP across the data lake top-of-rack pair."
+        ["Hadoop/HDFS"]="Switches must support static LAG with layer3+4 hashing."
+        ["OLTP Database"]="No switch changes required; works with basic switching fabrics."
+        ["Virtualization/VM Farm"]="Switches should allow gratuitous ARP responses for MAC rebalancing."
+        ["Kubernetes/OpenShift"]="Leaf switches must expose LACP with fast timers enabled."
+    )
+
+    MODE_WARNINGS=(
+        ["balance-rr"]="Traffic may reorder; ensure upstream switch tolerates sequence changes."
+        ["active-backup"]="Only one link carries traffic; plan capacity accordingly."
+        ["balance-xor"]="Requires static port-channel hashing on upstream switches."
+        ["broadcast"]="All traffic floods every link; limited to niche HA scenarios."
+        ["802.3ad"]="Needs properly configured LACP and matching link characteristics."
+        ["balance-tlb"]="Depends on driver-level offload; confirm ethtool supports adaptive TX balancing."
+        ["balance-alb"]="Gratuitous ARP must be allowed to rewrite MAC tables across switches."
+    )
+
+    MODE_TUNING=(
+        ["balance-rr"]="Align MTU and switch hashing policies; consider downdelay=200 for stability."
+        ["active-backup"]="Configure miimon=100 and specify a primary interface for deterministic routing."
+        ["balance-xor"]="Set xmit_hash_policy=layer3+4 to spread multi-flow workloads evenly."
+        ["broadcast"]="Limit to dual-homed heartbeat networks and cap bandwidth expectations."
+        ["802.3ad"]="Enable lacp_rate=fast and xmit_hash_policy=layer3+4 on 10G+ links."
+        ["balance-tlb"]="Verify ethtool -K adaptive-rx/tx is supported; monitor arp_interval results."
+        ["balance-alb"]="Use arp_interval=100 and define arp_ip_target entries for upstream switches."
+    )
+
+    DETECTED_WORKLOADS=()
+    PRIMARY_WORKLOAD=""
+    MANUAL_RECOMMENDATION_MODE=""
+    MANUAL_RECOMMENDATION_SOURCE=""
+    MANUAL_RECOMMENDATION_WORKLOAD=""
+    MANUAL_RECOMMENDATION_NOTES=""
+    MANUAL_RECOMMENDATION_PITFALLS=""
+    SWITCH_CAPABILITIES_CACHE=()
+}
+
+init_workload_profiles
+
 # NetworkManager device metadata caches
 declare -Ag DEVICE_CONNECTION_MAP=()
 declare -Ag DEVICE_STATE_MAP=()
@@ -33,7 +138,7 @@ STATUS_MODE=false
 EXPORT_JSON_PATH=""
 ALLOW_NON_INTERACTIVE=false
 for arg in "$@"; do
-    if [[ $arg == "--status" || $arg == "--export-json" || $arg == "--help" ]]; then
+    if [[ $arg == "--status" || $arg == "--export-json" || $arg == "--help" || $arg == "--recommend" || $arg == --recommend=* ]]; then
         ALLOW_NON_INTERACTIVE=true
         break
     fi
@@ -111,6 +216,314 @@ log() {
     fi
 }
 
+join_by() {
+    local IFS=$1
+    shift
+    echo "$*"
+}
+
+normalize_workload_name() {
+    local input=${1:-}
+    [[ -z "$input" ]] && return 1
+    local lowered=${input,,}
+    case "$lowered" in
+        elasticsearch|es)
+            echo "Elasticsearch"
+            return 0
+            ;;
+        cloudera*|cdp|data\ lake)
+            echo "Cloudera Data Lake"
+            return 0
+            ;;
+        hadoop|hdfs)
+            echo "Hadoop/HDFS"
+            return 0
+            ;;
+        oltp|database|postgres|mysql|mariadb)
+            echo "OLTP Database"
+            return 0
+            ;;
+        virtualization|vmware|kvm|hypervisor|vm\ farm)
+            echo "Virtualization/VM Farm"
+            return 0
+            ;;
+        kubernetes|openshift|k8s)
+            echo "Kubernetes/OpenShift"
+            return 0
+            ;;
+    esac
+    for workload in "${WORKLOAD_LIST[@]}"; do
+        if [[ "${workload,,}" == "$lowered" ]]; then
+            echo "$workload"
+            return 0
+        fi
+    done
+    return 1
+}
+
+package_present() {
+    local pkg=$1
+    if command -v rpm >/dev/null 2>&1; then
+        rpm -q "$pkg" &>/dev/null && return 0
+    fi
+    return 1
+}
+
+package_present_pattern() {
+    local pattern=$1
+    if command -v rpm >/dev/null 2>&1; then
+        rpm -qa "$pattern" 2>/dev/null | grep -q . && return 0
+    fi
+    return 1
+}
+
+process_running() {
+    local name=$1
+    command -v pgrep >/dev/null 2>&1 || return 1
+    pgrep -f "$name" >/dev/null 2>&1
+}
+
+service_active() {
+    local svc=$1
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl is-active --quiet "$svc"
+}
+
+check_workload_signature() {
+    local workload=$1
+    case "$workload" in
+        "Elasticsearch")
+            package_present "elasticsearch" || service_active "elasticsearch" || process_running "elasticsearch"
+            ;;
+        "Cloudera Data Lake")
+            package_present "cloudera-manager-daemons" || package_present "cloudera-manager-agent" || \
+            package_present_pattern 'cloudera-*' || process_running "cloudera-scm-agent" || process_running "cloudera-scm-server"
+            ;;
+        "Hadoop/HDFS")
+            package_present "hadoop-hdfs" || package_present "hadoop-client" || package_present_pattern 'hadoop-*' || \
+            process_running "hdfs" || process_running "yarn"
+            ;;
+        "OLTP Database")
+            package_present "postgresql-server" || package_present "mariadb-server" || package_present "mysql-server" || \
+            process_running "postgres" || process_running "mysqld"
+            ;;
+        "Virtualization/VM Farm")
+            package_present "qemu-kvm" || package_present "libvirt" || service_active "libvirtd" || \
+            process_running "virtqemud"
+            ;;
+        "Kubernetes/OpenShift")
+            package_present "kubelet" || package_present_pattern 'kubernetes-*' || \
+            service_active "kubelet" || process_running "openshift" || service_active "crio"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+detect_workloads() {
+    DETECTED_WORKLOADS=()
+    PRIMARY_WORKLOAD=""
+    for workload in "${WORKLOAD_LIST[@]}"; do
+        if check_workload_signature "$workload"; then
+            DETECTED_WORKLOADS+=("$workload")
+        fi
+    done
+    if (( ${#DETECTED_WORKLOADS[@]} > 0 )); then
+        PRIMARY_WORKLOAD="${DETECTED_WORKLOADS[0]}"
+        local detected_list
+        detected_list=$(join_by ", " "${DETECTED_WORKLOADS[@]}")
+        log INFO "Detected workload signatures: $detected_list"
+    else
+        log INFO "No workload signatures detected"
+    fi
+}
+
+get_primary_workload_hint() {
+    if [[ -n "$MANUAL_RECOMMENDATION_WORKLOAD" ]]; then
+        echo "$MANUAL_RECOMMENDATION_WORKLOAD"
+        return
+    fi
+    if [[ -n "$PRIMARY_WORKLOAD" ]]; then
+        echo "$PRIMARY_WORKLOAD"
+        return
+    fi
+    echo ""
+}
+
+get_recommendation_context() {
+    local actual=${1:-}
+    local recommended=""
+    local source=""
+    local workload=""
+    local tips=""
+    local pitfalls=""
+
+    if [[ -n "$MANUAL_RECOMMENDATION_MODE" ]]; then
+        recommended="$MANUAL_RECOMMENDATION_MODE"
+        source="${MANUAL_RECOMMENDATION_SOURCE:-wizard}"
+        workload="${MANUAL_RECOMMENDATION_WORKLOAD:-Trait-guided profile}"
+        tips="$MANUAL_RECOMMENDATION_NOTES"
+        pitfalls="$MANUAL_RECOMMENDATION_PITFALLS"
+    elif [[ -n "$PRIMARY_WORKLOAD" ]]; then
+        workload="$PRIMARY_WORKLOAD"
+        recommended="${WORKLOAD_RECOMMENDATIONS[$PRIMARY_WORKLOAD]}"
+        source="detected"
+        tips="${WORKLOAD_TUNING[$PRIMARY_WORKLOAD]}"
+        pitfalls="${WORKLOAD_PITFALLS[$PRIMARY_WORKLOAD]}"
+    else
+        workload="General purpose"
+        recommended="active-backup"
+        source="default-baseline"
+        tips="Use active-backup for deterministic failover without switch coordination."
+        pitfalls="Throughput limited to one active link; ensure primary selection meets demand."
+    fi
+
+    local compliance="n/a"
+    if [[ -n "$actual" && -n "$recommended" ]]; then
+        if [[ "$actual" == "$recommended" ]]; then
+            compliance="aligned"
+        else
+            compliance="mismatch"
+        fi
+    elif [[ -n "$actual" ]]; then
+        compliance="no-recommendation"
+    fi
+
+    printf '%s|%s|%s|%s|%s|%s' "$recommended" "$source" "$workload" "$tips" "$pitfalls" "$compliance"
+}
+
+display_recommendation_hint() {
+    local context=$1
+    local actual=${2:-}
+    IFS='|' read -r recommended source workload tips pitfalls compliance <<< "$(get_recommendation_context "$actual")"
+    [[ -z "$recommended" ]] && return 0
+    echo ""
+    echo "Recommendation hint ($context):"
+    echo "  Workload focus: ${workload}" 
+    echo "  Recommended mode: ${recommended} (source: ${source})"
+    if [[ -n "$tips" ]]; then
+        echo "  Suggested tuning: ${tips}"
+    fi
+    if [[ -n "$pitfalls" ]]; then
+        echo "  Watch-outs: ${pitfalls}"
+    fi
+    if [[ -n "$actual" && "$compliance" != "n/a" ]]; then
+        if [[ "$compliance" == "aligned" ]]; then
+            echo "  Compliance: ${compliance}"
+        else
+            echo "  Compliance: ${compliance} (selected mode: ${actual})"
+        fi
+    fi
+    log INFO "Recommendation hint displayed ($context): workload=${workload} recommended=${recommended} source=${source} actual=${actual:-n/a}"
+}
+
+show_mode_specific_guidance() {
+    local mode=$1
+    local warning="${MODE_WARNINGS[$mode]:-}"
+    local tuning="${MODE_TUNING[$mode]:-}"
+    [[ -n "$warning" ]] && echo "Mode advisory: $warning"
+    [[ -n "$tuning" ]] && echo "Mode tuning tip: $tuning"
+}
+
+record_recommendation_history() {
+    local context=$1
+    local workload=$2
+    local recommended=$3
+    local selected=$4
+    local source=$5
+    local compliance=$6
+    local message="Recommendation history [$context]: workload=${workload:-n/a} recommended=${recommended:-none} selected=${selected:-none} source=${source:-n/a} compliance=${compliance:-n/a}"
+    if [[ "$compliance" == "mismatch" ]]; then
+        log WARN "$message"
+    else
+        log INFO "$message"
+    fi
+}
+
+show_diagnostic_guidance() {
+    local bond_name=$1
+    local actual_mode=$2
+    IFS='|' read -r recommended source workload tips pitfalls compliance <<< "$(get_recommendation_context "$actual_mode")"
+    echo ""
+    echo "Recommendation analysis:"
+    if [[ "$compliance" == "aligned" ]]; then
+        echo "  ✔ Bond mode aligns with ${workload} guidance ($recommended)."
+        [[ -n "$tips" ]] && echo "  Keep in mind: $tips"
+    elif [[ "$compliance" == "mismatch" ]]; then
+        echo "  ⚠ Detected profile ${workload} prefers $recommended but $bond_name is configured for $actual_mode."
+        [[ -n "$tips" ]] && echo "  Suggested corrective action: Adjust to $recommended and apply: $tips"
+        if [[ -n "$pitfalls" ]]; then
+            echo "  Risk if unchanged: $pitfalls"
+        fi
+        local mode_warning="${MODE_WARNINGS[$actual_mode]:-}"
+        [[ -n "$mode_warning" ]] && echo "  Current mode considerations: $mode_warning"
+    else
+        echo "  No automated recommendation available for the current context."
+    fi
+    log INFO "Diagnostic guidance for $bond_name => actual=$actual_mode recommended=${recommended:-none} compliance=$compliance"
+}
+
+handle_recommend_cli() {
+    local workload_arg=${1:-}
+    if [[ -z "$workload_arg" ]]; then
+        echo "Error: --recommend requires a workload name or 'auto'" >&2
+        exit 1
+    fi
+    local normalized=""
+    local source="manual"
+    if [[ ${workload_arg,,} == "auto" ]]; then
+        if [[ -n "$PRIMARY_WORKLOAD" ]]; then
+            normalized="$PRIMARY_WORKLOAD"
+            source="detected"
+        elif [[ -n "$MANUAL_RECOMMENDATION_WORKLOAD" ]]; then
+            normalized="$MANUAL_RECOMMENDATION_WORKLOAD"
+            source="$MANUAL_RECOMMENDATION_SOURCE"
+        else
+            normalized="General purpose"
+            source="default-baseline"
+        fi
+    else
+        if ! normalized=$(normalize_workload_name "$workload_arg"); then
+            echo "Unknown workload '$workload_arg'. Supported workloads:" >&2
+            for workload in "${WORKLOAD_LIST[@]}"; do
+                echo "  - $workload" >&2
+            done
+            exit 1
+        fi
+        source="manual"
+    fi
+
+    local recommended=""
+    local rationale=""
+    local tuning=""
+    local pitfalls=""
+    local switch_req=""
+
+    if [[ -n ${WORKLOAD_RECOMMENDATIONS[$normalized]+x} ]]; then
+        recommended="${WORKLOAD_RECOMMENDATIONS[$normalized]}"
+        rationale="${WORKLOAD_RATIONALES[$normalized]}"
+        tuning="${WORKLOAD_TUNING[$normalized]}"
+        pitfalls="${WORKLOAD_PITFALLS[$normalized]}"
+        switch_req="${WORKLOAD_SWITCH_REQS[$normalized]}"
+    else
+        recommended="active-backup"
+        rationale="Use active-backup for deterministic failover without requiring switch configuration."
+        tuning="Set miimon=100 and define a preferred primary interface."
+        pitfalls="Throughput is limited to a single active link; ensure sizing meets workload demand."
+        switch_req="Compatible with unmanaged switches."
+    fi
+
+    echo "Workload profile: $normalized"
+    echo "Recommended bond mode: $recommended"
+    echo "Rationale: ${rationale:-n/a}"
+    echo "Switch prerequisites: ${switch_req:-n/a}"
+    echo "Tuning suggestions: ${tuning:-n/a}"
+    echo "Pitfalls to watch: ${pitfalls:-n/a}"
+    log INFO "CLI recommendation requested for workload=${normalized} (source=$source) => mode=$recommended"
+    exit 0
+}
+
 preflight_checks() {
     log INFO "Starting preflight checks"
     local os_id="" os_version=""
@@ -164,6 +577,16 @@ preflight_checks() {
         fi
     else
         log DEBUG "Bonding module already loaded"
+    fi
+
+    detect_workloads
+    if (( ${#DETECTED_WORKLOADS[@]} > 0 )); then
+        local suggestion="${WORKLOAD_RECOMMENDATIONS[$PRIMARY_WORKLOAD]}"
+        if [[ -n "$suggestion" ]]; then
+            echo "Detected workload hint: $PRIMARY_WORKLOAD (recommended bond mode: $suggestion)"
+        fi
+    else
+        echo "No workload-specific signatures detected; defaulting to general guidance." 
     fi
 }
 
@@ -238,6 +661,112 @@ confirm_prompt() {
         return 0
     fi
     return 1
+}
+
+require_switch_capability() {
+    local capability=$1
+    local key=${capability,,}
+    if [[ -n ${SWITCH_CAPABILITIES_CACHE[$key]+x} ]]; then
+        [[ ${SWITCH_CAPABILITIES_CACHE[$key]} == "yes" ]] && return 0 || return 1
+    fi
+    local prompt="Confirm your upstream switches support ${capability}?"
+    if confirm_prompt "$prompt" "N"; then
+        SWITCH_CAPABILITIES_CACHE[$key]="yes"
+        log INFO "Switch capability confirmed: $capability"
+        return 0
+    fi
+    SWITCH_CAPABILITIES_CACHE[$key]="no"
+    log WARN "Switch capability missing or unconfirmed: $capability"
+    return 1
+}
+
+ensure_nic_parity() {
+    local mode=$1
+    shift
+    local -a nics=("$@")
+    if (( ${#nics[@]} < 2 )); then
+        echo "Error: Mode $mode requires at least two NICs" >&2
+        log ERROR "Parity check failed for $mode: insufficient NICs (${nics[*]:-none})"
+        return 1
+    fi
+    local strict="false"
+    case "$mode" in
+        802.3ad|balance-xor|balance-rr|broadcast|balance-alb|balance-tlb)
+            strict="true"
+            ;;
+        active-backup)
+            strict="false"
+            ;;
+    esac
+    local speeds=()
+    local unknown=false
+    for nic in "${nics[@]}"; do
+        local info=($(get_nic_info "$nic"))
+        local speed="${info[0]:-Unknown}"
+        if [[ "$speed" =~ ^([0-9]+)Mb/s$ ]]; then
+            speeds+=("${BASH_REMATCH[1]}")
+        else
+            unknown=true
+            log WARN "Unable to determine link speed for $nic during parity validation"
+        fi
+    done
+    local mismatch=false
+    if (( ${#speeds[@]} > 1 )); then
+        local baseline="${speeds[0]}"
+        for speed in "${speeds[@]:1}"; do
+            if [[ "$speed" != "$baseline" ]]; then
+                mismatch=true
+                break
+            fi
+        done
+    fi
+    if [[ "$mismatch" == "true" ]]; then
+        if [[ "$strict" == "true" ]]; then
+            echo "Error: Mode $mode requires NICs with matching speeds. Selected: ${nics[*]}" >&2
+            log ERROR "Mode $mode speed parity failed for NICs: ${nics[*]}"
+            return 1
+        else
+            echo "Warning: NIC speeds differ; $mode may exhibit uneven performance." >&2
+            log WARN "Mode $mode proceeding despite NIC speed mismatch: ${nics[*]}"
+        fi
+    fi
+    if [[ "$unknown" == "true" ]]; then
+        echo "Warning: Unable to verify NIC speed parity for all members." >&2
+    fi
+    return 0
+}
+
+validate_mode_prerequisites() {
+    local mode=$1
+    shift
+    local -a nics=("$@")
+    case "$mode" in
+        802.3ad)
+            if ! require_switch_capability "LACP"; then
+                echo "Error: 802.3ad requires switches configured for LACP." >&2
+                return 1
+            fi
+            ;;
+        balance-xor|balance-rr)
+            if ! require_switch_capability "static link aggregation"; then
+                echo "Error: $mode requires static port-channel support on upstream switches." >&2
+                return 1
+            fi
+            ;;
+        balance-alb)
+            if ! require_switch_capability "gratuitous ARP updates"; then
+                echo "Error: balance-alb depends on switches accepting gratuitous ARP updates." >&2
+                return 1
+            fi
+            ;;
+        balance-tlb)
+            if ! require_switch_capability "gratuitous ARP updates"; then
+                echo "Error: balance-tlb depends on switches accepting gratuitous ARP updates." >&2
+                return 1
+            fi
+            ;;
+    esac
+    ensure_nic_parity "$mode" "${nics[@]}"
 }
 
 get_bond_option_value() {
@@ -490,6 +1019,15 @@ show_bond_summary() {
         clear_screen
     fi
     echo "Bond Summary"
+    local detected_summary="none"
+    if (( ${#DETECTED_WORKLOADS[@]} > 0 )); then
+        detected_summary=$(join_by ", " "${DETECTED_WORKLOADS[@]}")
+    fi
+    echo "Detected workloads: $detected_summary"
+    IFS='|' read -r session_mode session_source session_focus session_tips session_pitfalls _ <<< "$(get_recommendation_context)"
+    echo "Session recommendation: ${session_mode:-n/a} (source: ${session_source:-n/a}, focus: ${session_focus:-n/a})"
+    [[ -n "$session_tips" ]] && echo "  Suggested tuning: $session_tips"
+    [[ -n "$session_pitfalls" ]] && echo "  Watch-outs: $session_pitfalls"
     local bonds=()
     mapfile -t bonds < <(list_bonds)
     if (( ${#bonds[@]} == 0 )); then
@@ -504,10 +1042,23 @@ show_bond_summary() {
         local gateway=$(nmcli_get_field ipv4.gateway "$bond")
         local ipv6=$(nmcli_get_field ipv6.addresses "$bond")
         local primary=$(get_bond_option_value "$options" "primary")
+        IFS='|' read -r recommended_mode recommended_source recommended_workload recommended_tips recommended_pitfalls recommendation_compliance <<< "$(get_recommendation_context "$mode")"
         echo ""
         echo "Bond: $bond"
         echo "  Mode: ${mode:-unknown}"
         [[ -n "$primary" ]] && echo "  Primary: $primary"
+        if [[ -n "$recommended_mode" ]]; then
+            echo "  Recommended mode: $recommended_mode (source: ${recommended_source:-n/a}, focus: ${recommended_workload:-n/a})"
+            echo "  Recommendation compliance: ${recommendation_compliance:-n/a}"
+            [[ -n "$recommended_tips" ]] && echo "  Suggested tuning: $recommended_tips"
+            if [[ -n "$recommended_pitfalls" ]]; then
+                if [[ "$recommendation_compliance" == "mismatch" ]]; then
+                    echo "  Risk if unchanged: $recommended_pitfalls"
+                else
+                    echo "  Watch-outs: $recommended_pitfalls"
+                fi
+            fi
+        fi
         if [[ -n "$vlan" && "$vlan" != "0" ]]; then
             echo "  VLAN: $vlan"
         fi
@@ -559,6 +1110,49 @@ export_bond_summary() {
         printf '  "generated_at": "%s",\n' "$(date -Iseconds)"
         local host_name=$(hostname -f 2>/dev/null || hostname)
         printf '  "host": "%s",\n' "$(json_escape "$host_name")"
+        printf '  "detected_workloads": '
+        if (( ${#DETECTED_WORKLOADS[@]} == 0 )); then
+            printf '[],\n'
+        else
+            printf '[\n'
+            for idx in "${!DETECTED_WORKLOADS[@]}"; do
+                local workload="${DETECTED_WORKLOADS[$idx]}"
+                local suffix=','
+                if (( idx == ${#DETECTED_WORKLOADS[@]} - 1 )); then
+                    suffix=''
+                fi
+                printf '    "%s"%s\n' "$(json_escape "$workload")" "$suffix"
+            done
+            printf '  ],\n'
+        fi
+        IFS='|' read -r session_mode session_source session_focus session_tips session_pitfalls _ <<< "$(get_recommendation_context)"
+        printf '  "session_recommendation": {\n'
+        if [[ -n "$session_mode" ]]; then
+            printf '    "mode": "%s",\n' "$(json_escape "$session_mode")"
+        else
+            printf '    "mode": null,\n'
+        fi
+        if [[ -n "$session_source" ]]; then
+            printf '    "source": "%s",\n' "$(json_escape "$session_source")"
+        else
+            printf '    "source": null,\n'
+        fi
+        if [[ -n "$session_focus" ]]; then
+            printf '    "workload": "%s",\n' "$(json_escape "$session_focus")"
+        else
+            printf '    "workload": null,\n'
+        fi
+        if [[ -n "$session_tips" ]]; then
+            printf '    "tuning": "%s",\n' "$(json_escape "$session_tips")"
+        else
+            printf '    "tuning": null,\n'
+        fi
+        if [[ -n "$session_pitfalls" ]]; then
+            printf '    "pitfalls": "%s"\n' "$(json_escape "$session_pitfalls")"
+        else
+            printf '    "pitfalls": null\n'
+        fi
+        printf '  },\n'
         printf '  "bonds": [\n'
         for i in "${!bonds[@]}"; do
             local bond="${bonds[$i]}"
@@ -569,6 +1163,7 @@ export_bond_summary() {
             local ipv6=$(nmcli_get_field ipv6.addresses "$bond")
             local gateway=$(nmcli_get_field ipv4.gateway "$bond")
             local primary=$(get_bond_option_value "$options" "primary")
+            IFS='|' read -r recommended_mode recommended_source recommended_workload recommended_tips recommended_pitfalls recommendation_compliance <<< "$(get_recommendation_context "$mode")"
             printf '    {\n'
             printf '      "name": "%s",\n' "$(json_escape "$bond")"
             printf '      "mode": "%s",\n' "$(json_escape "${mode:-unknown}")"
@@ -590,6 +1185,36 @@ export_bond_summary() {
                 printf '      "gateway": null,\n'
             fi
             printf '      "options": %s,\n' "$(to_json_array "$options")"
+            if [[ -n "$recommended_mode" ]]; then
+                printf '      "recommended_mode": "%s",\n' "$(json_escape "$recommended_mode")"
+            else
+                printf '      "recommended_mode": null,\n'
+            fi
+            if [[ -n "$recommended_source" ]]; then
+                printf '      "recommendation_source": "%s",\n' "$(json_escape "$recommended_source")"
+            else
+                printf '      "recommendation_source": null,\n'
+            fi
+            if [[ -n "$recommended_workload" ]]; then
+                printf '      "recommendation_focus": "%s",\n' "$(json_escape "$recommended_workload")"
+            else
+                printf '      "recommendation_focus": null,\n'
+            fi
+            if [[ -n "$recommended_tips" ]]; then
+                printf '      "recommendation_tuning": "%s",\n' "$(json_escape "$recommended_tips")"
+            else
+                printf '      "recommendation_tuning": null,\n'
+            fi
+            if [[ -n "$recommended_pitfalls" ]]; then
+                printf '      "recommendation_pitfalls": "%s",\n' "$(json_escape "$recommended_pitfalls")"
+            else
+                printf '      "recommendation_pitfalls": null,\n'
+            fi
+            if [[ -n "$recommendation_compliance" ]]; then
+                printf '      "recommendation_compliance": "%s",\n' "$(json_escape "$recommendation_compliance")"
+            else
+                printf '      "recommendation_compliance": null,\n'
+            fi
             local slaves=()
             mapfile -t slaves < <(get_bond_slaves "$bond")
             printf '      "slaves": [\n'
@@ -797,6 +1422,215 @@ pause_continue() {
     TIMEOUT=15
     read_input "Press Enter to continue..." _ || true
     TIMEOUT=$prev_timeout
+}
+
+display_welcome_screen() {
+    clear_screen
+    echo "Workload-aware Bond Manager"
+    echo "============================"
+    echo "Supported workloads and recommended modes:"
+    for workload in "${WORKLOAD_LIST[@]}"; do
+        local recommendation="${WORKLOAD_RECOMMENDATIONS[$workload]}"
+        local rationale="${WORKLOAD_RATIONALES[$workload]}"
+        local switch_req="${WORKLOAD_SWITCH_REQS[$workload]}"
+        local pitfalls="${WORKLOAD_PITFALLS[$workload]}"
+        printf ' - %s => %s\n' "$workload" "$recommendation"
+        [[ -n "$rationale" ]] && printf '     Why: %s\n' "$rationale"
+        [[ -n "$switch_req" ]] && printf '     Switch prerequisite: %s\n' "$switch_req"
+        [[ -n "$pitfalls" ]] && printf '     Watch-outs: %s\n' "$pitfalls"
+    done
+    local detected_summary=""
+    if (( ${#DETECTED_WORKLOADS[@]} > 0 )); then
+        detected_summary=$(join_by ", " "${DETECTED_WORKLOADS[@]}")
+        echo ""
+        echo "Detected workload hints on this host: $detected_summary"
+    else
+        echo ""
+        echo "No specific workload signatures detected on this host."
+    fi
+    IFS='|' read -r recommended source workload tips pitfalls _ <<< "$(get_recommendation_context)"
+    if [[ -n "$recommended" ]]; then
+        echo "Suggested starting mode: $recommended (source: $source, focus: $workload)"
+        [[ -n "$tips" ]] && echo "Tuning focus: $tips"
+        [[ -n "$pitfalls" ]] && echo "Risks: $pitfalls"
+    fi
+    log INFO "Displayed welcome screen (detected: ${detected_summary:-none}, recommended: ${recommended:-none})"
+    pause_continue
+}
+
+run_recommendation_wizard() {
+    clear_screen
+    echo "Workload Recommendation Wizard"
+    echo "--------------------------------"
+    if (( ${#DETECTED_WORKLOADS[@]} > 0 )); then
+        echo "Detected workload hints: $(join_by ", " "${DETECTED_WORKLOADS[@]}")"
+    else
+        echo "No specific workload detected automatically."
+    fi
+    echo ""
+    echo "Known workload profiles:"
+    echo "0) Trait-based guidance"
+    for i in "${!WORKLOAD_LIST[@]}"; do
+        printf "%d) %s (recommended: %s)\n" $((i+1)) "${WORKLOAD_LIST[$i]}" "${WORKLOAD_RECOMMENDATIONS[${WORKLOAD_LIST[$i]}]}"
+    done
+    local selection=""
+    if ! read_input "Select a known workload (0-${#WORKLOAD_LIST[@]}): " selection true; then
+        return 1
+    fi
+    if [[ -n "$selection" && "$selection" =~ ^[0-9]+$ && $selection -ge 1 && $selection -le ${#WORKLOAD_LIST[@]} ]]; then
+        local chosen="${WORKLOAD_LIST[$((selection-1))]}"
+        MANUAL_RECOMMENDATION_MODE="${WORKLOAD_RECOMMENDATIONS[$chosen]}"
+        MANUAL_RECOMMENDATION_SOURCE="wizard-known"
+        MANUAL_RECOMMENDATION_WORKLOAD="$chosen"
+        MANUAL_RECOMMENDATION_NOTES="${WORKLOAD_TUNING[$chosen]}"
+        MANUAL_RECOMMENDATION_PITFALLS="${WORKLOAD_PITFALLS[$chosen]}"
+        echo ""
+        echo "Wizard recommendation: $MANUAL_RECOMMENDATION_MODE for $chosen"
+        echo "Rationale: ${WORKLOAD_RATIONALES[$chosen]}"
+        show_mode_specific_guidance "$MANUAL_RECOMMENDATION_MODE"
+        record_recommendation_history "wizard-known" "$chosen" "$MANUAL_RECOMMENDATION_MODE" "$MANUAL_RECOMMENDATION_MODE" "$MANUAL_RECOMMENDATION_SOURCE" "aligned"
+        return 0
+    fi
+
+    echo ""
+    echo "Trait-based questions:"
+    echo "1) Throughput-heavy analytics or backups"
+    echo "2) Latency-sensitive applications"
+    echo "3) Mixed workloads or virtualization"
+    local focus=""
+    while true; do
+        if ! read_input "Select primary performance focus (1-3): " focus; then
+            return 1
+        fi
+        if [[ "$focus" =~ ^[123]$ ]]; then
+            break
+        fi
+        echo "Error: Please choose 1, 2, or 3" >&2
+    done
+    local virtualization=false
+    if confirm_prompt "Is this host primarily virtualization or container infrastructure?" "N"; then
+        virtualization=true
+    fi
+    local lacp_supported=false
+    if confirm_prompt "Do your upstream switches support and allow you to enable LACP?" "N"; then
+        lacp_supported=true
+    fi
+    local switch_independent=false
+    if confirm_prompt "Do you require a configuration that works without switch changes?" "N"; then
+        switch_independent=true
+    fi
+
+    local profile_label="Trait-based profile"
+    local recommended_mode="active-backup"
+    case "$focus" in
+        1)
+            profile_label="Trait-based: Throughput"
+            if [[ "$lacp_supported" == "true" ]]; then
+                recommended_mode="802.3ad"
+            elif [[ "$virtualization" == "true" || "$switch_independent" == "true" ]]; then
+                recommended_mode="balance-alb"
+            else
+                recommended_mode="balance-xor"
+            fi
+            ;;
+        2)
+            profile_label="Trait-based: Latency"
+            recommended_mode="active-backup"
+            ;;
+        3)
+            profile_label="Trait-based: Mixed/Virtualization"
+            if [[ "$virtualization" == "true" ]]; then
+                if [[ "$lacp_supported" == "true" && "$switch_independent" != "true" ]]; then
+                    recommended_mode="802.3ad"
+                else
+                    recommended_mode="balance-alb"
+                fi
+            else
+                if [[ "$lacp_supported" == "true" && "$switch_independent" != "true" ]]; then
+                    recommended_mode="balance-xor"
+                else
+                    recommended_mode="active-backup"
+                fi
+            fi
+            ;;
+    esac
+
+    MANUAL_RECOMMENDATION_MODE="$recommended_mode"
+    MANUAL_RECOMMENDATION_SOURCE="wizard-traits"
+    MANUAL_RECOMMENDATION_WORKLOAD="$profile_label"
+    MANUAL_RECOMMENDATION_NOTES="${MODE_TUNING[$recommended_mode]}"
+    MANUAL_RECOMMENDATION_PITFALLS="${MODE_WARNINGS[$recommended_mode]}"
+
+    echo ""
+    echo "Wizard recommendation: $recommended_mode for $profile_label"
+    echo "Reasoning: focus=$focus, virtualization=$virtualization, LACP=$lacp_supported, switch independence=$switch_independent"
+    show_mode_specific_guidance "$recommended_mode"
+    record_recommendation_history "wizard-traits" "$profile_label" "$recommended_mode" "$recommended_mode" "$MANUAL_RECOMMENDATION_SOURCE" "aligned"
+}
+
+generate_quick_reference_report() {
+    clear_screen
+    echo "Generate Workload Quick Reference"
+    local default_path="/var/log/bond_manager/workload_quick_reference.txt"
+    local output_path=""
+    if read_input "Enter output path [$default_path]: " output_path true; then
+        output_path=${output_path:-$default_path}
+    else
+        output_path=$default_path
+    fi
+    local tmp_file
+    tmp_file=$(mktemp)
+    {
+        printf "Workload Quick Reference Report\n"
+        printf "Generated at: %s\n" "$(date -Iseconds)"
+        printf "Host: %s\n" "$(hostname -f 2>/dev/null || hostname)"
+        local detected_summary=""
+        if (( ${#DETECTED_WORKLOADS[@]} > 0 )); then
+            detected_summary=$(join_by ", " "${DETECTED_WORKLOADS[@]}")
+        fi
+        printf "Detected workloads: %s\n" "${detected_summary:-none}"
+        IFS='|' read -r recommended source workload tips pitfalls _ <<< "$(get_recommendation_context)"
+        printf "Session recommendation: %s (source: %s, focus: %s)\n" "${recommended:-n/a}" "${source:-n/a}" "${workload:-n/a}"
+        if [[ -n "$tips" ]]; then
+            printf "Tuning focus: %s\n" "$tips"
+        fi
+        printf "\nWorkload details:\n"
+        for workload_name in "${WORKLOAD_LIST[@]}"; do
+            printf "- %s\n" "$workload_name"
+            printf "  Recommended mode: %s\n" "${WORKLOAD_RECOMMENDATIONS[$workload_name]}"
+            printf "  Rationale: %s\n" "${WORKLOAD_RATIONALES[$workload_name]}"
+            printf "  Switch prerequisite: %s\n" "${WORKLOAD_SWITCH_REQS[$workload_name]}"
+            printf "  Tuning: %s\n" "${WORKLOAD_TUNING[$workload_name]}"
+            printf "  Pitfalls: %s\n" "${WORKLOAD_PITFALLS[$workload_name]}"
+            printf "\n"
+        done
+        printf "Bonding modes at a glance:\n"
+        for mode in "${BOND_MODES[@]}"; do
+            printf "- %s\n" "$mode"
+            [[ -n ${MODE_WARNINGS[$mode]:-} ]] && printf "  Advisory: %s\n" "${MODE_WARNINGS[$mode]}"
+            [[ -n ${MODE_TUNING[$mode]:-} ]] && printf "  Tuning tip: %s\n" "${MODE_TUNING[$mode]}"
+            printf "\n"
+        done
+    } > "$tmp_file"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        cat "$tmp_file"
+        rm -f "$tmp_file"
+        return 0
+    fi
+    local out_dir
+    out_dir=$(dirname "$output_path")
+    mkdir -p "$out_dir"
+    if mv "$tmp_file" "$output_path"; then
+        chmod 640 "$output_path" 2>/dev/null || true
+        echo "Quick reference saved to $output_path"
+        log INFO "Generated workload quick reference at $output_path"
+    else
+        echo "Error: Failed to write quick reference to $output_path" >&2
+        log ERROR "Failed to write quick reference to $output_path"
+        rm -f "$tmp_file"
+        return 1
+    fi
 }
 
 # Get available Ethernet NICs
@@ -1144,6 +1978,7 @@ create_bond() {
     local nics=()
     clear_screen
     echo "Create Bond"
+    display_recommendation_hint "create-bond"
     if ! read_input "Enter bond name (e.g., bond0): " bond_name; then
         return 1
     fi
@@ -1162,6 +1997,12 @@ create_bond() {
         return 1
     fi
     mode=${BOND_MODES[$((mode_num-1))]}
+    show_mode_specific_guidance "$mode"
+    display_recommendation_hint "create-bond selection" "$mode"
+    IFS='|' read -r recommended_mode recommended_source recommended_workload _ _ recommendation_compliance <<< "$(get_recommendation_context "$mode")"
+    if [[ "$recommendation_compliance" == "mismatch" ]]; then
+        echo "Warning: Selected mode $mode differs from recommended $recommended_mode for $recommended_workload."
+    fi
     local available_nics=($(get_available_nics))
     if [[ ${#available_nics[@]} -lt 2 ]]; then
         echo "Error: At least two available NICs required" >&2
@@ -1204,6 +2045,10 @@ create_bond() {
             break
         fi
     done
+    if ! validate_mode_prerequisites "$mode" "${nics[@]}"; then
+        return 1
+    fi
+    record_recommendation_history "create" "$recommended_workload" "$recommended_mode" "$mode" "$recommended_source" "$recommendation_compliance"
     echo "Selected NICs: ${nics[*]}"
     if ! read_input "Confirm selection? (y/n): " confirm; then
         return 1
@@ -1367,6 +2212,7 @@ edit_bond() {
     local nics=()
     clear_screen
     echo "Edit Bond"
+    display_recommendation_hint "edit-bond"
     local bonds=()
     mapfile -t bonds < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="bond"{print $1}')
     if [[ ${#bonds[@]} -eq 0 ]]; then
@@ -1399,6 +2245,7 @@ edit_bond() {
             return 1
         fi
         mode=${BOND_MODES[$((mode_num-1))]}
+        show_mode_specific_guidance "$mode"
     fi
     local available_nics=($(get_available_nics))
     display_nics "$bond_name" "${available_nics[@]}"
@@ -1446,6 +2293,37 @@ edit_bond() {
             return 0
         fi
     fi
+    local effective_mode="$mode"
+    if [[ -z "$effective_mode" ]]; then
+        effective_mode=$(get_bond_mode "$bond_name")
+    fi
+    local -a validation_nics=()
+    if (( ${#nics[@]} > 0 )); then
+        validation_nics=("${nics[@]}")
+    else
+        local current_slave_conns=()
+        mapfile -t current_slave_conns < <(get_bond_slaves "$bond_name")
+        for conn in "${current_slave_conns[@]}"; do
+            local iface=$(nmcli_get_field connection.interface-name "$conn")
+            [[ -z "$iface" ]] && iface="$conn"
+            validation_nics+=("$iface")
+        done
+    fi
+    if (( ${#validation_nics[@]} >= 2 )); then
+        if ! validate_mode_prerequisites "$effective_mode" "${validation_nics[@]}"; then
+            return 1
+        fi
+    else
+        log WARN "Unable to perform mode prerequisite validation for $bond_name: fewer than two NICs available"
+    fi
+    show_mode_specific_guidance "$effective_mode"
+    display_recommendation_hint "edit-bond selection" "$effective_mode"
+    local recommended_mode="" recommended_source="" recommended_workload="" recommendation_compliance=""
+    IFS='|' read -r recommended_mode recommended_source recommended_workload _ _ recommendation_compliance <<< "$(get_recommendation_context "$effective_mode")"
+    if [[ "$recommendation_compliance" == "mismatch" ]]; then
+        echo "Warning: Effective mode $effective_mode differs from recommended $recommended_mode for $recommended_workload."
+    fi
+    record_recommendation_history "edit" "$recommended_workload" "$recommended_mode" "$effective_mode" "$recommended_source" "$recommendation_compliance"
     if ! read_input "Enter VLAN ID (1-4094, optional, press Enter to keep current or skip): " vlan true; then
         return 1
     fi
@@ -1529,10 +2407,6 @@ edit_bond() {
                 fi
             fi
         done
-    fi
-    local effective_mode="$mode"
-    if [[ -z "$effective_mode" ]]; then
-        effective_mode=$(get_bond_mode "$bond_name")
     fi
     if ! configure_bond_options "$bond_name" "$effective_mode"; then
         rollback
@@ -1687,7 +2561,7 @@ remove_bond() {
 
 # Repair bond
 repair_bond() {
-    local bond_name
+    local bond_name mode=""
     clear_screen
     echo "Repair Bond"
     local bonds=()
@@ -1708,6 +2582,7 @@ repair_bond() {
         return 1
     fi
     bond_name=${bonds[$((bond_num-1))]}
+    mode=$(get_bond_mode "$bond_name")
     backup_configs
     local slaves=()
     if [[ -f "/proc/net/bonding/$bond_name" ]]; then
@@ -1716,6 +2591,18 @@ repair_bond() {
                 slaves+=("${BASH_REMATCH[1]}")
             fi
         done < "/proc/net/bonding/$bond_name"
+    fi
+    if [[ -n "$mode" ]]; then
+        if (( ${#slaves[@]} >= 2 )); then
+            if ! validate_mode_prerequisites "$mode" "${slaves[@]}"; then
+                return 1
+            fi
+        else
+            log WARN "Unable to validate prerequisites for $bond_name: fewer than two slave interfaces detected"
+        fi
+        local recommended_mode="" recommended_source="" recommended_workload="" recommendation_compliance=""
+        IFS='|' read -r recommended_mode recommended_source recommended_workload _ _ recommendation_compliance <<< "$(get_recommendation_context "$mode")"
+        record_recommendation_history "repair" "$recommended_workload" "$recommended_mode" "$mode" "$recommended_source" "$recommendation_compliance"
     fi
     # Remove any existing slave connections for the bond to avoid duplicates
     local current_slaves=()
@@ -1778,7 +2665,7 @@ repair_bond() {
 
 # Repair bond (10Gb Active-Backup)
 repair_bond_10gb_ab() {
-    local bond_name
+    local bond_name target_mode="active-backup" slaves=()
     clear_screen
     echo "Repair Bond (10Gb Active-Backup)"
     local bonds=()
@@ -1799,6 +2686,23 @@ repair_bond_10gb_ab() {
         return 1
     fi
     bond_name=${bonds[$((bond_num-1))]}
+    if [[ -f "/proc/net/bonding/$bond_name" ]]; then
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^Slave\ Interface:\ (.*)$ ]]; then
+                slaves+=("${BASH_REMATCH[1]}")
+            fi
+        done < "/proc/net/bonding/$bond_name"
+    fi
+    if (( ${#slaves[@]} >= 2 )); then
+        if ! validate_mode_prerequisites "$target_mode" "${slaves[@]}"; then
+            return 1
+        fi
+    else
+        log WARN "Unable to validate prerequisites for $bond_name active-backup repair: fewer than two slave interfaces detected"
+    fi
+    local recommended_mode="" recommended_source="" recommended_workload="" recommendation_compliance=""
+    IFS='|' read -r recommended_mode recommended_source recommended_workload _ _ recommendation_compliance <<< "$(get_recommendation_context "$target_mode")"
+    record_recommendation_history "repair-10gb-ab" "$recommended_workload" "$recommended_mode" "$target_mode" "$recommended_source" "$recommendation_compliance"
     backup_configs
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "set_bond_mode $bond_name active-backup"
@@ -1811,14 +2715,6 @@ repair_bond_10gb_ab() {
             rollback
             return 1
         fi
-    fi
-    local slaves=()
-    if [[ -f "/proc/net/bonding/$bond_name" ]]; then
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^Slave\ Interface:\ (.*)$ ]]; then
-                slaves+=("${BASH_REMATCH[1]}")
-            fi
-        done < "/proc/net/bonding/$bond_name"
     fi
     # Remove any existing slave connections for the bond to avoid duplicates
     local current_slaves=()
@@ -1922,6 +2818,8 @@ diagnose_bond() {
         ip -s link show "$nic"
         echo
     done
+    local mode=$(get_bond_mode "$bond_name")
+    show_diagnostic_guidance "$bond_name" "$mode"
 }
 
 # Extended diagnostics
@@ -1965,11 +2863,13 @@ extended_diagnostics() {
         echo "Latency test to $target via $nic:"
         ping -I "$nic" -c 3 -w 5 "$target" | tail -n 2
     done
+    local mode=$(get_bond_mode "$bond_name")
+    show_diagnostic_guidance "$bond_name" "$mode"
 }
 
 # Switch migration
 switch_migration() {
-    local bond_name new_nics=()
+    local bond_name new_nics=() mode=""
     clear_screen
     echo "Switch Migration Helper"
     local bonds=()
@@ -1990,6 +2890,7 @@ switch_migration() {
         return 1
     fi
     bond_name=${bonds[$((bond_num-1))]}
+    mode=$(get_bond_mode "$bond_name")
     local available_nics=($(get_available_nics))
     if [[ ${#available_nics[@]} -lt 2 ]]; then
         echo "Error: At least two available NICs required" >&2
@@ -2029,6 +2930,18 @@ switch_migration() {
     done
     if [[ "$selection_valid" != "true" ]]; then
         return 0
+    fi
+    if [[ -n "$mode" ]]; then
+        if (( ${#new_nics[@]} >= 2 )); then
+            if ! validate_mode_prerequisites "$mode" "${new_nics[@]}"; then
+                return 1
+            fi
+        else
+            log WARN "Unable to validate prerequisites for $bond_name: fewer than two target NICs selected"
+        fi
+        local recommended_mode="" recommended_source="" recommended_workload="" recommendation_compliance=""
+        IFS='|' read -r recommended_mode recommended_source recommended_workload _ _ recommendation_compliance <<< "$(get_recommendation_context "$mode")"
+        record_recommendation_history "switch-migration" "$recommended_workload" "$recommended_mode" "$mode" "$recommended_source" "$recommendation_compliance"
     fi
     echo "Selected new NICs: ${new_nics[*]}"
     if ! read_input "Confirm migration to new NICs? (y/n): " confirm; then
@@ -2110,7 +3023,7 @@ switch_migration() {
 
 # 10Gb migration wizard
 ten_gb_migration() {
-    local old_bond new_bond new_nics=()
+    local old_bond new_bond new_nics=() mode=""
     clear_screen
     echo "10Gb Migration Wizard"
     local bonds=()
@@ -2131,6 +3044,7 @@ ten_gb_migration() {
         return 1
     fi
     old_bond=${bonds[$((bond_num-1))]}
+    mode=$(get_bond_mode "$old_bond")
     if ! read_input "Enter new bond name (e.g., bond10g): " new_bond; then
         return 1
     fi
@@ -2182,6 +3096,18 @@ ten_gb_migration() {
     if [[ "$selection_valid" != "true" ]]; then
         return 0
     fi
+    if [[ -n "$mode" ]]; then
+        if (( ${#new_nics[@]} >= 2 )); then
+            if ! validate_mode_prerequisites "$mode" "${new_nics[@]}"; then
+                return 1
+            fi
+        else
+            log WARN "Unable to validate prerequisites for $old_bond migration: fewer than two 10Gb NICs selected"
+        fi
+        local recommended_mode="" recommended_source="" recommended_workload="" recommendation_compliance=""
+        IFS='|' read -r recommended_mode recommended_source recommended_workload _ _ recommendation_compliance <<< "$(get_recommendation_context "$mode")"
+        record_recommendation_history "ten-gb-migration" "$recommended_workload" "$recommended_mode" "$mode" "$recommended_source" "$recommendation_compliance"
+    fi
     echo "Selected 10Gb NICs: ${new_nics[*]}"
     if ! read_input "Confirm creation of new 10Gb bond? (y/n): " confirm; then
         return 1
@@ -2191,7 +3117,6 @@ ten_gb_migration() {
         return 0
     fi
     backup_configs
-    local mode=$(get_bond_mode "$old_bond")
     local vlan=$(nmcli -t -f 802-3-ethernet.vlan con show "$old_bond" | cut -d: -f2)
     local ipv4=$(nmcli -t -f ipv4.addresses con show "$old_bond" | cut -d: -f2)
     local gateway=$(nmcli -t -f ipv4.gateway con show "$old_bond" | cut -d: -f2)
@@ -2336,12 +3261,24 @@ main_menu() {
                 EXPORT_JSON_PATH=$2
                 shift 2
                 ;;
+            --recommend)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --recommend requires a workload name or 'auto'" >&2
+                    exit 1
+                fi
+                handle_recommend_cli "$2"
+                ;;
+            --recommend=*)
+                local workload=${1#*=}
+                handle_recommend_cli "$workload"
+                ;;
             --help)
                 echo "Usage: $0 [-n|--dry-run] [--debug] [--help]"
                 echo "  -n, --dry-run: Echo commands without executing"
                 echo "  --debug: Enable verbose output"
                 echo "  --status: Print bond summary and exit"
                 echo "  --export-json <path>: Export bond summary to JSON and exit"
+                echo "  --recommend <name|auto>: Print recommended bond mode for workload and exit"
                 echo "  --help: Show this help message"
                 exit 0
                 ;;
@@ -2363,24 +3300,27 @@ main_menu() {
         export_bond_summary "$EXPORT_JSON_PATH" "--no-clear"
         exit 0
     fi
+    display_welcome_screen
     while true; do
         clear_screen
         echo "Bond Manager v$VERSION"
         echo "0) Rollback last change"
-        echo "1) Switch migration helper"
-        echo "2) 10Gb migration wizard"
-        echo "3) Repair bond"
-        echo "4) Repair bond (10GB A/B)"
-        echo "5) Diagnose bond"
-        echo "6) Extended diagnostics"
-        echo "7) Create bond"
-        echo "8) Edit bond"
-        echo "9) Remove bond"
-        echo "10) Show bond summary"
-        echo "11) Export bond summary (JSON)"
-        echo "12) Collect support bundle"
-        echo "13) Show version"
-        echo "14) Exit"
+        echo "1) Workload recommendation wizard"
+        echo "2) Generate workload quick reference"
+        echo "3) Switch migration helper"
+        echo "4) 10Gb migration wizard"
+        echo "5) Repair bond"
+        echo "6) Repair bond (10GB A/B)"
+        echo "7) Diagnose bond"
+        echo "8) Extended diagnostics"
+        echo "9) Create bond"
+        echo "10) Edit bond"
+        echo "11) Remove bond"
+        echo "12) Show bond summary"
+        echo "13) Export bond summary (JSON)"
+        echo "14) Collect support bundle"
+        echo "15) Show version"
+        echo "16) Exit"
         if ! read_input "Select an option: " option; then
             continue
         fi
@@ -2389,46 +3329,52 @@ main_menu() {
                 rollback
                 ;;
             1)
-                switch_migration
+                run_recommendation_wizard
                 ;;
             2)
-                ten_gb_migration
+                generate_quick_reference_report
                 ;;
             3)
-                repair_bond
+                switch_migration
                 ;;
             4)
-                repair_bond_10gb_ab
+                ten_gb_migration
                 ;;
             5)
-                diagnose_bond
+                repair_bond
                 ;;
             6)
-                extended_diagnostics
+                repair_bond_10gb_ab
                 ;;
             7)
-                create_bond
+                diagnose_bond
                 ;;
             8)
-                edit_bond
+                extended_diagnostics
                 ;;
             9)
-                remove_bond
+                create_bond
                 ;;
             10)
-                show_bond_summary
+                edit_bond
                 ;;
             11)
-                export_bond_summary ""
+                remove_bond
                 ;;
             12)
-                collect_support_bundle
+                show_bond_summary
                 ;;
             13)
+                export_bond_summary ""
+                ;;
+            14)
+                collect_support_bundle
+                ;;
+            15)
                 clear_screen
                 echo "Bond Manager v$VERSION"
                 ;;
-            14)
+            16)
                 clear_screen
                 exit 0
                 ;;
@@ -2437,7 +3383,7 @@ main_menu() {
                 ;;
         esac
         case $option in
-            1|2|3|4|5|6|7|8|9)
+            3|4|5|6|9|10|11)
                 prompt_rollback
                 ;;
         esac
