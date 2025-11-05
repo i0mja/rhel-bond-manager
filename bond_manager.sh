@@ -6,7 +6,7 @@
 
 set -Eeuo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # -----------------------------
 # Constants & Paths
@@ -16,7 +16,8 @@ BACKUP_DIR="/var/backups/bond_manager"
 SUPPORT_DIR="/var/log/bond_manager/support"
 LOGROTATE_CONF="/etc/logrotate.d/bond_manager"
 CONN_DIR="/etc/NetworkManager/system-connections"
-MAX_BACKUPS=10
+CONFIG_FILE="/etc/bond_manager.conf"
+MAX_BACKUPS=10  # may be overridden by CONFIG_FILE
 
 # -----------------------------
 # Runtime flags (default)
@@ -27,9 +28,25 @@ FLAG_STATUS=false
 EXPORT_JSON_PATH=""
 
 # -----------------------------
+# Default tunables (may be overridden by CONFIG_FILE)
+# -----------------------------
+DEFAULT_MIIMON="100"
+DEFAULT_8023AD_LACP_RATE="fast"
+DEFAULT_8023AD_XHP="layer3+4"
+
+# Logrotate defaults (may be overridden by CONFIG_FILE)
+LOGROTATE_FREQUENCY="weekly"   # daily|weekly|monthly
+LOGROTATE_ROTATE="12"          # number of rotated files to keep
+
+# NIC selection policy (ERE patterns, space-separated). If allowlist is empty, all NICs are eligible
+# except those matching the blocklist.
+NIC_ALLOWLIST_PATTERNS="^(ens|enp|eth)[0-9].*"
+NIC_BLOCKLIST_PATTERNS="^lo$ ^veth.* ^docker.* ^br-.* ^virbr.* ^vnet.* ^tun.* ^tap.* ^nm-.* ^wl.* ^bond.* ^team.* ^ovs.*"
+
+# -----------------------------
 # Utilities
 # -----------------------------
-timestamp() { date +'%%Y-%%m-%%dT%%H:%%M:%%S%z'; }
+timestamp() { date +'%Y-%m-%dT%H:%M:%S%z'; }
 
 _log_common() {
   local level="$1"; shift || true
@@ -37,10 +54,10 @@ _log_common() {
   local line="[$(timestamp)] [$level] $msg"
   # file
   mkdir -p "$(dirname "$LOG_FILE")"
-  printf '%%s\n' "$line" >> "$LOG_FILE" || true
+  printf '%s\n' "$line" >> "$LOG_FILE" || true
   # stderr mirror in --debug
   if [[ "$DEBUG" == "true" ]]; then
-    printf '%%s\n' "$line" >&2
+    printf '%s\n' "$line" >&2
   fi
 }
 
@@ -68,23 +85,87 @@ require_root() {
   fi
 }
 
-ensure_first_run_artifacts() {
-  mkdir -p "$BACKUP_DIR" "$SUPPORT_DIR"
-  touch "$LOG_FILE"
-  # Create logrotate policy if missing
-  if [[ ! -f "$LOGROTATE_CONF" ]]; then
-    cat <<'EOF' > "$LOGROTATE_CONF"
-/var/log/bond_manager.log {
-    weekly
-    rotate 12
+write_text_if_changed() {
+  # $1 path, $2 text
+  local path="$1"
+  local text="$2"
+  local tmp
+  tmp="$(mktemp)"
+  printf '%s\n' "$text" > "$tmp"
+  if [[ -f "$path" ]]; then
+    if cmp -s "$tmp" "$path"; then
+      rm -f "$tmp"
+      return 0
+    fi
+  fi
+  install -m 0640 -o root -g root "$tmp" "$path"
+  rm -f "$tmp"
+}
+
+render_logrotate_conf() {
+  cat <<EOF
+# Managed by bond_manager.sh v${VERSION}
+${LOG_FILE} {
+    ${LOGROTATE_FREQUENCY}
+    rotate ${LOGROTATE_ROTATE}
     compress
     missingok
     notifempty
     create 0640 root root
 }
 EOF
-    log_info "Installed logrotate policy at $LOGROTATE_CONF"
+}
+
+ensure_config() {
+  # Create a default config if missing; otherwise source it.
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    cat > "$CONFIG_FILE" <<'EOF'
+# /etc/bond_manager.conf
+# Managed by bond_manager.sh. Edit the values below to change defaults.
+#
+# --------- Bond tuning defaults ---------
+DEFAULT_MIIMON="100"
+DEFAULT_8023AD_LACP_RATE="fast"       # fast|slow
+DEFAULT_8023AD_XHP="layer3+4"         # layer2|layer3+4|layer2+3
+#
+# --------- Backup & rotation ---------
+MAX_BACKUPS="10"                      # how many NetworkManager backups to retain
+LOGROTATE_FREQUENCY="weekly"          # daily|weekly|monthly
+LOGROTATE_ROTATE="12"                 # number of rotated log files to keep
+#
+# --------- NIC selection policy ---------
+# Allow only NICs matching these ERE patterns (space-separated).
+# If empty, all NICs are eligible except those matching the blocklist.
+NIC_ALLOWLIST_PATTERNS="^(ens|enp|eth)[0-9].*"
+# Always exclude any NICs matching these ERE patterns (space-separated).
+NIC_BLOCKLIST_PATTERNS="^lo$ ^veth.* ^docker.* ^br-.* ^virbr.* ^vnet.* ^tun.* ^tap.* ^nm-.* ^wl.* ^bond.* ^team.* ^ovs.*"
+EOF
+    chmod 0640 "$CONFIG_FILE"
+    chown root:root "$CONFIG_FILE" || true
+    log_info "Installed default config at $CONFIG_FILE"
   fi
+
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE" || die "Failed to source $CONFIG_FILE"
+
+  # Apply overrides if set in config
+  : "${DEFAULT_MIIMON:=${DEFAULT_MIIMON}}"
+  : "${DEFAULT_8023AD_LACP_RATE:=${DEFAULT_8023AD_LACP_RATE}}"
+  : "${DEFAULT_8023AD_XHP:=${DEFAULT_8023AD_XHP}}"
+  : "${LOGROTATE_FREQUENCY:=${LOGROTATE_FREQUENCY}}"
+  : "${LOGROTATE_ROTATE:=${LOGROTATE_ROTATE}}"
+  : "${MAX_BACKUPS:=${MAX_BACKUPS}}"
+  : "${NIC_ALLOWLIST_PATTERNS:=${NIC_ALLOWLIST_PATTERNS}}"
+  : "${NIC_BLOCKLIST_PATTERNS:=${NIC_BLOCKLIST_PATTERNS}}"
+}
+
+ensure_first_run_artifacts() {
+  mkdir -p "$BACKUP_DIR" "$SUPPORT_DIR"
+  touch "$LOG_FILE"
+  # Always ensure logrotate policy matches current config
+  local lr
+  lr="$(render_logrotate_conf)"
+  write_text_if_changed "$LOGROTATE_CONF" "$lr"
 }
 
 # Run an nmcli command with logging and dry-run support
@@ -98,7 +179,7 @@ run_nmcli() {
   fi
 }
 
-# Run a command that is not nmcli; always executes (dry-run affects nmcli only per README)
+# Run a command that is not nmcli; always executes (dry-run affects nmcli only)
 run_cmd() {
   log_info "RUN $*"
   "$@"
@@ -245,6 +326,72 @@ is_10g() {
   [[ -n "$spd" && "$spd" -ge 10000 ]]
 }
 
+nic_exists() {
+  local ifname="$1"
+  [[ -e "/sys/class/net/$ifname" ]]
+}
+
+_match_any() {
+  # $1 text; remaining args are ERE patterns
+  local text="$1"; shift || true
+  local p
+  for p in "$@"; do
+    [[ -z "$p" ]] && continue
+    if [[ "$text" =~ $p ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+nic_allowed() {
+  local ifname="$1"
+  local -a allow=() block=()
+  # shellcheck disable=SC2206
+  allow=($NIC_ALLOWLIST_PATTERNS)
+  # shellcheck disable=SC2206
+  block=($NIC_BLOCKLIST_PATTERNS)
+
+  # Always block if matched
+  if _match_any "$ifname" "${block[@]}"; then
+    return 1
+  fi
+  # If allowlist is empty -> eligible
+  if (( ${#allow[@]} == 0 )); then
+    return 0
+  fi
+  # Otherwise require a match
+  if _match_any "$ifname" "${allow[@]}"; then
+    return 0
+  fi
+  return 1
+}
+
+validate_slaves() {
+  # echo back a **space-separated** list of validated NICs or die if none remain
+  local -a out=()
+  local s
+  for s in "$@"; do
+    if ! nic_exists "$s"; then
+      log_warn "Skipping $s: interface not found."
+      continue
+    fi
+    if ! nic_allowed "$s"; then
+      log_warn "Skipping $s: blocked by NIC policy (see $CONFIG_FILE)."
+      continue
+    fi
+    # Warn if already enslaved elsewhere
+    if grep -Rqs "Slave Interface: $s" /proc/net/bonding/* 2>/dev/null; then
+      log_warn "$s appears to already be enslaved in an existing bond."
+    fi
+    out+=("$s")
+  done
+  if (( ${#out[@]} == 0 )); then
+    die "No eligible slave interfaces after validation. Adjust NIC_* patterns in $CONFIG_FILE."
+  fi
+  printf '%s ' "${out[@]}"
+}
+
 # -----------------------------
 # JSON & Summary
 # -----------------------------
@@ -379,7 +526,7 @@ create_bond_profile() {
 
 # Add bond slaves
 add_bond_slaves() {
-  local bond="$1"; shift
+  local bond="$1"; shift || true
   local slaves=("$@")
   for s in "${slaves[@]}"; do
     run_nmcli connection add type bond-slave ifname "$s" con-name "${bond}-slave-${s}" master "$bond"
@@ -447,6 +594,10 @@ opt_1_switch_migration() {
   raw="$(prompt_list "Enter NEW slave interfaces to add to $bond")"
   read -r -a new_slaves <<<"$raw"
   [[ ${#new_slaves[@]} -gt 0 ]] || die "No new slaves provided."
+  # Validate
+  local validated; validated="$(validate_slaves "${new_slaves[@]}")"
+  # shellcheck disable=SC2206
+  new_slaves=($validated)
 
   backup_networkmanager >/dev/null
   add_bond_slaves "$bond" "${new_slaves[@]}"
@@ -454,6 +605,7 @@ opt_1_switch_migration() {
 
   local old raw_old
   raw_old="$(prompt_list "Enter OLD slave interfaces to remove after adding new ones (or leave blank to skip)")"
+  # We allow removal of anything named here without validation (user intent).
   read -r -a old <<<"$raw_old"
   for s in "${old[@]:-}"; do
     run_nmcli connection delete "${bond}-slave-${s}" || true
@@ -474,6 +626,10 @@ opt_2_10g_migration_wizard() {
   raw="$(prompt_list "Enter new 10Gb slave interfaces")"
   read -r -a new_slaves <<<"$raw"
   [[ ${#new_slaves[@]} -gt 0 ]] || die "No new slaves provided."
+  # Validate against NIC policy
+  local validated; validated="$(validate_slaves "${new_slaves[@]}")"
+  # shellcheck disable=SC2206
+  new_slaves=($validated)
   for s in "${new_slaves[@]}"; do
     if ! is_10g "$s"; then
       log_warn "$s doesn't look like 10Gb (speed check may be unreliable on some NICs)."
@@ -487,11 +643,12 @@ opt_2_10g_migration_wizard() {
   mode="$(awk -F': +' '/^Bonding Mode:/{print $2}' "/proc/net/bonding/$src_bond" 2>/dev/null | awk '{print $1}' | head -n1)"
   [[ -z "$mode" ]] && mode="active-backup"
   miimon="$(awk -F': +' '/^MII Polling Interval \(ms\):/{print $2}' "/proc/net/bonding/$src_bond" 2>/dev/null | head -n1)"
-  [[ -z "$miimon" ]] && miimon="100"
+  [[ -z "$miimon" ]] && miimon="$DEFAULT_MIIMON"
   if [[ "$mode" == "802.3ad" ]]; then
     xhp="$(awk -F': +' '/^Transmit Hash Policy:/{print $2}' "/proc/net/bonding/$src_bond" 2>/dev/null | head -n1 | awk '{print $1}')"
     lacp_rate="$(awk -F': +' '/^LACP rate:/{print $2}' "/proc/net/bonding/$src_bond" 2>/dev/null | head -n1 | awk '{print $1}')"
-    [[ -z "$lacp_rate" ]] && lacp_rate="fast"
+    [[ -z "$lacp_rate" ]] && lacp_rate="$DEFAULT_8023AD_LACP_RATE"
+    [[ -z "$xhp" ]] && xhp="$DEFAULT_8023AD_XHP"
   fi
 
   create_bond_profile "$dst_bond" "$mode" "$miimon" "$lacp_rate" "$xhp" ""
@@ -557,6 +714,11 @@ opt_3_repair_bond() {
     run_nmcli connection delete "$s" || true
   done
 
+  # Validate from policy before re-adding
+  local validated; validated="$(validate_slaves "${slaves[@]}")"
+  # shellcheck disable=SC2206
+  slaves=($validated)
+
   add_bond_slaves "$bond" "${slaves[@]}"
   up_conn "$bond" || true
   restore_selinux_contexts
@@ -570,7 +732,7 @@ opt_4_repair_10g_ab() {
 
   backup_networkmanager >/dev/null
   # Set mode=active-backup
-  run_nmcli connection modify "$bond" bond.options "mode=active-backup,miimon=100"
+  run_nmcli connection modify "$bond" bond.options "mode=active-backup,miimon=${DEFAULT_MIIMON}"
   # Remove non-10G and re-add 10G only
   mapfile -t slaves < <(bond_slaves_from_proc "$bond")
   for s in "${slaves[@]}"; do
@@ -585,6 +747,9 @@ opt_4_repair_10g_ab() {
     local raw ns
     raw="$(prompt_list "Enter 10Gb slave interfaces to add to $bond")"
     read -r -a ns <<<"$raw"
+    local validated; validated="$(validate_slaves "${ns[@]}")"
+    # shellcheck disable=SC2206
+    ns=($validated)
     add_bond_slaves "$bond" "${ns[@]}"
   fi
   up_conn "$bond" || true
@@ -659,13 +824,13 @@ opt_7_create_bond() {
     die "Unsupported mode: $mode"
   fi
 
-  local miimon; miimon="$(prompt_read "miimon interval ms (default 100): ")"
-  [[ -z "$miimon" ]] && miimon="100"
+  local miimon; miimon="$(prompt_read "miimon interval ms (default ${DEFAULT_MIIMON}): ")"
+  [[ -z "$miimon" ]] && miimon="$DEFAULT_MIIMON"
 
   local lacp_rate=""; local xhp=""; local arp_targets=""
   if [[ "$mode" == "802.3ad" ]]; then
-    lacp_rate="$(prompt_read "LACP rate [fast|slow] (default fast): ")"; [[ -z "$lacp_rate" ]] && lacp_rate="fast"
-    xhp="$(prompt_read "xmit_hash_policy [layer2|layer3+4|layer2+3] (default layer3+4): ")"; [[ -z "$xhp" ]] && xhp="layer3+4"
+    lacp_rate="$(prompt_read "LACP rate [fast|slow] (default ${DEFAULT_8023AD_LACP_RATE}): ")"; [[ -z "$lacp_rate" ]] && lacp_rate="$DEFAULT_8023AD_LACP_RATE"
+    xhp="$(prompt_read "xmit_hash_policy [layer2|layer3+4|layer2+3] (default ${DEFAULT_8023AD_XHP}): ")"; [[ -z "$xhp" ]] && xhp="$DEFAULT_8023AD_XHP"
   fi
 
   arp_targets="$(prompt_read "Optional ARP monitor targets (comma-separated), blank to skip: ")"
@@ -674,6 +839,11 @@ opt_7_create_bond() {
   raw="$(prompt_list "Slave interfaces")"
   read -r -a slaves <<<"$raw"
   (( ${#slaves[@]} > 0 )) || die "At least one slave required."
+
+  # Policy-validate & prune
+  local validated; validated="$(validate_slaves "${slaves[@]}")"
+  # shellcheck disable=SC2206
+  slaves=($validated)
 
   backup_networkmanager >/dev/null
   create_bond_profile "$bond" "$mode" "$miimon" "$lacp_rate" "$xhp" "$arp_targets"
@@ -742,6 +912,9 @@ opt_8_edit_bond() {
       local raw slaves
       raw="$(prompt_list "Slave interfaces to add")"
       read -r -a slaves <<<"$raw"
+      local validated; validated="$(validate_slaves "${slaves[@]}")"
+      # shellcheck disable=SC2206
+      slaves=($validated)
       add_bond_slaves "$bond" "${slaves[@]}"
       ;;
     2)
@@ -755,10 +928,10 @@ opt_8_edit_bond() {
     3)
       local mode miimon lacp_rate xhp arp_targets
       mode="$(prompt_read "Mode [active-backup|802.3ad] (blank to keep): ")"
-      miimon="$(prompt_read "miimon interval ms (blank to keep): ")"
+      miimon="$(prompt_read "miimon interval ms (blank to keep; default ${DEFAULT_MIIMON}): ")"
       if [[ "$mode" == "802.3ad" ]]; then
-        lacp_rate="$(prompt_read "LACP rate [fast|slow] (blank to keep): ")"
-        xhp="$(prompt_read "xmit_hash_policy [layer2|layer3+4|layer2+3] (blank to keep): ")"
+        lacp_rate="$(prompt_read "LACP rate [fast|slow] (blank to keep; default ${DEFAULT_8023AD_LACP_RATE}): ")"
+        xhp="$(prompt_read "xmit_hash_policy [layer2|layer3+4|layer2+3] (blank to keep; default ${DEFAULT_8023AD_XHP}): ")"
       fi
       arp_targets="$(prompt_read "ARP targets (comma list, blank to keep/remove): ")"
       # Build new options from existing + overrides
@@ -853,6 +1026,11 @@ opt_12_support_bundle() {
 
 opt_13_version() {
   echo "RHEL Bond Manager version $VERSION"
+  echo "Config: $CONFIG_FILE"
+  echo "Backups retained: $MAX_BACKUPS"
+  echo "Logrotate: ${LOGROTATE_FREQUENCY}, keep ${LOGROTATE_ROTATE}"
+  echo "NIC allowlist: ${NIC_ALLOWLIST_PATTERNS:-<none>}"
+  echo "NIC blocklist: ${NIC_BLOCKLIST_PATTERNS:-<none>}"
 }
 
 # -----------------------------
@@ -943,6 +1121,7 @@ parse_args() {
 main() {
   parse_args "$@"
   require_root
+  ensure_config        # read or create /etc/bond_manager.conf (overrides defaults)
   ensure_first_run_artifacts
   check_requirements
 
