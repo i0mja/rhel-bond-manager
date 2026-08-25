@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# ping PATH-shim: reachability is controlled by $BM_STUB_PING_RC (default 0).
+set -u
+if [[ -n "${BM_TEST_CALLS:-}" ]]; then
+  printf 'ping %s\n' "$*" >>"$BM_TEST_CALLS"
+fi
+exit "${BM_STUB_PING_RC:-0}"

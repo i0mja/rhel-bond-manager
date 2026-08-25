@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# modprobe PATH-shim: the bonding module is always "available".
+set -u
+if [[ -n "${BM_TEST_CALLS:-}" ]]; then
+  printf 'modprobe %s\n' "$*" >>"$BM_TEST_CALLS"
+fi
+exit "${BM_STUB_MODPROBE_RC:-0}"

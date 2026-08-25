@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# systemctl PATH-shim.
+#   is-active [--quiet] NetworkManager -> rc $BM_STUB_NM_ACTIVE_RC (default 0)
+#   stop / reset-failed                -> rc 0
+set -u
+
+if [[ -n "${BM_TEST_CALLS:-}" ]]; then
+  printf 'systemctl %s\n' "$*" >>"$BM_TEST_CALLS"
+fi
+
+case "$*" in
+  *is-active*NetworkManager*)
+    rc="${BM_STUB_NM_ACTIVE_RC:-0}"
+    if [[ "$*" != *--quiet* ]]; then
+      if (( rc == 0 )); then echo active; else echo inactive; fi
+    fi
+    exit "$rc" ;;
+esac
+exit 0

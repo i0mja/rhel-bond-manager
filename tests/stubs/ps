@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# ps PATH-shim: only `ps -o tty= -p PID` is intercepted, and only when
+# $BM_STUB_PS_TTY is set (the tool asks for its own controlling terminal to
+# look the SSH peer up in who(1); under bats there is none). Every other
+# invocation — and the default case — is delegated to the real ps, so putting
+# this shim on PATH cannot change unrelated behavior.
+set -u
+if [[ -n "${BM_STUB_PS_TTY:-}" && "$*" == "-o tty= -p "* ]]; then
+  if [[ -n "${BM_TEST_CALLS:-}" ]]; then
+    printf 'ps %s\n' "$*" >>"$BM_TEST_CALLS"
+  fi
+  printf '%s\n' "$BM_STUB_PS_TTY"
+  exit 0
+fi
+for d in /usr/bin /bin /usr/local/bin; do
+  [[ -x "$d/ps" ]] && exec "$d/ps" "$@"
+done
+exit 127

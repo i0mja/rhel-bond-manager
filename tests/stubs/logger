@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# logger PATH-shim: swallow journal records.
+set -u
+if [[ -n "${BM_TEST_CALLS:-}" ]]; then
+  printf 'logger %s\n' "$*" >>"$BM_TEST_CALLS"
+fi
+exit 0

@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+      - name: Lint
+        run: make lint
+      - name: Verify committed artifact matches sources
+        run: make check-dist
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bats jq
+      - name: Test (unprivileged)
+        run: make test
+      # The snapshot and checkpoint suites need euid 0 and skip themselves
+      # otherwise, which would silently leave the safety engine untested.
+      - name: Test (root)
+        run: sudo --preserve-env=PATH make test

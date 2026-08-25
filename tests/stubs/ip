@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# ip PATH-shim: answers from canned files in $BM_STUB_IP_DIR.
+#   ip -br addr show [dev DEV]   -> addr_DEV / addr
+#   ip -br link show [dev DEV]   -> link_DEV / link
+#   ip -4 route show default     -> route4_default
+#   ip route get IP              -> route_get
+# Missing files mean empty output, rc 0 (like a dev with no addresses).
+set -u
+
+if [[ -n "${BM_TEST_CALLS:-}" ]]; then
+  printf 'ip %s\n' "$*" >>"$BM_TEST_CALLS"
+fi
+
+IPDIR="${BM_STUB_IP_DIR:-${BM_TEST_SANDBOX:-/nonexistent}/ip}"
+
+emit() { cat "$IPDIR/$1" 2>/dev/null || true; }
+
+key="$*"
+case "$key" in
+  "-br addr show dev "*) emit "addr_${key##* }" ;;
+  "-br addr show") emit addr ;;
+  "-br link show dev "*) emit "link_${key##* }" ;;
+  "-br link show") emit link ;;
+  "-4 route show default") emit route4_default ;;
+  "route get "*) emit route_get ;;
+  *) : ;;
+esac
+exit 0

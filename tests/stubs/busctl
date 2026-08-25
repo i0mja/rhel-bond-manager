@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# busctl PATH-shim: NetworkManager D-Bus checkpoint API.
+#   Peer.Ping                        -> rc $BM_STUB_BUSCTL_PING_RC (default 0)
+#   CheckpointCreate                 -> o "/org/freedesktop/NetworkManager/Checkpoint/1"
+#                                       rc $BM_STUB_CKPT_CREATE_RC (default 0)
+#   CheckpointDestroy                -> rc $BM_STUB_CKPT_DESTROY_RC (default 0);
+#                                       non-zero models a checkpoint that is
+#                                       already gone (NM rolled it back)
+#   CheckpointRollback               -> rc $BM_STUB_CKPT_ROLLBACK_RC (default 0)
+#   CheckpointAdjustRollbackTimeout  -> rc $BM_STUB_CKPT_ADJUST_RC (default 0)
+set -u
+
+if [[ -n "${BM_TEST_CALLS:-}" ]]; then
+  printf 'busctl %s\n' "$*" >>"$BM_TEST_CALLS"
+fi
+
+case "$*" in
+  *"org.freedesktop.DBus.Peer Ping"*)
+    exit "${BM_STUB_BUSCTL_PING_RC:-0}" ;;
+  *CheckpointCreate*)
+    rc="${BM_STUB_CKPT_CREATE_RC:-0}"
+    if (( rc == 0 )); then
+      echo 'o "/org/freedesktop/NetworkManager/Checkpoint/1"'
+    else
+      echo 'Call failed: checkpoints are unavailable (stub)' >&2
+    fi
+    exit "$rc" ;;
+  *CheckpointDestroy*)
+    rc="${BM_STUB_CKPT_DESTROY_RC:-0}"
+    (( rc == 0 )) || echo 'Call failed: No checkpoint with the given path (stub)' >&2
+    exit "$rc" ;;
+  *CheckpointRollback*)
+    rc="${BM_STUB_CKPT_ROLLBACK_RC:-0}"
+    (( rc == 0 )) || echo 'Call failed: No checkpoint with the given path (stub)' >&2
+    exit "$rc" ;;
+  *CheckpointAdjustRollbackTimeout*)
+    exit "${BM_STUB_CKPT_ADJUST_RC:-0}" ;;
+esac
+exit 0

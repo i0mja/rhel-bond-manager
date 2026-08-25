@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# who PATH-shim: deterministic login records for the SSH-egress fallback that
+# recovers the peer address from the session's controlling terminal (sudo's
+# env_reset strips SSH_CONNECTION, so that path is the real-world default).
+# Prints $BM_STUB_WHO_LINES verbatim; empty (the default) means "nobody
+# logged in", which is what a container reports anyway.
+set -u
+if [[ -n "${BM_TEST_CALLS:-}" ]]; then
+  printf 'who %s\n' "$*" >>"$BM_TEST_CALLS"
+fi
+if [[ -n "${BM_STUB_WHO_LINES:-}" ]]; then
+  printf '%s\n' "$BM_STUB_WHO_LINES"
+fi
+exit 0

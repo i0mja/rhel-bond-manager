@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# systemd-run PATH-shim: pretends the transient deadman timer was created.
+set -u
+if [[ -n "${BM_TEST_CALLS:-}" ]]; then
+  printf 'systemd-run %s\n' "$*" >>"$BM_TEST_CALLS"
+fi
+exit "${BM_STUB_SYSTEMD_RUN_RC:-0}"

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# journalctl PATH-shim.
+set -u
+if [[ -n "${BM_TEST_CALLS:-}" ]]; then
+  printf 'journalctl %s\n' "$*" >>"$BM_TEST_CALLS"
+fi
+echo "-- stub journal: NetworkManager[1]: <info> device state change --"
+exit 0

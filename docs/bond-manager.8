@@ -1,0 +1,710 @@
+.TH BOND\-MANAGER 8 "2026-08-25" "bond\-manager 3.0.0" "System Administration"
+.SH NAME
+bond\-manager \- safe NetworkManager bond management for RHEL-like systems
+.SH SYNOPSIS
+.B bond\-manager
+.RI [ "GLOBAL FLAGS" ]
+.I command
+.RI [ ARGS ]
+.br
+.B bond\-manager
+.RS 4
+(with no command on a terminal: interactive whiptail TUI)
+.RE
+.SH DESCRIPTION
+.B bond\-manager
+creates, modifies, repairs and removes Linux kernel bonding interfaces
+through NetworkManager on RHEL-like systems (RHEL, CentOS Stream, Rocky,
+Alma, Fedora).
+It is designed for remote operation over SSH on production machines:
+every change is executed as a planned transaction and is protected so
+that a mistake \(em including one that severs the SSH session driving
+the change \(em rolls the network back to its previous state
+automatically.
+.PP
+A mutating command runs as:
+plan \(-> snapshot \(-> arm protection \(-> execute \(-> verify \(->
+commit or roll back.
+The plan is rendered before anything is executed; with
+.B \-\-dry\-run
+the rendering is all that happens.
+Verification checks kernel state
+.RI ( /proc ", " /sys )
+and the routing table rather than what
+.BR nmcli (1)
+reports.
+See
+.B SAFETY MODEL
+below for the protection tiers.
+.PP
+Run with no command on a terminal,
+.B bond\-manager
+starts a menu-driven TUI covering the same workflows; each TUI action
+prints its CLI equivalent so it can be scripted afterwards.
+.PP
+All mutating invocations are serialized through a single lock (exit code 4
+when another instance holds it), and all of them honor
+.BR \-\-dry\-run .
+This covers the change commands and the safety commands alike:
+.BR commit ,
+.BR rollback ,
+.BR "snapshot create" ,
+.B "snapshot restore"
+and
+.B "snapshot prune"
+take the lock and write nothing under
+.BR \-\-dry\-run .
+The read-only commands \(em including
+.BR "snapshot list" ", " "snapshot diff" " and " verify
+\(em take no lock and write nothing at all.
+.SH GLOBAL OPTIONS
+.TP
+.BR \-n ", " \-\-dry\-run
+Render the plan; execute nothing, write nothing.
+Dry runs need neither root nor a running NetworkManager.
+.TP
+.BR \-y ", " \-\-yes
+No prompts; auto-commit when verification passes.
+.TP
+.B \-\-json
+Machine-readable output.
+Applies to
+.BR list ", " show " and " status
+only;
+.B doctor
+has no JSON form.
+.TP
+.B \-\-debug
+Mirror log records to stderr.
+.TP
+.B \-\-quiet
+Suppress progress messages.
+.TP
+.B \-\-no\-color
+Disable colored output (the
+.B NO_COLOR
+environment variable is also honored).
+.TP
+.B \-\-plain
+Force plain text prompts (skip whiptail).
+.TP
+.BI \-\-rollback\-window " SECONDS"
+Auto-rollback window for unconfirmed changes, 10..86400 seconds
+(default: the
+.B ROLLBACK_WINDOW
+config key, 120 seconds out of the box).
+.TP
+.B \-\-no\-checkpoint
+Skip NetworkManager D-Bus checkpoints and fall back to the
+deadman/snapshot tiers (see
+.BR "SAFETY MODEL" ).
+.TP
+.B \-\-force\-unsafe
+Allow touching the device that carries the current SSH session without
+checkpoint protection.
+Without this flag such changes are refused.
+.TP
+.BR \-V ", " \-\-version
+Print version and exit.
+.TP
+.BR \-h ", " \-\-help
+Print usage and exit.
+.TP
+.BR \-\-status ", " \-\-export\-json " \fIPATH\fP"
+Legacy v2.x compatibility flags:
+.B \-\-status
+is equivalent to the
+.B status
+command, and
+.BI \-\-export\-json " PATH"
+writes the JSON inventory document to
+.IR PATH .
+Combined
+.RB ( "\-\-status \-\-export\-json " PATH ),
+the file is written, the human-readable status is printed, and the exit
+status is the health verdict (0, 10 or 11) \(em not 0 \(em so a monitoring
+caller still learns that a bond is degraded or down.
+.SH COMMANDS
+.SS Read-only commands (no root required; write nothing)
+.TP
+.B list
+One line per bond: name, mode, health verdict.
+.TP
+.BI show " BOND"
+Full detail for one bond: mode, health with reasons, miimon, active and
+primary member, per-member MII status / speed / duplex / link failure
+count, addresses and VLANs.
+Supports
+.BR \-\-json .
+.TP
+.BR status " [\fIBOND\fP]"
+Health summary for one bond or all bonds.
+Exit status encodes the worst verdict: 0 healthy, 10 degraded, 11 down.
+Supports
+.BR \-\-json ,
+which honors the
+.I BOND
+argument:
+.B status BOND \-\-json
+emits a
+.B bonds
+array holding only that bond, while
+.B status \-\-json
+emits the full inventory document.
+.TP
+.BI diagnose " BOND" " " [ \-\-extended "] [" "\-\-target IP" ]
+Run diagnostics against a bond: link and bonding state, and connectivity
+probing.
+.B \-\-extended
+adds deeper checks;
+.BI \-\-target " IP"
+sets the ping target (default: the default gateway).
+.TP
+.B doctor
+Environment preflight: required and optional tools, NetworkManager
+state, bonding module, SELinux, config presence, the protection tier
+this host supports, and any pending (unconfirmed) change.
+Exit status 3 when the host is not ready.
+.TP
+.BR "config show" " | " "config path"
+Print the effective configuration (defaults overlaid with
+.IR /etc/bond_manager.conf ),
+or the config file path.
+.TP
+.B completion bash
+Emit a bash completion script
+(typically installed with:
+.BR "bond\-manager completion bash > /etc/bash_completion.d/bond\-manager" ).
+.SS Change commands (root required; guarded by plan \(-> snapshot \(-> checkpoint \(-> verify)
+.TP
+.BI create " BOND" " \-\-mode " MODE " \-\-members " IF1,IF2 " " [ options ]
+Create a bond with the given members.
+Accepts the IP and tuning flags listed below, plus repeatable
+.BI \-\-vlan " VID[:ip4=..;gw4=..]"
+to create VLANs on top of the new bond in the same transaction.
+.TP
+.BI modify " BOND" " " [ "\-\-mode MODE" "] [" "\-\-opt k=v" "]... [" "\-\-del\-opt k" "]... [" "ip/mtu flags" ]
+Modify an existing bond: mode, bonding options, IP configuration, MTU.
+Only the difference from the current profile is planned.
+When the profile carries no explicit
+.B mode=
+in its
+.BR bond.options ,
+the bond is treated as
+.B balance\-rr
+\(em the kernel and NetworkManager default \(em and a note says so, so the
+resulting option set is validated against the mode the bond really runs in.
+.TP
+.BI add\-member " BOND IF" [ ,IF... ]
+Add member interfaces to a bond.
+.TP
+.BI remove\-member " BOND IF" [ ,IF... ]
+Remove member interfaces from a bond.
+Verification asserts the named members are no longer enslaved.
+Removing the last member takes the bond down: that is confirmed
+interactively and verified with a relaxed state expectation, so a correct
+change is not rolled back for leaving the bond down.
+.TP
+.BI swap\-member " BOND" " \-\-old " IF " \-\-new " IF
+Replace one member NIC with another: the new member is added first, then
+the old one is removed, so redundancy is never reduced below the
+starting point.
+Verification covers both halves: the new member enslaved, the old one gone.
+.TP
+.BI remove " BOND" " " [ \-\-keep\-vlans ]
+Delete a bond together with its member and VLAN profiles.
+.B \-\-keep\-vlans
+leaves the VLAN profiles in place.
+.RB ( delete
+is accepted as an alias.)
+.TP
+.BI "vlan add" " BOND VID" [ :ip4=..;gw4=.. ]
+Create a VLAN interface on top of a bond, optionally with IPv4
+configuration in the token.
+.TP
+.BI "vlan modify" " BOND VID" " " [ "ip flags" ]
+Change the IP configuration of an existing VLAN interface.
+.TP
+.BI "vlan remove" " BOND VID"
+Delete a VLAN interface from a bond.
+.TP
+.BI "vlan list" " BOND"
+List the VLAN interfaces configured on a bond.
+.TP
+.BI clone " SRC DST" " \-\-members " IF [ ,IF... ] " " [ \-\-copy\-ip "] [" \-\-copy\-vlans ]
+Create bond
+.I DST
+on new member NICs using the mode and bonding options of
+.IR SRC ,
+optionally copying its IP configuration and cloning its VLANs.
+.TP
+.BI repair " BOND"
+Rebuild member port profiles from kernel state \(em for bonds whose
+NetworkManager profiles were deleted or mangled while the kernel bond
+still runs.
+.TP
+.BI verify " BOND"
+Re-run the verification checks against the current state of a bond and
+render the pass/warn/fail report.
+Read-only: no root, no lock, nothing written.
+Exit status 1 when a check fails.
+.SS Create/modify IP and tuning flags
+.TP
+.BI \-\-ip4 " dhcp\fR|\fPnone\fR|\fPCIDR" [ ,CIDR ]
+IPv4 method or static address list:
+.B dhcp
+sets
+.BR "ipv4.method auto" ,
+.B none
+sets
+.BR "ipv4.method disabled" ,
+and an address list sets
+.B ipv4.method manual
+with
+.BR ipv4.addresses .
+.TP
+.BI \-\-gw4 " ADDR"
+IPv4 gateway.
+.TP
+.BI \-\-dns4 " A,B"
+IPv4 DNS servers.
+.TP
+.BI \-\-ip6 " auto\fR|\fPdhcp\fR|\fPnone\fR|\fPCIDR" [ ,CIDR ]
+IPv6 method or static address list.
+.B auto
+sets
+.B ipv6.method auto
+(SLAAC), while
+.B dhcp
+sets
+.B ipv6.method dhcp
+\(em DHCPv6 without SLAAC, a distinct NetworkManager method, not a synonym
+for
+.BR auto .
+.B none
+sets
+.BR "ipv6.method ignore" :
+the
+.B disabled
+value exists only from NetworkManager 1.20, and
+.B ignore
+means the same thing on every release this tool supports.
+.TP
+.BI \-\-gw6 " ADDR"
+IPv6 gateway.
+.TP
+.BI \-\-dns6 " A,B"
+IPv6 DNS servers.
+.TP
+.BI \-\-mtu " N"
+MTU for the bond (and its members).
+.TP
+.BI \-\-opt " key=value"
+Set an arbitrary bonding option (repeatable).
+Values may contain commas
+.RB ( "\-\-opt arp_ip_target=10.0.0.1,10.0.0.2" );
+they are merged into the existing
+.B bond.options
+as one option, not split into bogus keys.
+.TP
+.BI \-\-del\-opt " key"
+Delete a bonding option (repeatable;
+.B modify
+only).
+.TP
+.BI \-\-vlan " VID" [ :ip4=..;gw4=.. ]
+Create a VLAN on the bond in the same transaction (repeatable;
+.B create
+only).
+.TP
+.BI \-\-miimon " MS"
+MII link monitoring interval in milliseconds.
+.TP
+.BI \-\-primary " IF"
+Primary member (active\-backup).
+.TP
+.BI \-\-lacp\-rate " fast\fR|\fPslow"
+LACPDU rate (802.3ad).
+.TP
+.BI \-\-xmit\-hash " POLICY"
+Transmit hash policy (802.3ad / balance\-xor), e.g.
+.BR layer3+4 .
+.TP
+.BI \-\-arp\-interval " MS"
+ARP monitoring interval in milliseconds.
+.TP
+.BI \-\-arp\-targets " IP" [ ,IP ]
+ARP monitoring target addresses.
+.TP
+.BI \-\-min\-links " N"
+Minimum number of active links for the bond to be considered up.
+.TP
+.B \-\-no\-activate
+Write profiles but do not activate the bond.
+Verification then runs with a relaxed state expectation, since the bond is
+legitimately down afterwards.
+.PP
+Supported bond modes:
+.BR balance\-rr ,
+.BR active\-backup ,
+.BR balance\-xor ,
+.BR broadcast ,
+.BR 802.3ad ,
+.BR balance\-tlb ,
+.BR balance\-alb .
+.SS Safety commands
+.TP
+.B commit
+Confirm a pending change: keep the applied state and disarm the
+auto-rollback protection.
+Can be run from a new session (for example after an SSH reconnect).
+.IP
+If the NetworkManager checkpoint can no longer be destroyed because it has
+already gone, the change was most likely rolled back server-side when the
+window expired.
+.B commit
+reports that and exits 5; it never reports such a change as committed.
+Confirm the actual state with
+.BR "bond\-manager status" .
+.TP
+.BR rollback " [\fB\-\-snapshot\fP \fIID\fP]"
+Revert a pending change through whichever protection tier is armed, or
+\(em when no change is pending \(em restore a snapshot
+(the most recent one, or the one named with
+.BR \-\-snapshot ).
+Restoring a named snapshot while a change is pending disarms that
+change's protection first, so no checkpoint or timer can fire later on top
+of the restored profiles.
+.TP
+.B snapshot create
+Take a manual snapshot of the NetworkManager connection profiles in
+.B both
+profile stores: the keyfile store
+.RI ( /etc/NetworkManager/system\-connections )
+and the ifcfg store
+.RI ( /etc/sysconfig/network\-scripts ,
+used by RHEL 8's
+.B ifcfg\-rh
+plugin).
+In the ifcfg store only NetworkManager's own files are captured \(em
+.IR ifcfg\-* ", " keys\-* ", " route\-* ", " route6\-* ", " rule\-*
+and
+.I rule6\-*
+at the top level \(em never the legacy
+.IR ifup* / ifdown*
+scripts that share the directory.
+.TP
+.B snapshot list
+List snapshots with ID, creation time and reason.
+Read-only.
+.TP
+.BI "snapshot diff" " ID"
+Show what would change if the snapshot were restored, for both stores.
+Read-only.
+.TP
+.BR "snapshot restore" " [\fIID\fP]"
+Restore a snapshot (the most recent when
+.I ID
+is omitted).
+The restore reconciles: files created after the snapshot are deleted
+(with confirmation), in both stores, so restoring undoes creates, not just
+edits.
+The current state is snapshotted first, and if extraction fails the
+command fails loudly, naming that pre-restore snapshot \(em it does not
+report success over a half-restored profile set.
+With no snapshots present the command stops with a precondition error
+(exit 3).
+.TP
+.B snapshot prune
+Delete old snapshots beyond the configured
+.B MAX_BACKUPS
+(default 10), oldest first.
+Snapshots that are in use are never deleted: the one named in the
+pending-change state file, the one a restore is currently reading, and the
+one just created.
+Protected snapshots do not consume the
+.B MAX_BACKUPS
+budget, so pinning one does not shorten retention for the rest.
+.TP
+.BR bundle " [\fB\-\-output\fP \fIPATH\fP] [\fB\-\-redact\fP]"
+Create a support bundle (logs, state, diagnostics).
+.B \-\-redact
+strips IP and MAC addresses for off-site tickets.
+.TP
+.B init
+Install the default configuration file and logrotate policy, and create
+the backup and support directories.
+.SH SAFETY MODEL
+Every change is protected by up to three tiers; the strongest available
+tier is chosen automatically
+.RB ( doctor
+reports which one this host supports):
+.TP
+.B Tier 1: checkpoint
+A NetworkManager D-Bus checkpoint (created via
+.BR busctl )
+with a server-side rollback timeout.
+NetworkManager itself reverts device and profile state if the change is
+never confirmed \(em safe even when the change severs the SSH session
+that is driving it.
+Checkpoints are created with flags that delete new connections and
+disconnect new devices on rollback, so a rollback undoes a
+.IR create ,
+not just an edit.
+.TP
+.B Tier 2: deadman
+When no D-Bus checkpoint is available (or
+.B \-\-no\-checkpoint
+was given), a transient systemd timer
+.RB ( systemd\-run )
+runs
+.B bond\-manager rollback
+against the pre-change snapshot unless it is cancelled in time by
+.BR commit .
+.TP
+.B Tier 3: snapshot
+A tar snapshot of all connection profiles in both stores, with a manifest.
+This tier is always in effect \(em a snapshot is taken before every
+change regardless of the higher tiers \(em but on hosts with neither
+.B busctl
+nor
+.BR systemd\-run ,
+rollback is manual
+.RB ( "bond\-manager rollback" ):
+nothing reverts the change on its own, and the tool says so rather than
+promising an auto-rollback it cannot deliver.
+.PP
+A deadman timer is only armed when the path bond\-manager was invoked as is
+an executable file, since systemd has to re-run it; otherwise the tool
+falls back to tier 3 instead of arming protection that could never fire.
+.PP
+After the change is applied, a verification gate checks the result
+against kernel state
+.RI ( /proc/net/bonding ", " /sys )
+and the routing table.
+Checks that FAIL \(em bond absent from the kernel, operstate not reaching
+.BR up ,
+wrong mode, an expected member not enslaved, a removed member still
+enslaved \(em roll the change back immediately and the command exits 5.
+Checks that only warn \(em a member's MII status, a missing LACP partner,
+no currently-active member, no address yet, an unanswered gateway ping
+\(em are printed for the operator's decision and never roll anything back.
+Operations that legitimately leave the bond down
+.RB ( \-\-no\-activate ,
+removing the last member) are verified with a relaxed state expectation.
+.PP
+If verification passes, the auto-rollback window is re-budgeted to a full
+window \(em the time the apply itself consumed does not come out of the
+decision time \(em and the change is committed automatically with
+.BR \-\-yes ;
+otherwise the operator is prompted, and an unconfirmed change is rolled
+back automatically when the rollback window expires (command exits 6
+while the change is pending).
+.PP
+Pending-change state is kept in
+.IR /run/bond\-manager/pending.state ,
+so a
+.B new
+session \(em for instance after an SSH disconnect \(em can run
+.B bond\-manager commit
+or
+.B bond\-manager rollback
+to resolve it.
+Changes that would touch the device carrying the current SSH session are
+refused unless checkpoint protection is active or
+.B \-\-force\-unsafe
+is given.
+The devices considered are the bond, its current members and its VLAN
+interfaces.
+The session's device is resolved from
+.BR SSH_CONNECTION ,
+falling back to
+.B SSH_CLIENT
+and then to the
+.BR who (1)
+login record for the session's terminal, because
+.BR sudo (8)
+strips
+.B SSH_CONNECTION
+under its default
+.BR env_reset .
+.SH EXIT STATUS
+.TP
+.B 0
+Success, healthy, or nothing to do.
+.TP
+.B 1
+Error.
+.TP
+.B 2
+Usage error (unknown command, missing or invalid arguments).
+.TP
+.B 3
+Precondition failed (not root, NetworkManager not active, missing tool,
+no pending change, ...).
+.TP
+.B 4
+Locked: another bond\-manager instance is running.
+.TP
+.B 5
+The change failed verification and was rolled back.
+Also returned by
+.B commit
+when the checkpoint had already been destroyed, meaning NetworkManager
+most likely rolled the change back when the window expired.
+.TP
+.B 6
+The change was applied but is unconfirmed (pending); it will be rolled
+back automatically unless committed within the rollback window.
+.TP
+.B 10
+At least one bond is degraded
+.RB ( status ).
+.TP
+.B 11
+At least one bond is down
+.RB ( status ).
+.SH ENVIRONMENT
+Every filesystem root the tool reads or writes can be overridden, which
+is how the test suite and fixture-based inspection work:
+.BR BM_PROC_ROOT " (default " /proc ),
+.BR BM_SYS_ROOT " (" /sys ),
+.BR BM_CONN_DIR " (" /etc/NetworkManager/system\-connections ),
+.BR BM_IFCFG_DIR " (" /etc/sysconfig/network\-scripts ),
+.BR BM_CONF ,
+.BR BM_LOG_FILE ,
+.BR BM_BACKUP_DIR ,
+.BR BM_SUPPORT_DIR ,
+.BR BM_RUN_DIR ,
+.BR BM_LOGROTATE_CONF
+(defaults for these are listed under
+.BR FILES ).
+.PP
+.B NO_COLOR
+disables colored output.
+.SH FILES
+.TP
+.I /etc/bond_manager.conf
+Configuration.
+The file is parsed line by line against a key allowlist
+.RB ( "KEY=\[dq]value\[dq]" " per line)"
+and never sourced; unknown keys and invalid values are ignored with a
+warning.
+See
+.B bond\-manager config show
+for the effective values and
+.B bond\-manager init
+to install the commented default file.
+.TP
+.I /var/log/bond_manager.log
+Structured operation log.
+Read-only commands never write it.
+.TP
+.I /etc/logrotate.d/bond_manager
+Logrotate policy for the log file (installed by
+.BR init ).
+.TP
+.I /var/backups/bond_manager/
+Snapshot archives and manifests:
+.I conn\-ID.tar.gz
+(keyfile store),
+.I conn\-ID.ifcfg.tar.gz
+(ifcfg store, written only when that store holds NetworkManager files) and
+.I conn\-ID.manifest
+(sha256 of every captured file in both stores, plus the directories they
+came from).
+.TP
+.I /var/log/bond_manager/support/
+Support bundles created by
+.BR bundle .
+.TP
+.I /run/bond\-manager/
+Runtime state: the mutation lock and
+.IR pending.state .
+.TP
+.I /etc/NetworkManager/system\-connections/
+The keyfile connection profiles (RHEL 9 and later) that snapshots capture
+and restore.
+.TP
+.I /etc/sysconfig/network\-scripts/
+The ifcfg connection profiles written by NetworkManager's
+.B ifcfg\-rh
+plugin (the default on RHEL 8).
+Snapshots capture and restore only
+.IR ifcfg\-* ", " keys\-* ", " route\-* ", " route6\-* ", " rule\-*
+and
+.I rule6\-*
+at the top level of this directory; the legacy
+.IR ifup* / ifdown*
+scripts and helper files that also live there are never read or written.
+.SH EXAMPLES
+Create an LACP bond with a static address and jumbo frames:
+.PP
+.nf
+.RS
+bond\-manager create bond0 \-\-mode 802.3ad \e
+    \-\-members ens1f0,ens1f1 \e
+    \-\-ip4 10.0.0.10/24 \-\-gw4 10.0.0.1 \-\-dns4 10.0.0.2,10.0.0.3 \e
+    \-\-mtu 9000 \-\-lacp\-rate fast \-\-xmit\-hash layer3+4
+.RE
+.fi
+.PP
+Preview the same change without touching anything:
+.PP
+.nf
+.RS
+bond\-manager \-\-dry\-run create bond0 \-\-mode 802.3ad \-\-members ens1f0,ens1f1
+.RE
+.fi
+.PP
+Replace a failing NIC without losing redundancy, then confirm:
+.PP
+.nf
+.RS
+bond\-manager swap\-member bond0 \-\-old ens1f0 \-\-new ens2f0
+bond\-manager commit
+.RE
+.fi
+.PP
+Add a VLAN with its own address on top of an existing bond:
+.PP
+.nf
+.RS
+bond\-manager vlan add bond0 '100:ip4=10.0.100.10/24;gw4=10.0.100.1'
+.RE
+.fi
+.PP
+Health for monitoring (exit code 0/10/11) and JSON inventory:
+.PP
+.nf
+.RS
+bond\-manager status
+bond\-manager \-\-json status > /tmp/bonds.json
+bond\-manager status bond0 \-\-json      # just that bond, exit 0/10/11
+.RE
+.fi
+.PP
+Something went wrong \(em revert to the state before the last change:
+.PP
+.nf
+.RS
+bond\-manager rollback
+.RE
+.fi
+.PP
+Review an older snapshot before restoring it, then restore it:
+.PP
+.nf
+.RS
+bond\-manager snapshot list
+bond\-manager snapshot diff 20260825\-141530
+bond\-manager \-n snapshot restore 20260825\-141530   # rehearsal, writes nothing
+bond\-manager snapshot restore 20260825\-141530
+.RE
+.fi
+.SH SEE ALSO
+.BR nmcli (1),
+.BR NetworkManager (8),
+.BR ip (8),
+.BR systemd\-run (1),
+.BR logrotate (8)

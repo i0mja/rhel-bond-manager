@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# ethtool PATH-shim: fixed driver info for `ethtool -i DEV`.
+set -u
+if [[ -n "${BM_TEST_CALLS:-}" ]]; then
+  printf 'ethtool %s\n' "$*" >>"$BM_TEST_CALLS"
+fi
+if [[ "${1:-}" == -i ]]; then
+  printf 'driver: stub-nic\nversion: 1.0\nfirmware-version: N/A\nbus-info: 0000:00:03.0\n'
+fi
+exit 0

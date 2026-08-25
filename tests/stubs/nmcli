@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# nmcli PATH-shim for the test suite.
+#
+# Connection database: one file per profile in $BM_STUB_NM_DIR/*.conn with
+# KEY=VALUE lines, where KEY is the nmcli property name, e.g.:
+#   connection.uuid=1111...   connection.id=bond0   connection.type=bond
+#   connection.interface-name=bond0   bond.options=mode=active-backup,miimon=100
+#
+# Supported invocations (everything bond-manager issues):
+#   nmcli --version
+#   nmcli -t -f F1,F2,... connection show          (terse listing, ':' escaped;
+#       column names UUID/NAME/TYPE/DEVICE map to connection.uuid /
+#       connection.id / connection.type / the optional DEVICE prop — the
+#       active device, empty for inactive profiles)
+#   nmcli -g PROP connection show WHO              (WHO = uuid or id)
+#   nmcli [-w N] connection add|modify|up|down|delete|reload ...   -> rc 0
+# Every call appends "nmcli <argv>" to $BM_TEST_CALLS.
+#
+# Mutating verbs additionally honor (in this order):
+#   $BM_STUB_NMCLI_FAIL_RE   ERE matched against the argv string; a match exits
+#                            ${BM_STUB_NMCLI_FAIL_RC:-1} WITHOUT running the
+#                            hook — a command that failed changed nothing.
+#   $BM_STUB_NMCLI_HOOK      executable run as `hook <argv...>`; it stands in
+#                            for what NetworkManager and the kernel do in
+#                            response (e.g. rewriting /proc/net/bonding).
+#   $BM_STUB_NMCLI_MUTATE_RC exit code for every mutating verb (default 0).
+set -u
+
+if [[ -n "${BM_TEST_CALLS:-}" ]]; then
+  printf 'nmcli %s\n' "$*" >>"$BM_TEST_CALLS"
+fi
+
+NMDIR="${BM_STUB_NM_DIR:-${BM_TEST_SANDBOX:-/nonexistent}/nm}"
+ARGV=("$@")
+ARGSTR="$*"
+
+prop_of() { # prop_of <file> <key> -> value (empty if missing)
+  local line
+  while IFS= read -r line; do
+    if [[ "$line" == "$2="* ]]; then
+      printf '%s' "${line#"$2"=}"
+      return 0
+    fi
+  done <"$1"
+  return 1
+}
+
+esc() { # nmcli terse escaping: '\' -> '\\', ':' -> '\:'
+  local v="$1"
+  v="${v//\\/\\\\}"
+  v="${v//:/\\:}"
+  printf '%s' "$v"
+}
+
+fields="" getprop="" verb="" target=""
+seen_connection=0
+while (( $# )); do
+  case "$1" in
+    --version) echo "nmcli tool, version 1.44.2 (stub)"; exit 0 ;;
+    -t) shift ;;
+    -f) fields="${2:-}"; shift 2 ;;
+    -g) getprop="${2:-}"; shift 2 ;;
+    -w) shift 2 ;;
+    connection) seen_connection=1; shift ;;
+    show | add | modify | up | down | delete | reload)
+      if (( seen_connection )) && [[ -z "$verb" ]]; then
+        verb="$1"
+      elif [[ "$verb" == show && -z "$target" ]]; then
+        target="$1"    # e.g. a profile literally named "show"; unlikely
+      fi
+      shift ;;
+    *)
+      if [[ "$verb" == show && -z "$target" ]]; then
+        target="$1"
+      fi
+      shift ;;
+  esac
+done
+
+case "$verb" in
+  show)
+    if [[ -z "$target" ]]; then
+      # listing
+      shopt -s nullglob
+      for f in "$NMDIR"/*.conn; do
+        line=""
+        first=1
+        IFS=',' read -r -a want <<<"$fields"
+        for k in "${want[@]}"; do
+          case "$k" in
+            UUID) k=connection.uuid ;;
+            NAME) k=connection.id ;;
+            TYPE) k=connection.type ;;
+            DEVICE) k=DEVICE ;;   # active device; set explicitly per profile
+          esac
+          v="$(prop_of "$f" "$k" || true)"
+          (( first )) || line+=":"
+          first=0
+          line+="$(esc "$v")"
+        done
+        printf '%s\n' "$line"
+      done
+      exit 0
+    fi
+    # single connection lookup by uuid or id
+    shopt -s nullglob
+    found=""
+    for f in "$NMDIR"/*.conn; do
+      u="$(prop_of "$f" connection.uuid || true)"
+      n="$(prop_of "$f" connection.id || true)"
+      if [[ "$u" == "$target" || "$n" == "$target" ]]; then
+        found="$f"
+        break
+      fi
+    done
+    if [[ -z "$found" ]]; then
+      echo "Error: $target - no such connection profile." >&2
+      exit 10
+    fi
+    if [[ -n "$getprop" ]]; then
+      printf '%s\n' "$(prop_of "$found" "$getprop" || true)"
+      exit 0
+    fi
+    # full show (not used by bond-manager): dump the props
+    cat "$found"
+    exit 0
+    ;;
+  add | modify | up | down | delete | reload)
+    if [[ -n "${BM_STUB_NMCLI_FAIL_RE:-}" ]] && [[ "$ARGSTR" =~ $BM_STUB_NMCLI_FAIL_RE ]]; then
+      echo "Error: $verb failed (stub: matched BM_STUB_NMCLI_FAIL_RE)" >&2
+      exit "${BM_STUB_NMCLI_FAIL_RC:-1}"
+    fi
+    if [[ -n "${BM_STUB_NMCLI_HOOK:-}" && -x "${BM_STUB_NMCLI_HOOK:-}" ]]; then
+      "$BM_STUB_NMCLI_HOOK" "${ARGV[@]}" || true
+    fi
+    exit "${BM_STUB_NMCLI_MUTATE_RC:-0}"
+    ;;
+esac
+exit 0

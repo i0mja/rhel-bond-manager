@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Test-only generator (NOT a PATH shim): write a realistic active-backup
+# /proc/net/bonding/<bond> file for an arbitrary member list.
+#
+#   mk-proc-bond <path> <active-slave> <member>...
+#
+# It exists so a stub can model the kernel reacting to an nmcli command —
+# enslaving a NIC on `connection up`, releasing it on `connection delete` —
+# which is what makes the swap-member ordering invariant observable.
+# The layout matches the kernel's bonding driver output byte for byte
+# (see tests/fixtures/proc_bonding_active_backup_healthy).
+set -euo pipefail
+
+path="$1"
+active="$2"
+shift 2
+
+mkdir -p "$(dirname "$path")"
+{
+  printf 'Ethernet Channel Bonding Driver: v6.1.0\n\n'
+  printf 'Bonding Mode: fault-tolerance (active-backup)\n'
+  printf 'Primary Slave: None\n'
+  printf 'Currently Active Slave: %s\n' "$active"
+  printf 'MII Status: up\n'
+  printf 'MII Polling Interval (ms): 100\n'
+  printf 'Up Delay (ms): 0\n'
+  printf 'Down Delay (ms): 0\n'
+  printf 'Peer Notification Delay (ms): 0\n'
+  n=0
+  for m in "$@"; do
+    n=$((n + 1))
+    printf '\nSlave Interface: %s\n' "$m"
+    printf 'MII Status: up\n'
+    printf 'Speed: 1000 Mbps\n'
+    printf 'Duplex: full\n'
+    printf 'Link Failure Count: 0\n'
+    printf 'Permanent HW addr: 52:54:00:12:34:%02d\n' "$n"
+    printf 'Slave queue ID: 0\n'
+  done
+} >"$path"

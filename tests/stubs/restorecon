@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# restorecon PATH-shim: SELinux relabel is a no-op in the sandbox.
+set -u
+if [[ -n "${BM_TEST_CALLS:-}" ]]; then
+  printf 'restorecon %s\n' "$*" >>"$BM_TEST_CALLS"
+fi
+exit 0
