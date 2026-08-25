@@ -166,11 +166,16 @@ archived_ifcfg() { # sorted member list of the ifcfg archive
 
 # ---- prune protection ------------------------------------------------------
 
-# Three snapshots with unambiguous mtimes: oldest .. newest.
+# Three snapshots with unambiguous mtimes: oldest .. newest. The budget is
+# tightened afterwards — creating a snapshot prunes, and these tests are about
+# what a later, explicit prune does.
 three_snapshots() {
   SNAP1="$(bm::snap::create one 2>/dev/null)"
   SNAP2="$(bm::snap::create two 2>/dev/null)"
   SNAP3="$(bm::snap::create three 2>/dev/null)"
+  [ -f "$BM_BACKUP_DIR/conn-$SNAP1.tar.gz" ]
+  [ -f "$BM_BACKUP_DIR/conn-$SNAP2.tar.gz" ]
+  [ -f "$BM_BACKUP_DIR/conn-$SNAP3.tar.gz" ]
   touch -d '2020-01-01 00:00:01' "$BM_BACKUP_DIR/conn-$SNAP1.tar.gz"
   touch -d '2020-01-01 00:00:02' "$BM_BACKUP_DIR/conn-$SNAP2.tar.gz"
   touch -d '2020-01-01 00:00:03' "$BM_BACKUP_DIR/conn-$SNAP3.tar.gz"
@@ -178,8 +183,8 @@ three_snapshots() {
 
 @test "prune: never deletes the snapshot a pending change would roll back to" {
   require_root
-  bm::config::set MAX_BACKUPS 1
   three_snapshots
+  bm::config::set MAX_BACKUPS 1
   seed_pending checkpoint "$SNAP1" "pending change protecting the oldest snapshot"
 
   bm::snap::prune
@@ -197,8 +202,8 @@ three_snapshots() {
 
 @test "prune: BM_SNAP_PROTECT_ID and explicit arguments are honored" {
   require_root
-  bm::config::set MAX_BACKUPS 1
   three_snapshots
+  bm::config::set MAX_BACKUPS 1
   BM_SNAP_PROTECT_ID="$SNAP2"
   bm::snap::prune "$SNAP1"
   [ -e "$BM_BACKUP_DIR/conn-$SNAP1.tar.gz" ]
@@ -208,8 +213,8 @@ three_snapshots() {
 
 @test "prune: with nothing protected the budget is enforced strictly" {
   require_root
-  bm::config::set MAX_BACKUPS 1
   three_snapshots
+  bm::config::set MAX_BACKUPS 1
   bm::snap::prune
   [ ! -e "$BM_BACKUP_DIR/conn-$SNAP1.tar.gz" ]
   [ ! -e "$BM_BACKUP_DIR/conn-$SNAP2.tar.gz" ]
@@ -218,8 +223,8 @@ three_snapshots() {
 
 @test "create: pruning during a snapshot cannot delete the snapshot being read" {
   require_root
-  bm::config::set MAX_BACKUPS 1
   three_snapshots
+  bm::config::set MAX_BACKUPS 1
   seed_pending checkpoint "$SNAP3" "pending"
   # a restore takes a pre-restore snapshot, which prunes; the snapshot it is
   # about to extract must survive that

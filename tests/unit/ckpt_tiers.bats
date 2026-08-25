@@ -196,13 +196,15 @@ setup() {
   require_root
   export BM_STUB_BUSCTL_PING_RC=1
   bm::ckpt::arm 120 20240101-000000 "change"
-  local first="$BM_CKPT_UNIT"
+  local first="$BM_CKPT_UNIT" old_deadline="$BM_CKPT_DEADLINE"
   bm::ckpt::rebudget 600
-  [ "$BM_CKPT_UNIT" != "$first" ]
+  # cancel the old timer first, then arm one carrying the full new window
+  # (the unit name may repeat: it is derived from pid + second)
   assert_call_order \
-    "^systemd-run --collect --unit $first " \
+    "^systemd-run --collect --unit $first --on-active=120s" \
     "^systemctl stop $first.timer$" \
     "^systemd-run --collect --unit $BM_CKPT_UNIT --on-active=600s"
+  (( BM_CKPT_DEADLINE > old_deadline ))
   grep -q "deadman_unit=$BM_CKPT_UNIT" "$BM_RUN_DIR/pending.state"
 }
 

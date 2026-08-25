@@ -54,12 +54,30 @@ setup_sandbox() {
 
 # The dist artifact begins with `set -Eeuo pipefail`; save and restore the
 # bats shell options around the source so bats' own error handling is intact.
+#
+# The state MUST be captured from `$-` and `[[ -o ... ]]`, never from
+# `$(set +o)`: bash reports errexit as OFF inside a command substitution, so
+# restoring that snapshot leaves the test body running WITHOUT errexit — and
+# bats then reports a test whose assertions failed as passing.
 load_artifact() {
-  local _opts
-  _opts="$(set +o)"
+  local _dash="$-" _pipefail=0
+  [[ -o pipefail ]] && _pipefail=1
+  # `source` runs inside THIS function, which makes every file-scope
+  # `declare -A` in the artifact (BM_CFG, BM_MODE_OPTS, BM_MODE_HELP, BM_SPEC)
+  # function-local — they would vanish the moment this helper returns, leaving
+  # unit tests with an empty configuration and an empty mode matrix. Source a
+  # copy whose top-level declarations are explicitly global instead; when the
+  # artifact runs as a program (integration tests, production) they already are.
+  local _sourceable="$BATS_TEST_TMPDIR/artifact.sourceable.sh"
+  if [[ ! -s "$_sourceable" ]]; then
+    sed -E 's/^declare -([Aa]) /declare -g\1 /' "$BM_ARTIFACT" >"$_sourceable"
+  fi
   # shellcheck disable=SC1090
-  source "$BM_ARTIFACT"
-  eval "$_opts" 2>/dev/null || true
+  source "$_sourceable"
+  if [[ "$_dash" == *e* ]]; then set -e; else set +e; fi
+  if [[ "$_dash" == *u* ]]; then set -u; else set +u; fi
+  if (( _pipefail )); then set -o pipefail; else set +o pipefail; fi
+  return 0
 }
 
 # ---- running the CLI for integration tests ---------------------------------
