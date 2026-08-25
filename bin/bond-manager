@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Development entrypoint: sources lib/*.sh in numeric order and dispatches.
+# Production deploys use the single-file artifact built by `make dist`
+# (committed at the repo root as bond_manager.sh).
+set -Eeuo pipefail
+
+BM_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+for _bm_mod in "$BM_ROOT"/lib/*.sh; do
+  # shellcheck disable=SC1090
+  source "$_bm_mod"
+done
+unset _bm_mod
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  bm::main "$@"
+fi

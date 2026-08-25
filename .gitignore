@@ -1,0 +1,8 @@
+# Editor / OS cruft
+*~
+*.swp
+*.swo
+.DS_Store
+
+# Local scratch files (build/check outputs go through mktemp, not the repo)
+*.tmp
