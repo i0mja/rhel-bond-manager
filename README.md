@@ -1,21 +1,129 @@
 # bond-manager
 
-**Safe NetworkManager bond management for RHEL-like systems.**
+**Bond your NICs without losing the box.**
 
-bond-manager creates, modifies, repairs, and removes Linux kernel bonding
-interfaces (802.3ad/LACP, active-backup, and the other five kernel modes)
-through NetworkManager on RHEL-like 8/9 systems. It is a single bash script
-with no dependencies beyond NetworkManager and the standard base tools,
-usable three ways: as a CLI for scripted, reviewable changes; as a
-menu-driven TUI for guided operation (which prints the CLI equivalent of
-every action it performs); and as a health probe for monitoring systems via
-typed exit codes and versioned JSON output.
+It's 02:40. You're SSHed into a server in a datacenter three hours away. The
+ticket says *"convert bond0 to LACP."* The bond you're about to convert is
+the one carrying your SSH session. There's no console. Remote hands start at
+09:00.
 
-## Why v3
+Get it right and nothing happens — which is the point. Get it wrong and the
+machine is simply *gone*: a working server, fully booted, running your
+workload, that nobody can reach until someone drives to the rack.
 
-v3 is a ground-up rebuild around one idea: **a network change on a remote
-machine must be able to fail safely — including a failure that severs the
-SSH session driving it.**
+`bond-manager` is built for that moment.
+
+---
+
+## The dangerous part isn't the bonding
+
+Linux bonding is well understood. `nmcli` is capable and stable. The danger
+lives in the gap between *"I typed a command"* and *"the box is still
+there"* — and that gap is where servers go to die:
+
+- A mode the switch isn't configured for. LACP against ports with no
+  port-channel, and the link goes dark.
+- An option the kernel quietly ignores because it doesn't apply to the mode
+  you chose — so the failover you configured was never actually armed.
+- A member removed one heartbeat before its replacement finished enslaving.
+- A change that "worked": `nmcli` returned 0, and the bond never came up.
+- A rollback plan consisting of a `tar` file and optimism.
+
+Every one of those is survivable — *if the machine can undo the change by
+itself once you stop answering.* That single idea drives the whole design.
+
+## What it does differently
+
+### It shows you the future before it happens
+
+`--dry-run` prints the exact `nmcli` commands it would run. Not a summary —
+the commands. Paste them into a change ticket, read them in review, or run
+them by hand if you'd rather. It needs no root and writes nothing, not even
+a log line.
+
+### It arms a dead man's switch
+
+Before anything changes, bond-manager asks NetworkManager for a checkpoint.
+If you don't confirm within the window — because the change cut your session
+— **NetworkManager rolls it back itself**, server-side, with no help from
+you. You reconnect to the machine you started with.
+
+That's the trick that makes remote bonding survivable, and it's why this
+tool exists. On hosts without D-Bus checkpoints it degrades to a systemd
+dead-man timer, then to snapshots, and `doctor` tells you which tier you're
+getting *before* you need it.
+
+### It checks reality, not intentions
+
+`nmcli` returning 0 means "the profile was written," not "your network
+works." After every change bond-manager reads `/proc/net/bonding`,
+`/sys/class/net` and the routing table and asks the questions that matter:
+is the bond *actually* up, is the mode what you asked for, are the members
+*really* enslaved, does the gateway answer **through the new interface**?
+
+A failed check rolls the change back on its own. You don't have to notice.
+
+### It won't let you shoot yourself in the foot quietly
+
+It works out which device carries your SSH session — including when that's a
+VLAN riding on the bond, and including under `sudo`, which strips
+`SSH_CONNECTION` out of the environment. Touching that device without
+checkpoint protection takes an explicit `--force-unsafe` and a deliberate
+decision, not a shrug.
+
+### It teaches you the CLI
+
+The menu-driven TUI is there for 02:40, when nobody wants to recall flag
+names from memory. But every wizard prints the exact command line it just
+built for you:
+
+```
+CLI equivalent: bond-manager create bond0 --mode 802.3ad --members ens1f0,ens1f1 --ip4 10.0.0.10/24 --gw4 10.0.0.1
+```
+
+Click through it once, paste that into your runbook, and never open the menu
+again. The TUI is a teaching tool that puts itself out of a job.
+
+## The 30-second version
+
+```bash
+bond-manager doctor      # can this host protect me? which tier do I get?
+bond-manager list        # what have I got, and is it healthy?
+bond-manager -n create bond0 --mode 802.3ad --members ens1f0,ens1f1 --ip4 dhcp
+                         # show me the plan; change absolutely nothing
+```
+
+Happy with the plan? Drop the `-n`. Watch it snapshot, arm, apply, and
+verify — then press `c` to commit, or just walk away and let it undo itself.
+
+## It's one file
+
+No packages, no runtime, no `pip install` on an air-gapped box, no
+dependency you have to justify to a change board. `scp` one auditable bash
+script to `/usr/local/sbin` and it runs on what RHEL 8/9 already ships. You
+can read the whole thing in an afternoon. So can your security team.
+
+*(It's developed as 15 focused modules under `lib/` and compiled into that
+single file by `make dist`. The modularity is for us; the single file is for
+you.)*
+
+## Is this for you?
+
+**Probably yes if** you run bonded NICs on RHEL-like servers, you change
+them over SSH, and "just use the console" isn't a plan you actually have.
+
+**Probably not if** you manage machines exclusively through Ansible or
+Ignition and never touch a live host — though `--dry-run`, the JSON output
+and the typed exit codes are designed to slot into exactly that world too.
+
+**Definitely not** a replacement for NetworkManager, a switch configuration
+tool (LACP still needs the switch side configured), or a cross-host
+orchestrator. It does one thing: make bonding changes on *this* host
+survivable.
+
+---
+
+## Under the hood: how a change works
 
 Every mutating command runs as a transaction:
 
@@ -399,6 +507,45 @@ and never touched by a restore.
 | 6 | Applied but unconfirmed (no TTY to confirm on; protection stays armed) |
 | 10 | `status`: at least one bond degraded |
 | 11 | `status`: at least one bond down |
+
+## Can you trust it with your only route to the box?
+
+Fair question. A tool whose failure mode is "server unreachable until
+someone drives to the datacenter" should have to show its work.
+
+- **289 tests**, across 21 files, run on every change — unit tests for the
+  parsers and the safety logic, integration tests that drive the real
+  compiled script end to end.
+- The tests **stub `nmcli`, `ip`, `busctl` and `systemd-run` as PATH shims**
+  and point the tool at fixture `/proc` and `/sys` trees, so the whole
+  transaction engine is exercised without a NetworkManager anywhere in
+  sight. CI runs the suite twice — unprivileged and as root — because the
+  snapshot and checkpoint paths need euid 0 and would otherwise skip
+  themselves in silence.
+- The paths that decide whether you keep your network have **explicit
+  tests**: `swap-member` really does enslave the replacement before dropping
+  the old member; a failed step and a failed verification each roll back and
+  clear the pending state; a commit whose checkpoint already expired reports
+  the change as rolled back rather than applied; `--dry-run` on every
+  command writes literally nothing.
+- **The build refuses to ship broken code.** `make dist` fails on a parse
+  error, a duplicate function definition, a shellcheck warning, or any
+  `bm::` function that is called but never defined. That last gate is not
+  hypothetical — v2.1.0 shipped with a function called in five places and
+  defined nowhere, which is exactly the kind of thing a monolithic script
+  hides and a build gate catches.
+- v3 was **reviewed adversarially before release**: six independent passes
+  over the codebase (bash semantics, nmcli/kernel correctness, safety-engine
+  logic, security, documentation accuracy, test honesty), with findings put
+  to independent skeptics to confirm or refute before being acted on. It
+  found real bugs —
+  snapshots that didn't cover RHEL 8's profile store, a restore that
+  reported success after a failed extraction, a `--dry-run rollback` that
+  rolled back for real. Those are fixed, and each one now has a test that
+  fails if it comes back.
+
+None of that makes it perfect. It does mean the failure modes have been
+hunted deliberately rather than waited for.
 
 ## Development
 
