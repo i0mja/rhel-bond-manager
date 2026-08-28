@@ -290,12 +290,12 @@ bm::wf::modify() {
 
   # merge: explicit mode change + --opt pairs + --del-opt keys
   local -a changes=()
+  local -A spec_opts=()
   [[ -n "${BM_SPEC[mode]:-}" ]] && changes+=("mode=$mode")
   if [[ -n "${BM_SPEC[opts]:-}" ]]; then
     # Parse rather than split on commas: values such as
     # arp_ip_target=10.0.0.1,10.0.0.2 legitimately contain commas, and a naive
     # split would turn the second address into a bogus option key.
-    local -A spec_opts=()
     bm::nm::opts_parse "${BM_SPEC[opts]}" spec_opts
     local kv
     for kv in "${!spec_opts[@]}"; do
@@ -316,6 +316,29 @@ bm::wf::modify() {
     bm::nm::opts_parse "$new_opts" merged
     # shellcheck disable=SC2034  # merged is consumed by name via nameref
     merged[mode]="$mode"
+
+    # An explicit mode change carries the old mode's options into the merge,
+    # where they are no longer valid: switching an 802.3ad bond to
+    # active-backup (what a cross-switch migration needs, since LACP cannot
+    # span two independent switches) would otherwise fail on the lacp_rate and
+    # xmit_hash_policy it is being asked to abandon. Dropping them is what the
+    # operator means. Options passed in THIS command are left in place so a
+    # contradictory request still fails loudly.
+    if [[ -n "${BM_SPEC[mode]:-}" ]]; then
+      local -a dropped=()
+      local okey
+      for okey in "${!merged[@]}"; do
+        [[ "$okey" == mode ]] && continue
+        bm::val::option_allowed "$mode" "$okey" && continue
+        [[ -n "${spec_opts[$okey]:-}" ]] && continue
+        unset 'merged[$okey]'
+        dropped+=("$okey")
+      done
+      if (( ${#dropped[@]} > 0 )); then
+        bm::log::say "$(bm::core::c_warn "note: dropping option(s) not valid in mode $mode: ${dropped[*]}")"
+      fi
+    fi
+
     local errors
     if ! errors="$(bm::val::option_set "$mode" merged)"; then
       printf '%s\n' "$errors" >&2

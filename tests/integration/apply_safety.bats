@@ -298,3 +298,59 @@ HOOK
   assert_contains "$output" "a previous change is still pending (modify bond0)"
   assert_no_nmcli_mutations
 }
+
+# --- switch migration: mode changes carry stale options ----------------------
+
+@test "modify --mode drops options that only belonged to the old mode" {
+  scenario_bond0_healthy
+  stub_nm_conn 11111111-1111-1111-1111-111111111111 \
+    connection.id=bond0 connection.type=bond connection.interface-name=bond0 \
+    "bond.options=mode=802.3ad,lacp_rate=fast,miimon=100,xmit_hash_policy=layer3+4"
+  # Going 802.3ad -> active-backup is what a cross-switch migration needs;
+  # the carried-over LACP options must not block it.
+  run_cli -n modify bond0 --mode active-backup
+  [ "$status" -eq 0 ]
+  # inspect the resulting option string itself: the drop notice above it
+  # legitimately names the options being removed
+  local opts
+  opts="$(printf '%s\n' "$output" | sed -n "s/.*Set bond.options to '\\(.*\\)'.*/\\1/p")"
+  [ -n "$opts" ]
+  assert_contains "$opts" "mode=active-backup"
+  assert_contains "$opts" "miimon=100"
+  [[ "$opts" != *"lacp_rate"* ]]
+  [[ "$opts" != *"xmit_hash_policy"* ]]
+}
+
+@test "modify --mode reports which stale options it dropped" {
+  scenario_bond0_healthy
+  stub_nm_conn 11111111-1111-1111-1111-111111111111 \
+    connection.id=bond0 connection.type=bond connection.interface-name=bond0 \
+    "bond.options=mode=802.3ad,lacp_rate=fast,miimon=100,xmit_hash_policy=layer3+4"
+  run_cli -n modify bond0 --mode active-backup
+  assert_contains "$output" "dropping option(s) not valid in mode active-backup"
+}
+
+@test "modify --mode still rejects an option the caller explicitly contradicts" {
+  scenario_bond0_healthy
+  stub_nm_conn 11111111-1111-1111-1111-111111111111 \
+    connection.id=bond0 connection.type=bond connection.interface-name=bond0 \
+    "bond.options=mode=802.3ad,lacp_rate=fast,miimon=100,xmit_hash_policy=layer3+4"
+  # asking for active-backup AND lacp_rate in the same breath is a mistake,
+  # not an inheritance: it must fail rather than be silently dropped
+  run_cli -n modify bond0 --mode active-backup --lacp-rate fast
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "not valid for mode active-backup"
+}
+
+@test "modify without --mode leaves an unrelated option set untouched" {
+  scenario_bond0_healthy
+  stub_nm_conn 11111111-1111-1111-1111-111111111111 \
+    connection.id=bond0 connection.type=bond connection.interface-name=bond0 \
+    "bond.options=mode=802.3ad,lacp_rate=fast,miimon=100,xmit_hash_policy=layer3+4"
+  run_cli -n modify bond0 --opt miimon=50
+  [ "$status" -eq 0 ]
+  # no mode change -> nothing is dropped
+  assert_contains "$output" "lacp_rate=fast"
+  assert_contains "$output" "xmit_hash_policy=layer3+4"
+  assert_contains "$output" "miimon=50"
+}

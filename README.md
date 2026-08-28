@@ -1,38 +1,104 @@
 # bond-manager
 
-**Bond your NICs without losing the box.**
+**Move a live server onto a new switch without dropping it. Fix a bond that
+has drifted from reality. Do both over the SSH session that's riding on the
+bond you're changing.**
 
-It's 02:40. You're SSHed into a server in a datacenter three hours away. The
-ticket says *"convert bond0 to LACP."* The bond you're about to convert is
-the one carrying your SSH session. There's no console. Remote hands start at
-09:00.
+That's the job this was written for.
 
-Get it right and nothing happens — which is the point. Get it wrong and the
-machine is simply *gone*: a working server, fully booted, running your
-workload, that nobody can reach until someone drives to the rack.
+A rack is being migrated to a new switch. The servers are bonded, they're in
+production, and nobody has scheduled an outage — because with bonding you
+shouldn't need one. The bond is *designed* to survive losing a leg, so you
+move the legs one at a time: bring a NIC up on the new switch, wait for it
+to actually join the bond, then and only then retire the leg on the old
+switch. The server never notices. You never leave your chair.
 
-`bond-manager` is built for that moment.
+That's simple to describe and unforgiving to do by hand at 2am across forty
+hosts, because every step has an ordering rule and a way to get it subtly
+wrong. `bond-manager` is that procedure, encoded — with a machine that
+checks the result and undoes it if you vanish.
 
 ---
 
-## The dangerous part isn't the bonding
+## The two jobs it was built for
 
-Linux bonding is well understood. `nmcli` is capable and stable. The danger
-lives in the gap between *"I typed a command"* and *"the box is still
-there"* — and that gap is where servers go to die:
+### 1. Move a live server to a new switch, one leg at a time
 
-- A mode the switch isn't configured for. LACP against ports with no
-  port-channel, and the link goes dark.
-- An option the kernel quietly ignores because it doesn't apply to the mode
-  you chose — so the failover you configured was never actually armed.
-- A member removed one heartbeat before its replacement finished enslaving.
-- A change that "worked": `nmcli` returned 0, and the bond never came up.
-- A rollback plan consisting of a `tar` file and optimism.
+```bash
+bond-manager swap-member bond0 --old ens1f0 --new ens2f0
+```
+
+That single command adds `ens2f0`, activates it, **waits until the kernel
+actually reports it enslaved to `bond0`**, and only then deletes the profile
+for `ens1f0`. The bond is never down a leg it hasn't already replaced. Then
+you do the other one:
+
+```bash
+bond-manager swap-member bond0 --old ens1f1 --new ens2f1
+```
+
+Two commands, no outage, and the verification gate confirms both halves
+afterwards: the new member is enslaved, the old one is gone.
+
+> **The LACP catch.** If your bond is `802.3ad`, its members must terminate
+> in one LAG domain — a single switch, or an MLAG/stacked pair. Mid-migration
+> you'd have one leg on the old switch and one on the new, and LACP will
+> refuse to aggregate across two independent switches. So either the two
+> switches share a LAG domain, or you ride the migration out in
+> `active-backup`, which is perfectly happy with a leg on each:
+>
+> ```bash
+> bond-manager modify bond0 --mode active-backup   # drops the now-meaningless
+>                                                  # lacp_rate/xmit_hash_policy
+> ...migrate both legs...
+> bond-manager modify bond0 --mode 802.3ad         # once both are on the new switch
+> ```
+>
+> `diagnose` will tell you when LACP has no partner, which is exactly the
+> symptom of a switch side that isn't bundled yet.
+
+### 2. Repair a bond that no longer matches reality
+
+Bonds drift. Someone enslaved a NIC by hand and never wrote a profile. A
+half-finished migration left a port profile pointing at a NIC that isn't a
+member any more. The kernel says one thing, NetworkManager says another —
+and the difference only bites at the next reboot, when NetworkManager wins
+and the bond comes back wrong.
+
+```bash
+bond-manager repair bond0
+```
+
+reconciles the profiles to what the kernel is *actually* doing right now:
+creates a port profile for every enslaved member that lacks one, deletes
+every port profile whose NIC is no longer a member. `--dry-run` first shows
+you exactly which way the drift goes before you commit to a direction.
+
+---
+
+## Why not just run the nmcli by hand?
+
+You can. People do. The commands aren't the hard part — the ordering, the
+verification and the recovery are:
+
+- **Order.** Remove the old leg a heartbeat before the new one finishes
+  enslaving and you've just dropped the server you're logged into. The gap
+  is small, real, and invisible until it isn't.
+- **A mode the switch isn't ready for.** LACP against ports with no
+  port-channel and the link goes dark. Move a leg to a switch that isn't
+  bundled yet and the bond quietly runs on one NIC.
+- **Options the kernel ignores.** Set `primary` on a `balance-rr` bond, or
+  `lacp_rate` on `active-backup`, and nothing complains — the failover you
+  thought you configured was never armed.
+- **`nmcli` returning 0 means "the profile was written."** It does not mean
+  the bond came up, the members enslaved, or the gateway is reachable.
+- **A rollback plan of "I took a tar backup first"** doesn't help when the
+  change already cut the session you'd need to restore it from.
 
 Every one of those is survivable — *if the machine can undo the change by
 itself once you stop answering.* That single idea drives the whole design.
 
-## What it does differently
+## What it does about it
 
 ### It shows you the future before it happens
 
@@ -48,18 +114,18 @@ If you don't confirm within the window — because the change cut your session
 — **NetworkManager rolls it back itself**, server-side, with no help from
 you. You reconnect to the machine you started with.
 
-That's the trick that makes remote bonding survivable, and it's why this
-tool exists. On hosts without D-Bus checkpoints it degrades to a systemd
-dead-man timer, then to snapshots, and `doctor` tells you which tier you're
-getting *before* you need it.
+That's the trick that makes migrating a live server survivable, and it's why
+this tool exists. On hosts without D-Bus checkpoints it degrades to a
+systemd dead-man timer, then to snapshots, and `doctor` tells you which tier
+you're getting *before* you need it.
 
 ### It checks reality, not intentions
 
-`nmcli` returning 0 means "the profile was written," not "your network
-works." After every change bond-manager reads `/proc/net/bonding`,
-`/sys/class/net` and the routing table and asks the questions that matter:
-is the bond *actually* up, is the mode what you asked for, are the members
-*really* enslaved, does the gateway answer **through the new interface**?
+After every change bond-manager reads `/proc/net/bonding`, `/sys/class/net`
+and the routing table and asks the questions that matter: is the bond
+*actually* up, is the mode what you asked for, are the members *really*
+enslaved, did the member you replaced actually leave, does the gateway
+answer **through the new interface**?
 
 A failed check rolls the change back on its own. You don't have to notice.
 
@@ -73,23 +139,22 @@ decision, not a shrug.
 
 ### It teaches you the CLI
 
-The menu-driven TUI is there for 02:40, when nobody wants to recall flag
-names from memory. But every wizard prints the exact command line it just
-built for you:
+The menu-driven TUI is there for 2am, when nobody wants to recall flag names
+from memory. But every wizard prints the exact command line it just built:
 
 ```
-CLI equivalent: bond-manager create bond0 --mode 802.3ad --members ens1f0,ens1f1 --ip4 10.0.0.10/24 --gw4 10.0.0.1
+CLI equivalent: bond-manager swap-member bond0 --old ens1f0 --new ens2f0
 ```
 
-Click through it once, paste that into your runbook, and never open the menu
-again. The TUI is a teaching tool that puts itself out of a job.
+Click through the first host, paste that into your runbook, script the other
+thirty-nine. The TUI is a teaching tool that puts itself out of a job.
 
 ## The 30-second version
 
 ```bash
 bond-manager doctor      # can this host protect me? which tier do I get?
 bond-manager list        # what have I got, and is it healthy?
-bond-manager -n create bond0 --mode 802.3ad --members ens1f0,ens1f1 --ip4 dhcp
+bond-manager -n swap-member bond0 --old ens1f0 --new ens2f0
                          # show me the plan; change absolutely nothing
 ```
 
@@ -109,15 +174,16 @@ you.)*
 
 ## Is this for you?
 
-**Probably yes if** you run bonded NICs on RHEL-like servers, you change
-them over SSH, and "just use the console" isn't a plan you actually have.
+**Probably yes if** you run bonded NICs on RHEL-like servers, you re-cable
+or re-home them while they're in production, and "just use the console"
+isn't a plan you actually have.
 
 **Probably not if** you manage machines exclusively through Ansible or
 Ignition and never touch a live host — though `--dry-run`, the JSON output
 and the typed exit codes are designed to slot into exactly that world too.
 
 **Definitely not** a replacement for NetworkManager, a switch configuration
-tool (LACP still needs the switch side configured), or a cross-host
+tool (the switch side of LACP is still your problem), or a cross-host
 orchestrator. It does one thing: make bonding changes on *this* host
 survivable.
 
@@ -263,9 +329,20 @@ Grow, shrink, and migrate membership:
 ```bash
 bond-manager add-member bond0 ens1f2,ens1f3
 bond-manager remove-member bond0 ens1f3
-bond-manager swap-member bond0 --old ens1f0 --new ens2f0   # adds ens2f0 and waits for it
-                                                           # to enslave BEFORE removing ens1f0
+bond-manager swap-member bond0 --old ens1f0 --new ens2f0
 ```
+
+`swap-member` is the switch-migration workhorse, and its ordering is the
+whole point: it adds `ens2f0`, activates it, **waits for the kernel to
+report it enslaved**, and only then deletes the profile for `ens1f0` — so
+the bond is never short a leg it hasn't already replaced. Verification
+afterwards checks both halves (new member in, old member out), and the swap
+is rolled back if either is untrue. There is a test asserting the add lands
+before the remove, because that ordering is the reason the command exists.
+
+`remove-member` will take the last member out if you ask it to — it warns
+first, and verifies with a relaxed expectation, since a memberless bond is
+legitimately down rather than broken.
 
 Modify tuning, mode, IP, or MTU on an existing bond (only the diff is planned):
 
@@ -275,6 +352,14 @@ bond-manager modify bond0 --mode active-backup --opt primary=ens1f0
 bond-manager modify bond0 --ip4 10.0.0.10/24 --gw4 10.0.0.1 --dns4 10.0.0.53
 bond-manager modify bond0 --del-opt updelay           # delete an option
 ```
+
+Changing `--mode` **drops the options that only belonged to the old mode**
+and says which ones. Taking an 802.3ad bond to `active-backup` — what a
+migration across two unbundled switches needs — would otherwise fail on the
+`lacp_rate` and `xmit_hash_policy` it is being asked to abandon. Options you
+pass in the *same* command are still validated strictly, so
+`--mode active-backup --lacp-rate fast` is still rejected as the
+contradiction it is.
 
 If the existing profile carries no explicit `mode=` in `bond.options`,
 `modify` treats it as `balance-rr` — the kernel/NetworkManager default —

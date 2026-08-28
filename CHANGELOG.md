@@ -105,6 +105,15 @@ migration guide.
 - The default NIC blocklist additionally excludes `cali.*`, `flannel.*`,
   and `cni.*`; the allowlist covers `eno`, `em`, and `p<N>p<M>` naming.
 
+### Changed
+
+- `modify --mode` now drops bond options that are only valid in the previous
+  mode, naming them, instead of failing validation. Switching an 802.3ad bond
+  to `active-backup` (needed when migrating between two switches that are not
+  in one LAG domain) no longer requires hand-listing `--del-opt lacp_rate
+  --del-opt xmit_hash_policy`. Options supplied in the same invocation are
+  still validated strictly, so a contradictory request is still an error.
+
 ### Fixed
 
 All of the following are verified against the v2.1.0 script
