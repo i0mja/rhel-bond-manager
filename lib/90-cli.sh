@@ -1004,9 +1004,8 @@ bm::cli::cmd_bundle() {
   done
   bm::core::require_root
   bm::log::enable_file
-  local path
-  path="$(bm::diag::bundle "$out" "$redact")" || bm::core::die "support bundle creation failed" "$BM_EX_ERR"
-  echo "support bundle: $path"
+  bm::diag::bundle "$out" "$redact" || bm::core::die "support bundle creation failed" "$BM_EX_ERR"
+  echo "support bundle: $BM_BUNDLE_PATH"
 }
 
 bm::cli::cmd_init() {

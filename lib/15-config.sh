@@ -110,9 +110,10 @@ EOF
 # Install the default config and logrotate policy (only `init` calls this).
 bm::config::install() {
   bm::core::require_root
+  bm::core::ensure_tmpdir || bm::core::die "could not create a temporary directory in ${TMPDIR:-/tmp}" "$BM_EX_ERR"
   if [[ ! -f "$BM_CONF" ]]; then
     local tmp
-    tmp="$(bm::core::tmpdir)/conf"
+    tmp="${BM_TMPDIR:?}/conf"
     bm::config::default_text >"$tmp"
     install -m 0640 -o root -g root "$tmp" "$BM_CONF"
     bm::log::say "installed default config at $BM_CONF"
@@ -120,7 +121,7 @@ bm::config::install() {
     bm::log::say "config already present at $BM_CONF (left unchanged)"
   fi
   local tmp2
-  tmp2="$(bm::core::tmpdir)/logrotate"
+  tmp2="${BM_TMPDIR:?}/logrotate"
   bm::log::render_logrotate >"$tmp2"
   if [[ ! -f "$BM_LOGROTATE_CONF" ]] || ! cmp -s "$tmp2" "$BM_LOGROTATE_CONF"; then
     install -m 0644 -o root -g root "$tmp2" "$BM_LOGROTATE_CONF"

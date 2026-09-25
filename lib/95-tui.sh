@@ -400,6 +400,14 @@ bm::tui::_toggle_practice() {
 
 bm::tui::_emit_outcome() { printf '%s' "${BM_PLAN_OUTCOME:-}" >&3 2>/dev/null || true; }
 
+# EXIT trap of an action's subshell: report the outcome, and clean up what
+# the action created there (its temp directory, a terminal left raw) — the
+# subshell does not run the program's own EXIT trap.
+bm::tui::_action_exit() {
+  bm::tui::_emit_outcome
+  bm::core::cleanup
+}
+
 # Run one action in a subshell. kind: change (network change; checks it can
 # run first), safety (commit/rollback/snapshots/bundle), look (read-only).
 # Results: BM_TUI_LAST_RC, BM_TUI_LAST_OUTCOME. Never fails.
@@ -411,7 +419,7 @@ bm::tui::run() { # run <kind> <function> [args...]
   BM_UI_INTERRUPTED=0
   printf '\n' >&2
   out="$( (
-    trap bm::tui::_emit_outcome EXIT
+    trap bm::tui::_action_exit EXIT
     if [[ "$kind" == change ]]; then
       bm::cli::preflight_mutate
     fi

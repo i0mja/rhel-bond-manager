@@ -124,16 +124,31 @@ bm::core::init_traps() {
   trap 'bm::core::cleanup' EXIT
 }
 
+# Private scratch directory, created on first use and removed by the EXIT
+# trap (bm::core::cleanup). It sets BM_TMPDIR in the CALLING shell and prints
+# nothing — never call it inside $(...): the directory would then be made in
+# a subshell whose BM_TMPDIR the cleanup never sees, which is how every
+# `init` and `bundle` used to leak a /tmp/bond-manager.XXXXXX directory.
+# Callers use "${BM_TMPDIR:?}/name" so a misuse can never write to "/name".
 BM_TMPDIR=""
-bm::core::tmpdir() { # lazily create a private temp dir, echo its path
-  if [[ -z "$BM_TMPDIR" ]]; then
-    BM_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/bond-manager.XXXXXX")"
+bm::core::ensure_tmpdir() {
+  if [[ -n "$BM_TMPDIR" && -d "$BM_TMPDIR" ]]; then
+    return 0
   fi
-  printf '%s' "$BM_TMPDIR"
+  BM_TMPDIR=""
+  local d
+  d="$(mktemp -d "${TMPDIR:-/tmp}/bond-manager.XXXXXX")" || return 1
+  BM_TMPDIR="$d"
+  return 0
 }
+
 bm::core::cleanup() {
   bm::core::term_restore
-  [[ -n "$BM_TMPDIR" && -d "$BM_TMPDIR" ]] && rm -rf "$BM_TMPDIR"
+  # only ever delete a directory ensure_tmpdir made
+  if [[ -n "$BM_TMPDIR" && "${BM_TMPDIR##*/}" == bond-manager.* && -d "$BM_TMPDIR" ]]; then
+    rm -rf "$BM_TMPDIR"
+  fi
+  BM_TMPDIR=""
   return 0
 }
 
@@ -398,9 +413,10 @@ EOF
 # Install the default config and logrotate policy (only `init` calls this).
 bm::config::install() {
   bm::core::require_root
+  bm::core::ensure_tmpdir || bm::core::die "could not create a temporary directory in ${TMPDIR:-/tmp}" "$BM_EX_ERR"
   if [[ ! -f "$BM_CONF" ]]; then
     local tmp
-    tmp="$(bm::core::tmpdir)/conf"
+    tmp="${BM_TMPDIR:?}/conf"
     bm::config::default_text >"$tmp"
     install -m 0640 -o root -g root "$tmp" "$BM_CONF"
     bm::log::say "installed default config at $BM_CONF"
@@ -408,7 +424,7 @@ bm::config::install() {
     bm::log::say "config already present at $BM_CONF (left unchanged)"
   fi
   local tmp2
-  tmp2="$(bm::core::tmpdir)/logrotate"
+  tmp2="${BM_TMPDIR:?}/logrotate"
   bm::log::render_logrotate >"$tmp2"
   if [[ ! -f "$BM_LOGROTATE_CONF" ]] || ! cmp -s "$tmp2" "$BM_LOGROTATE_CONF"; then
     install -m 0644 -o root -g root "$tmp2" "$BM_LOGROTATE_CONF"
@@ -5863,13 +5879,22 @@ bm::diag::_redact() { # mask IPv4 addresses and MACs on stdin
     -e 's/([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/MAC-REDACTED/g'
 }
 
-bm::diag::bundle() { # bundle [output-path] [redact:0|1]
+# Collect a support bundle. The archive path is returned in BM_BUNDLE_PATH
+# (not on stdout): running this inside $(...) would leak the scratch
+# directory, see bm::core::ensure_tmpdir.
+BM_BUNDLE_PATH=""
+bm::diag::bundle() { # bundle [output-path] [redact:0|1] -> BM_BUNDLE_PATH
   local out="${1:-}" redact="${2:-0}"
+  BM_BUNDLE_PATH=""
   bm::core::require_root
   mkdir -p "$BM_SUPPORT_DIR"
   local ts dir archive
   ts="$(date +'%Y%m%d-%H%M%S')"
-  dir="$(bm::core::tmpdir)/bundle-$ts"
+  if ! bm::core::ensure_tmpdir; then
+    bm::log::error "could not create a temporary directory in ${TMPDIR:-/tmp}"
+    return 1
+  fi
+  dir="${BM_TMPDIR:?}/bundle-$ts"
   mkdir -p "$dir"
   [[ -n "$out" ]] || out="$BM_SUPPORT_DIR/support_$ts.tar.gz"
 
@@ -5913,7 +5938,7 @@ bm::diag::bundle() { # bundle [output-path] [redact:0|1]
   chmod 0640 "$out" 2>/dev/null || true
   rm -rf "$dir"
   bm::log::info "support bundle created at $out (redacted=$redact)"
-  printf '%s\n' "$out"
+  BM_BUNDLE_PATH="$out"
 }
 
 # ==== 90-cli.sh ====
@@ -6920,9 +6945,8 @@ bm::cli::cmd_bundle() {
   done
   bm::core::require_root
   bm::log::enable_file
-  local path
-  path="$(bm::diag::bundle "$out" "$redact")" || bm::core::die "support bundle creation failed" "$BM_EX_ERR"
-  echo "support bundle: $path"
+  bm::diag::bundle "$out" "$redact" || bm::core::die "support bundle creation failed" "$BM_EX_ERR"
+  echo "support bundle: $BM_BUNDLE_PATH"
 }
 
 bm::cli::cmd_init() {
@@ -7377,6 +7401,14 @@ bm::tui::_toggle_practice() {
 
 bm::tui::_emit_outcome() { printf '%s' "${BM_PLAN_OUTCOME:-}" >&3 2>/dev/null || true; }
 
+# EXIT trap of an action's subshell: report the outcome, and clean up what
+# the action created there (its temp directory, a terminal left raw) — the
+# subshell does not run the program's own EXIT trap.
+bm::tui::_action_exit() {
+  bm::tui::_emit_outcome
+  bm::core::cleanup
+}
+
 # Run one action in a subshell. kind: change (network change; checks it can
 # run first), safety (commit/rollback/snapshots/bundle), look (read-only).
 # Results: BM_TUI_LAST_RC, BM_TUI_LAST_OUTCOME. Never fails.
@@ -7388,7 +7420,7 @@ bm::tui::run() { # run <kind> <function> [args...]
   BM_UI_INTERRUPTED=0
   printf '\n' >&2
   out="$( (
-    trap bm::tui::_emit_outcome EXIT
+    trap bm::tui::_action_exit EXIT
     if [[ "$kind" == change ]]; then
       bm::cli::preflight_mutate
     fi

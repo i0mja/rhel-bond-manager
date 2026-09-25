@@ -117,16 +117,31 @@ bm::core::init_traps() {
   trap 'bm::core::cleanup' EXIT
 }
 
+# Private scratch directory, created on first use and removed by the EXIT
+# trap (bm::core::cleanup). It sets BM_TMPDIR in the CALLING shell and prints
+# nothing — never call it inside $(...): the directory would then be made in
+# a subshell whose BM_TMPDIR the cleanup never sees, which is how every
+# `init` and `bundle` used to leak a /tmp/bond-manager.XXXXXX directory.
+# Callers use "${BM_TMPDIR:?}/name" so a misuse can never write to "/name".
 BM_TMPDIR=""
-bm::core::tmpdir() { # lazily create a private temp dir, echo its path
-  if [[ -z "$BM_TMPDIR" ]]; then
-    BM_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/bond-manager.XXXXXX")"
+bm::core::ensure_tmpdir() {
+  if [[ -n "$BM_TMPDIR" && -d "$BM_TMPDIR" ]]; then
+    return 0
   fi
-  printf '%s' "$BM_TMPDIR"
+  BM_TMPDIR=""
+  local d
+  d="$(mktemp -d "${TMPDIR:-/tmp}/bond-manager.XXXXXX")" || return 1
+  BM_TMPDIR="$d"
+  return 0
 }
+
 bm::core::cleanup() {
   bm::core::term_restore
-  [[ -n "$BM_TMPDIR" && -d "$BM_TMPDIR" ]] && rm -rf "$BM_TMPDIR"
+  # only ever delete a directory ensure_tmpdir made
+  if [[ -n "$BM_TMPDIR" && "${BM_TMPDIR##*/}" == bond-manager.* && -d "$BM_TMPDIR" ]]; then
+    rm -rf "$BM_TMPDIR"
+  fi
+  BM_TMPDIR=""
   return 0
 }
 
