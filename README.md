@@ -325,8 +325,9 @@ decision, not a shrug.
 
 The guided menus are there for 2am, when nobody wants to recall flag names
 from memory. They ask one plain question at a time. Ports and modes are
-picked from lists that say *"free - good to use"* or *"no link - cable or
-switch port?"*, and typos are caught while you type. Every change ends with
+picked from lists with a note on each line (*"up · 10G · free"*, *"NO LINK"*,
+*"has IP 10.0.0.9 (in use?)"*; `bond-manager nics` gives the same verdicts
+in words), and typos are caught while you type. Every change ends with
 a summary in plain words and the exact command line it built:
 
 ```

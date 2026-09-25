@@ -189,6 +189,22 @@ bm::ckpt::load_pending() {
 
 bm::ckpt::clear_pending() { rm -f "$(bm::ckpt::state_file)"; }
 
+# How the last waiting change ended, for a commit gate still waiting on it
+# in another process: "snapshot=<id> how=kept|undone|timer|restored".
+BM_CKPT_SETTLE_AS="" # overrides "kept" when a commit only disarms (a restore)
+bm::ckpt::settled_file() { printf '%s/settled' "$BM_RUN_DIR"; }
+bm::ckpt::_mark_settled() { # _mark_settled <how>
+  printf 'snapshot=%s how=%s\n' "${BM_PENDING_SNAPSHOT:-}" "$1" \
+    >"$(bm::ckpt::settled_file)" 2>/dev/null || true
+}
+bm::ckpt::settled_how() { # settled_how <snapshot-id> -> how, or nothing
+  local line=""
+  line="$(cat "$(bm::ckpt::settled_file)" 2>/dev/null || true)"
+  if [[ -n "$1" && "$line" == "snapshot=$1 how="* ]]; then
+    printf '%s' "${line##* how=}"
+  fi
+}
+
 # Reset the auto-rollback deadline to a full window. Applying a plan consumes
 # real time (each activation can take up to ACTIVATE_TIMEOUT), so without this
 # the operator would get whatever is left of the window to decide — sometimes
@@ -251,6 +267,8 @@ bm::ckpt::commit() {
       [[ -n "$BM_PENDING_UNIT" ]] && bm::ckpt::deadman_cancel "$BM_PENDING_UNIT"
       ;;
   esac
+  # the marker first: a gate watching for pending.state to go must find it
+  bm::ckpt::_mark_settled "${BM_CKPT_SETTLE_AS:-kept}"
   bm::ckpt::clear_pending
   if (( rc == 0 )); then
     bm::log::info "committed pending change (tier=$BM_PENDING_TIER)"
@@ -263,7 +281,8 @@ bm::ckpt::commit() {
 # rollback: revert the pending change through whichever tier is armed.
 bm::ckpt::rollback_pending() {
   bm::ckpt::load_pending || return 1
-  local ok=0
+  local ok=0 how=undone
+  if (( BM_CKPT_IN_DEADMAN )); then how=timer; fi
   case "$BM_PENDING_TIER" in
     checkpoint)
       if [[ -n "$BM_PENDING_PATH" ]] && bm::ckpt::dbus_rollback "$BM_PENDING_PATH"; then
@@ -285,6 +304,7 @@ bm::ckpt::rollback_pending() {
     fi
     bm::snap::restore "$BM_PENDING_SNAPSHOT"
     ok=1
+    bm::ckpt::_mark_settled "$how"
     bm::ckpt::clear_pending
     if (( ${#devs[@]} > 0 )); then
       bm::ckpt::reapply "$before" || ok=0
@@ -292,6 +312,7 @@ bm::ckpt::rollback_pending() {
       bm::ckpt::_problem "the saved settings are restored, but this change did not record which connections it touched (it was armed by an older version): running connections keep their settings until brought up again, e.g. nmcli connection up NAME"
     fi
   fi
+  bm::ckpt::_mark_settled "$how"
   bm::ckpt::clear_pending
   (( ok ))
 }

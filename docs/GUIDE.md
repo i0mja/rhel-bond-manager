@@ -77,13 +77,13 @@ sudo bond-manager
 You get a home screen like this:
 
 ```
-┌─ bond-manager 3.1.0 · web01 ─────────────────────────────  LIVE  ─┐
-│ ● bond0  active-backup (failover)  healthy   10.0.0.5/24          │  ← each bond, with its health
-│    ├─ ens1f0  up       10G  (active)                              │  ← its ports: link, speed
-│    └─ ens1f1  up       10G           ← your SSH connection        │  ← the port your session uses
-│                                                                   │
-│ ✔ Safety net: automatic undo (NetworkManager)                     │  ← how well you are protected
-└───────────────────────────────────────────────────────────────────┘
+┌─ bond-manager 3.1.0 · web01 ────────────────────────────────────────────────  LIVE  ─┐
+│ ● bond0  active-backup (failover)  healthy   10.0.0.5/24  ← your SSH connection      │
+│    ├─ ens1f0  up       10G  (active)                                                 │
+│    └─ ens1f1  up       10G                                                           │
+│                                                                                      │
+│ ✔ Safety net: automatic undo (NetworkManager)                                        │
+└──────────────────────────────────────────────────────────────────────────────────────┘
 What do you want to do?
  ❯ 1   Check my bonds               health, problems explained
    2   Move a bond to a new switch  one cable at a time, no outage
@@ -97,6 +97,12 @@ What do you want to do?
        Quit
  ▲▼ move · Enter choose · 1-9 jump · p practice · r refresh · ? help · q quit
 ```
+
+- Each **bond** with its health and address. **← your SSH connection**
+  marks the bond (or VLAN) your own session runs over: be careful with it.
+- Under it, its **ports**: link, speed, and which one carries the traffic
+  now (*active*).
+- The **safety net** line: how well this server can undo a mistake.
 
 **Keys:** arrows (or `j`/`k`) move, **Enter** chooses, a number jumps
 straight to an item, **Esc** or `q` goes back one step. In lists with
@@ -164,8 +170,8 @@ you):
 | Safety net | What happens if you never confirm |
 |---|---|
 | **automatic undo (NetworkManager)** | NetworkManager itself undoes the change. Works even if the change cut your session. The best one; the default on RHEL 8/9. |
-| **automatic undo (backup timer)** | A system timer restores the backup copy. |
-| **backup copy only** | Nothing automatic. You must undo by hand. Have console access ready, because bond-manager refuses to touch your SSH connection's device on this tier. |
+| **automatic undo (backup timer)** | A system timer restores the backup copy and brings the connections up again with it. bond-manager still refuses to touch your SSH connection's device here: a timer is not guaranteed to run on a machine you can no longer reach. |
+| **backup copy only** | Nothing automatic. You must undo by hand. Have console access ready, because bond-manager refuses to touch your SSH connection's device on this tier too. |
 
 ## 7. Which mode should I pick?
 
@@ -309,8 +315,8 @@ sudo bond-manager repair bond0
 
 ```bash
 sudo bond-manager rollback                  # undo the change that is waiting
-bond-manager snapshot list                  # backup copies (taken before every change)
-bond-manager snapshot diff 20260101-120000  # what restoring one would change
+sudo bond-manager snapshot list                  # backup copies (taken before every change)
+sudo bond-manager snapshot diff 20260101-120000  # what restoring one would change
 sudo bond-manager rollback --snapshot 20260101-120000
 ```
 
@@ -333,7 +339,7 @@ Common ones:
 | `interface 'X' is already enslaved to bond 'Y'` | That port is already in another bond. Pick a free one (`bond-manager nics`). |
 | `a previous change is still pending` | Keep or undo the last change first (`commit` / `rollback`). |
 | `another bond-manager instance is running` | Someone else is changing this server right now. Wait. |
-| `this change touches 'X', which carries your SSH connection` | Only on servers without automatic undo: use the console instead. |
+| `this change touches 'X', which carries your SSH session, and NetworkManager checkpoints are unavailable` | Only on servers where NetworkManager itself cannot undo the change (the "backup timer" and "backup copy only" safety nets): make this change from the console. |
 | `verification FAILED — rolling back` | The change did not work, so it was undone. The `FAIL` lines above say what did not check out. |
 
 Exit codes, for scripts: `0` ok · `1` error · `2` something typed wrong ·

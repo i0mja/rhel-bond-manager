@@ -178,6 +178,17 @@ assert_only_listings() {
   assert_contains "$output" "sudo bond-manager swap-member bond0 --old eth0 --new eth2"
 }
 
+@test "not root: a backup folder only root can read is said so, not 'no snapshots'" {
+  [[ "$EUID" -ne 0 ]] || skip "needs a non-root user"
+  chmod 000 "$BM_BACKUP_DIR"
+  run_cli snapshot list
+  chmod 755 "$BM_BACKUP_DIR"
+  [ "$status" -eq 3 ]
+  assert_contains "$output" "can only be read by root"
+  assert_contains "$output" "sudo bond-manager snapshot list"
+  assert_not_contains "$output" "No snapshots"
+}
+
 @test "doctor ends with a next step" {
   run_cli doctor
   assert_contains "$output" "Next step:"
