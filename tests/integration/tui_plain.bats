@@ -357,6 +357,7 @@ stub_bond0_with_gateway() {
 }
 
 @test "result: a support bundle made in practice mode is not called 'nothing was changed'" {
+  require_root   # the bundle is written as root
   tui 'tools\nbundle\nn\n\nq\nq\n' --dry-run
   [ "$status" -eq 0 ]
   assert_contains "$output" "support bundle:"
@@ -367,4 +368,68 @@ stub_bond0_with_gateway() {
   require_root
   tui 'safety\nsave\n\nsnapshots\n1\nrestore\nn\n\nq\nq\n'
   assert_contains "$output" "Cancelled - nothing was changed."
+}
+
+@test "build: plain mode says q goes back (Esc is a terminal key there)" {
+  tui 'build\nq\nq\n' --dry-run
+  assert_contains "$output" "q goes back one step"
+  assert_not_contains "$output" "Esc goes back"
+}
+
+@test "quit with a change waiting: keep and undo are two clear lines" {
+  seed_pending checkpoint 20240101-000000 "modify bond bond0"
+  tui 'q\ny\n' --dry-run
+  printf '%s\n' "$output" | grep -Eq '^ *Keep it: +sudo bond-manager commit *$'
+  printf '%s\n' "$output" | grep -Eq '^ *Undo it: +sudo bond-manager rollback *$'
+}
+
+@test "build: back from the gateway question returns to the address menu, mode kept" {
+  tui 'build\nbond9\neth2 eth3\n802.3ad\ny\nstatic\n10.0.0.5/24\nq\ndhcp\nfinish\ncancel\nq\n' --dry-run
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "How it works: 802.3ad"
+  assert_contains "$output" "IPv4: automatic (DHCP)"
+}
+
+@test "build: going back keeps the earlier answers (mode preselected, ports ticked)" {
+  tui 'build\nbond9\neth2 eth3\n802.3ad\ny\nq\n\ny\nq\nq\n\n\ny\ndhcp\nfinish\ncancel\nq\n' --dry-run
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "Build bond bond9 from: eth2, eth3"
+  assert_contains "$output" "How it works: 802.3ad"
+}
+
+@test "move (LACP): a practice switch to active-backup is not reported as done" {
+  install_proc_bond proc_bonding_8023ad_healthy bond0
+  stub_nm_conn 11111111-1111-1111-1111-111111111111 \
+    connection.id=bond0 connection.type=bond connection.interface-name=bond0 \
+    'bond.options=mode=802.3ad,miimon=100,lacp_rate=fast'
+  tui 'move\nab\ngo\n\nq\n\nq\n' --dry-run
+  assert_contains "$output" "Practice mode: bond0 was not switched and still runs 802.3ad"
+  assert_not_contains "$output" "bond0 now runs active-backup"
+}
+
+@test "move (LACP): saved settings already active-backup but the kernel runs 802.3ad stops the move" {
+  install_proc_bond proc_bonding_8023ad_healthy bond0     # profile says active-backup
+  tui 'move\nab\ngo\n\n\nq\n' --dry-run
+  assert_contains "$output" "already say active-backup, but it still runs"
+  assert_not_contains "$output" "bond0 now runs active-backup"
+  assert_not_contains "$output" "Port to replace"
+}
+
+@test "review: the command shown keeps the global flags the menus run with" {
+  tui 'change\nadd\neth2\ncancel\nq\nq\n' --dry-run --no-checkpoint --rollback-window 600 --force-unsafe
+  assert_contains "$output" "bond-manager -n --no-checkpoint --rollback-window 600 --force-unsafe add-member bond0 eth2"
+}
+
+@test "change > advanced: ARP link checks are one guided choice that works" {
+  tui 'change\nopt\nset\narp\n10.0.0.1\n1000\ngo\n\nq\nq\n' --dry-run
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "arp_interval=1000,arp_ip_target=10.0.0.1"
+  assert_not_contains "$output" "was not accepted"
+}
+
+@test "change > advanced: the single-option list no longer offers half of ARP" {
+  tui 'change\nopt\nset\nq\nq\nq\n' --dry-run
+  assert_contains "$output" "Check links by ARP"
+  assert_not_contains "$output" "arp_ip_target  ("
+  printf '%s\n' "$output" | grep -vq '^ *[0-9]*) arp_interval'
 }

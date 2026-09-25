@@ -133,6 +133,23 @@ assert_nothing_touched() {
   assert_not_contains "$output" "miimon"
 }
 
+@test "dry-run modify: switching to ARP link checks drops miimon (and back again)" {
+  stub_nm_bond0_profile                                  # mode=active-backup,miimon=100
+  run_cli --dry-run modify bond0 --arp-interval 1000 --arp-targets 10.0.0.1,10.0.0.2
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "bond.options mode=active-backup,arp_interval=1000,arp_ip_target=10.0.0.1,10.0.0.2"
+  assert_contains "$output" "ARP link checks replace miimon"
+
+  stub_nm_conn 11111111-1111-1111-1111-111111111111 \
+    connection.id=bond0 connection.type=bond connection.interface-name=bond0 \
+    'bond.options=mode=active-backup,arp_interval=1000,arp_ip_target=10.0.0.1'
+  run_cli --dry-run modify bond0 --miimon 100
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "bond.options mode=active-backup,miimon=100"
+  assert_contains "$output" "MII link checks replace ARP"
+  refute grep -q 'bond.options .*arp_ip_target' <<<"$output"
+}
+
 @test "CLI rejects unknown mode, rc 2" {
   run_cli --dry-run create bond9 --mode round-robin --members eth2
   [ "$status" -eq 2 ]

@@ -413,8 +413,10 @@ bm::plan::commit_gate() {
     fi
     if [[ "$BM_CKPT_TIER" == snapshot ]]; then
       printf '\rVerification passed. c=commit r=rollback : '
-    else
+    elif [[ "$BM_CKPT_TIER" == checkpoint ]]; then
       printf '\rVerification passed. c=commit r=rollback e=extend (auto-rollback in %4ds) : ' "$remaining"
+    else # only a checkpoint can be extended
+      printf '\rVerification passed. c=commit r=rollback (auto-rollback in %4ds) : ' "$remaining"
     fi
     rc=0
     read -r -t 2 -n 1 key || rc=$?
@@ -439,7 +441,12 @@ bm::plan::commit_gate() {
       e | E)
         if bm::plan::_gate_extend "$remaining"; then
           bm::log::say "extended by 300s"
+        else
+          bm::log::say "Only a NetworkManager checkpoint can be extended; this change is protected differently."
         fi
+        ;;
+      *)
+        bm::log::say "Press c (or K) to keep the change, r (or U) to undo it."
         ;;
     esac
   done

@@ -85,6 +85,25 @@ pty_run() { # pty_run <steps...> -- <command...>
   assert_contains "$screen" "PTY-EXIT 0"
 }
 
+@test "pty: one Ctrl-C backs out of one screen, not the whole wizard a second later" {
+  utf8_or_skip
+  # Ctrl-C at the port list goes back to the name; after waiting there, Enter
+  # must lead to the port list again (the wizard did not unwind to home)
+  drive TERM=xterm LANG=C.UTF-8 LC_ALL=C.UTF-8 -- \
+    @expect:"What do you want to do?" 3 @expect:"Bond name" '\r' @expect:"Ports for" \
+    '\x03' @expect:"Bond name" @wait:3 '\r' @expect:"Ports for" \
+    '\x03' @expect:"Bond name" @wait:1.5 '\x03' @expect:"What do you want to do?" q
+  [ "$status" -eq 0 ]
+  assert_contains "$screen" "PTY-EXIT 0"
+}
+
+@test "pty: Ctrl-C at a plain prompt goes back (plain mode on a terminal)" {
+  drive TERM=dumb LANG=C LC_ALL=C -- \
+    @expect:"Choose 1-10" 'build\r' @expect:"Bond name" '\x03' @expect:"Choose 1-10" 'q\r'
+  [ "$status" -eq 0 ]
+  assert_contains "$screen" "PTY-EXIT 0"
+}
+
 @test "pty: the terminal is handed back with echo, line mode and a visible cursor" {
   utf8_or_skip
   pty_run @expect:"What do you want to do?" 3 @expect:"Step 1 of 5" '\x03' \
@@ -152,5 +171,26 @@ pty_run() { # pty_run <steps...> -- <command...>
   [ "$status" -eq 0 ]
   assert_not_contains "$screen" "change committed"
   assert_contains "$screen" "rolled back to snapshot"
+  assert_contains "$screen" "PTY-EXIT 5"
+}
+
+@test "pty: a quick double Enter on the home screen never keeps a waiting change" {
+  require_root
+  seed_pending checkpoint 20240101-000000 "modify bond bond0"
+  # the first Enter opens "Keep or undo?"; the second one, typed ahead, must
+  # not answer it, and Enter there means "decide later"
+  pty_run @expect:"What do you want to do?" '\r\r' @expect:"Decide later" @wait:1.5 '\r' \
+    @expect:"What do you want to do?" q @wait:1 'y\r' -- \
+    env TERM=xterm LANG=C LC_ALL=C "$BM_ARTIFACT"
+  assert_not_contains "$screen" "pending change committed"
+  [ -f "$BM_RUN_DIR/pending.state" ]
+}
+
+@test "pty: any other key at the plain gate says which keys to press" {
+  require_root
+  pty_run @expect:"Apply this plan?" 'y\r' @expect:"Verification passed" @wait:0.5 x \
+    @expect:"Press c (or K) to keep the change" u -- \
+    env TERM=xterm LANG=C LC_ALL=C "$BM_ARTIFACT" --plain modify bond0 --opt miimon=50
+  [ "$status" -eq 0 ]
   assert_contains "$screen" "PTY-EXIT 5"
 }

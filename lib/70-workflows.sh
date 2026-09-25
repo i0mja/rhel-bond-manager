@@ -492,6 +492,27 @@ bm::wf::modify() {
       fi
     fi
 
+    # Links are checked by MII or by ARP, never both: asking for one in this
+    # command replaces the other, which is what switching them means.
+    if [[ -n "${spec_opts[arp_interval]:-}" && "${spec_opts[arp_interval]}" != 0 \
+          && -n "${merged[miimon]:-}" && -z "${spec_opts[miimon]:-}" ]]; then
+      unset 'merged[miimon]'
+      bm::log::say "$(bm::core::c_warn "note: ARP link checks replace miimon")"
+    fi
+    if [[ -n "${spec_opts[miimon]:-}" && "${spec_opts[miimon]}" != 0 && -z "${spec_opts[arp_interval]:-}" ]]; then
+      local akey
+      local -a adropped=()
+      for akey in arp_interval arp_ip_target arp_validate arp_all_targets; do
+        if [[ -n "${merged[$akey]:-}" && -z "${spec_opts[$akey]:-}" ]]; then
+          unset 'merged[$akey]'
+          adropped+=("$akey")
+        fi
+      done
+      if (( ${#adropped[@]} > 0 )); then
+        bm::log::say "$(bm::core::c_warn "note: MII link checks replace ARP (dropping ${adropped[*]})")"
+      fi
+    fi
+
     local errors
     if ! errors="$(bm::val::option_set "$mode" merged)"; then
       printf '%s\n' "$errors" >&2

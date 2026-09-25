@@ -165,6 +165,38 @@ schema are unchanged.
   as nothing**, so a pasted command lost it; it is now shown as `''`.
 - After a failed step or verification, "Your network is back the way it
   was" was printed even when the rollback reported problems.
+- **A quick double Enter on the home screen kept a waiting change.** "Keep
+  it" was pre-selected on "Keep or undo?" and the second Enter, typed
+  ahead, answered it. Type-ahead is now discarded there and Enter means
+  "Decide later"; keeping takes a deliberate choice, as at the gate.
+- **Ctrl-C in the menus:** at a plain prompt (`--plain`, serial consoles)
+  it did nothing, because bash's line read ignores a trapped signal; it
+  now goes back. In the arrow-key menus one Ctrl-C left a flag behind that
+  backed out of every later screen a second after it appeared, unwinding
+  the whole wizard; it now backs out of one screen.
+- **The plain commit gate** offered `e=extend` on the timer tier, where
+  only a checkpoint can be extended, and ignored other keys silently; it
+  now offers `e` only on the checkpoint tier and says which keys to press.
+- **Build wizard:** Back at the address, gateway or DNS question jumped to
+  the mode question and forgot the chosen mode (so Enter switched 802.3ad
+  back to active-backup). It now goes back to the address menu, and going
+  back keeps earlier answers (mode preselected, ports still ticked). In
+  plain mode it says "q goes back", not "Esc".
+- **Move wizard (LACP bond):** after switching to active-backup in
+  practice mode, or when the saved settings already said active-backup, it
+  said "bond1 now runs active-backup" although it still ran 802.3ad. It
+  now says what really happened, and stops the move when the kernel still
+  runs 802.3ad.
+- **"Same thing as a command"** dropped the global flags the menus ran
+  with (`--no-checkpoint`, `--rollback-window`, `--force-unsafe`), so the
+  copied command ran under a different safety net.
+- **ARP link monitoring:** the menus listed `arp_interval` and
+  `arp_ip_target` as single options, but neither can be set alone. They are
+  now one guided choice ("Check links by ARP": addresses to ping and how
+  often), and `modify` switches link monitoring cleanly: asking for ARP
+  drops `miimon`, and asking for `miimon` drops the ARP options.
+- Quitting with a change waiting printed the keep and undo commands run
+  together on one line; they are now two lines.
 - **Plain numbered prompts:** `010` picked item 8 (bash read it as octal)
   and `08`/`09` printed a raw bash error; numbers are now always decimal.
   The home menu listed Quit twice, and its `?) help` hint disappeared when

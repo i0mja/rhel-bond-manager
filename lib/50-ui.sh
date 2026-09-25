@@ -25,7 +25,8 @@ BM_UI_REPLY=""
 BM_UI_REPLY_LIST=()
 BM_UI_KEY=""
 BM_UI_EOF=0
-BM_UI_INTERRUPTED=0
+BM_UI_INTERRUPTED=0 # set by the menus' INT trap; a widget that acts on it clears it
+BM_UI_INT_SEEN=0    # the last widget was left with Ctrl-C (the home screen asks to quit)
 BM_UI_RESIZED=0
 BM_UI_DRAWN=0          # height of the block currently drawn in place
 BM_UI_VERR=""          # a validator's own error message
@@ -384,6 +385,35 @@ bm::ui::_raw_on() {
 
 bm::ui::_raw_off() { bm::core::term_restore; }
 
+# One line of input -> BM_UI_LINE. rc 0 = a line, 1 = end of input, 2 =
+# Ctrl-C. A trapped Ctrl-C does not interrupt bash's line read, so on a
+# terminal the line is read in 1-second slices with the flag checked in
+# between (what is typed so far stays in the terminal's line buffer).
+bm::ui::_read_line() {
+  local line rc
+  BM_UI_LINE=""
+  if [[ ! -t 0 ]]; then
+    IFS= read -r line || return 1
+    BM_UI_LINE="$line"
+    return 0
+  fi
+  while :; do
+    rc=0
+    IFS= read -r -t 1 line || rc=$?
+    if (( BM_UI_INTERRUPTED )); then
+      BM_UI_INTERRUPTED=0
+      BM_UI_INT_SEEN=1
+      printf '\n' >&2
+      return 2
+    fi
+    if (( rc == 0 )); then
+      BM_UI_LINE="$line"
+      return 0
+    fi
+    (( rc > 128 )) || return 1
+  done
+}
+
 bm::ui::_drain() { # discard type-ahead so a stray key never answers a prompt
   bm::ui::fancy || return 0
   local _k
@@ -405,6 +435,10 @@ bm::ui::read_key() { # read_key [timeout-seconds]
   fi
   if (( rc > 128 )); then
     if (( BM_UI_INTERRUPTED )); then
+      # consumed here: left set, every later widget would "go back" on its
+      # first idle second, unwinding the whole wizard
+      BM_UI_INTERRUPTED=0
+      BM_UI_INT_SEEN=1
       BM_UI_KEY=INTERRUPT
       return 0
     fi
@@ -641,11 +675,15 @@ bm::ui::_menu_plain() {
     else
       printf 'Choose 1-%d (q = %s): ' "$count" "$qword" >&2
     fi
-    if ! IFS= read -r ans; then
+    local lrc=0
+    bm::ui::_read_line || lrc=$?
+    if (( lrc == 2 )); then return 1; fi # Ctrl-C: back
+    if (( lrc != 0 )); then
       printf '\n' >&2
       BM_UI_EOF=1
       return 1
     fi
+    ans="$BM_UI_LINE"
     bm::ui::_echo_piped "$ans"
     ans="${ans#"${ans%%[![:space:]]*}"}"
     ans="${ans%"${ans##*[![:space:]]}"}"
@@ -906,11 +944,15 @@ bm::ui::_check_plain() {
     else
       printf 'Type the numbers to pick, e.g. 1 2 (q = back): ' >&2
     fi
-    if ! IFS= read -r ans; then
+    local lrc=0
+    bm::ui::_read_line || lrc=$?
+    if (( lrc == 2 )); then return 1; fi # Ctrl-C: back
+    if (( lrc != 0 )); then
       printf '\n' >&2
       BM_UI_EOF=1
       return 1
     fi
+    ans="$BM_UI_LINE"
     bm::ui::_echo_piped "$ans"
     case "${ans,,}" in
       q | back) return 1 ;;
@@ -1131,11 +1173,15 @@ bm::ui::_input_plain() {
     else
       printf '%s: ' "$prompt" >&2
     fi
-    if ! IFS= read -r v; then
+    local lrc=0
+    bm::ui::_read_line || lrc=$?
+    if (( lrc == 2 )); then return 1; fi # Ctrl-C: back
+    if (( lrc != 0 )); then
       printf '\n' >&2
       BM_UI_EOF=1
       return 1
     fi
+    v="$BM_UI_LINE"
     bm::ui::_echo_piped "$v"
     v="${v#"${v%%[![:space:]]*}"}"
     v="${v%"${v##*[![:space:]]}"}"
@@ -1238,19 +1284,22 @@ bm::ui::yesno() {
     return 0
   fi
   bm::ui::_ensure_init
-  local ans="" hint="[y/N]"
+  local ans="" hint="[y/N]" rc=0
   if [[ "$def" == y ]]; then hint="[Y/n]"; fi
+  # read -p only shows its prompt on a terminal; keep that, so a scripted
+  # transcript reads as before
   if bm::ui::fancy; then
     bm::ui::_drain
-    if ! read -r -p "$BM_S_BOLD$msg$BM_S_RST $hint: " ans; then
-      return 1
-    fi
-  elif [[ "$def" == y ]]; then
-    if ! read -r -p "$msg $hint: " ans; then
-      return 1
-    fi
-  else
-    read -r -p "$msg [y/N]: " ans || true
+    [[ -t 0 ]] && printf '%s' "$BM_S_BOLD$msg$BM_S_RST $hint: " >&2
+  elif [[ -t 0 ]]; then
+    printf '%s' "$msg $hint: " >&2
+  fi
+  bm::ui::_read_line || rc=$?
+  ans="$BM_UI_LINE"
+  if (( rc == 2 )); then return 1; fi # Ctrl-C is a no
+  if (( rc != 0 )); then
+    # end of input: no answer, so no (an explicit y is needed either way)
+    return 1
   fi
   if [[ -z "$ans" && "$def" == y ]]; then
     return 0
@@ -1273,7 +1322,7 @@ bm::ui::confirm_exact() { # require typing an exact string (destructive ops)
 
 bm::ui::pause() { # pause [prompt]
   bm::ui::_ensure_init
-  local prompt="${1:-Press Enter to go back}" _l rc
+  local prompt="${1:-Press Enter to go back}" rc
   if bm::ui::fancy; then
     printf '%s%s%s' "$BM_S_DIM" "$prompt" "$BM_S_RST" >&2
     bm::ui::_raw_on
@@ -1290,10 +1339,12 @@ bm::ui::pause() { # pause [prompt]
     printf '\r\033[K' >&2
   else
     printf '%s... ' "$prompt" >&2
-    if ! IFS= read -r _l; then
+    rc=0
+    bm::ui::_read_line || rc=$?
+    if (( rc == 1 )); then
       BM_UI_EOF=1
     fi
-    printf '\n' >&2
+    if (( rc != 2 )); then printf '\n' >&2; fi
 
   fi
   return 0

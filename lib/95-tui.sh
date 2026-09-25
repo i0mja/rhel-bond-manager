@@ -141,7 +141,8 @@ bm::tui::_pending_how_to() {
   else
     bm::ui::note "Nothing will undo it automatically on this server."
   fi
-  bm::ui::note "Keep it:  sudo $BM_PROG commit      Undo it:  sudo $BM_PROG rollback"
+  bm::ui::note "Keep it:  sudo $BM_PROG commit"
+  bm::ui::note "Undo it:  sudo $BM_PROG rollback"
 }
 
 bm::tui::_is_managed() { bm::core::in_list "$1" "${BM_TUI_MANAGED[@]:-}"; }
@@ -336,15 +337,15 @@ bm::tui::_loop() {
       items+=(practice "Practice mode is OFF"$'\t'"pick to try things without changing anything")
     fi
     items+=(quit "Quit")
-    BM_UI_INTERRUPTED=0
+    BM_UI_INTERRUPTED=0 BM_UI_INT_SEEN=0
     if ! bm::ui::menu --header bm::tui::_home_header --refresh 1 --keys "q p r ?" \
       --footer "$BM_G_UP$BM_G_DN move $BM_G_SEP Enter choose $BM_G_SEP 1-9 jump $BM_G_SEP p practice $BM_G_SEP r refresh $BM_G_SEP ? help $BM_G_SEP q quit" \
       -- "What do you want to do?" "${items[@]}"; then
       if (( BM_UI_EOF )); then
         break
       fi
-      if (( BM_UI_INTERRUPTED )); then
-        BM_UI_INTERRUPTED=0
+      if (( BM_UI_INT_SEEN || BM_UI_INTERRUPTED )); then
+        BM_UI_INTERRUPTED=0 BM_UI_INT_SEEN=0
         if bm::tui::_confirm_quit; then break; fi
       fi
       continue
@@ -706,7 +707,7 @@ bm::tui::pick_bond() { # pick_bond [--managed] <title> -> BM_UI_REPLY
 # pick_nics --free|--members BOND [--single] [--min N] [--max N]
 #           [--exclude a,b] -- TITLE     -> BM_UI_REPLY (comma list)
 bm::tui::pick_nics() {
-  local src="" bond="" single=0 min=1 max=0 exclude=""
+  local src="" bond="" single=0 min=1 max=0 exclude="" on=""
   while (( $# )); do
     case "$1" in
       --free) src=free; shift ;;
@@ -715,6 +716,7 @@ bm::tui::pick_nics() {
       --min) min="$2"; shift 2 ;;
       --max) max="$2"; shift 2 ;;
       --exclude) exclude="$2"; shift 2 ;;
+      --on) on="$2"; shift 2 ;;
       --) shift; break ;;
       *) break ;;
     esac
@@ -796,6 +798,7 @@ bm::tui::pick_nics() {
     else
       local -a copt=(--min "$min")
       if (( max > 0 )); then copt+=(--max "$max"); fi
+      if [[ -n "$on" ]]; then copt+=(--on "$on"); fi
       bm::ui::checklist "${copt[@]}" -- "$title" "${items[@]}" || return 1
     fi
     local picked="$BM_UI_REPLY" p warned=0
@@ -826,14 +829,18 @@ bm::tui::pick_nics() {
 }
 
 # Mode picker with the safe choice first. -> BM_UI_REPLY
-bm::tui::pick_mode() { # pick_mode [--current MODE]
-  local cur=""
-  if [[ "${1:-}" == --current ]]; then cur="$2"; fi
+bm::tui::pick_mode() { # pick_mode [--current MODE | --default MODE]
+  local cur="" pre=""
+  case "${1:-}" in
+    --current) cur="$2"; pre="$2" ;;
+    --default) pre="$2" ;; # an earlier answer, e.g. after going back
+  esac
   local c1="" c2=""
   [[ "$cur" == active-backup ]] && c1=" (current)"
   [[ "$cur" == 802.3ad ]] && c2=" (current)"
+  case "$pre" in active-backup | 802.3ad | "") ;; *) pre="more" ;; esac
   while :; do
-    if ! bm::ui::menu --default "${cur:-active-backup}" -- "How should the ports work together?" \
+    if ! bm::ui::menu --default "${pre:-active-backup}" -- "How should the ports work together?" \
       active-backup "active-backup - simple failover$c1"$'\t'"recommended if unsure $BM_G_SEP any switch" \
       802.3ad "802.3ad - LACP, all ports busy$c2"$'\t'"the switch MUST be set up for LACP" \
       more "Other modes (advanced)..."; then
@@ -932,24 +939,37 @@ bm::tui::ask_ip4() { # ask_ip4 [--keep] [--vlan-option] [--profile UUID] <what>
   if (( keep )); then
     items+=(keep "Leave it as it is")
   fi
-  bm::ui::menu -- "IPv4 address for $what" "${items[@]}" || return 1
-  case "$BM_UI_REPLY" in
-    dhcp) BM_TUI_IP4=dhcp ;;
-    none) BM_TUI_IP4=none ;;
-    keep) BM_TUI_IP4="" ;;
-    vlan) BM_TUI_IP4=vlan ;;
-    static)
-      bm::ui::input --validate bm::tui::_v_ipv4_cidr --example "10.0.0.10/24" \
-        -- "Address with prefix" || return 1
-      bm::tui::_csv "$BM_UI_REPLY"
-      BM_TUI_IP4="$BM_TUI_CSV"
-      bm::tui::_ask_kept bm::tui::_v_ipv4_addr "10.0.0.1" "Gateway (router)" "$cur_gw" || return 1
-      BM_TUI_GW4="$BM_TUI_KEPT"
-      bm::tui::_ask_kept bm::tui::_v_dns4 "10.0.0.53,10.0.0.54" "DNS servers" "$cur_dns" || return 1
-      BM_TUI_DNS4="$BM_TUI_KEPT"
-      ;;
-  esac
-  return 0
+  # Back from the address, gateway or DNS question returns to this menu
+  while :; do
+    BM_TUI_IP4="" BM_TUI_GW4="" BM_TUI_DNS4=""
+    bm::ui::menu -- "IPv4 address for $what" "${items[@]}" || return 1
+    case "$BM_UI_REPLY" in
+      dhcp) BM_TUI_IP4=dhcp ;;
+      none) BM_TUI_IP4=none ;;
+      keep) BM_TUI_IP4="" ;;
+      vlan) BM_TUI_IP4=vlan ;;
+      static)
+        if ! bm::ui::input --validate bm::tui::_v_ipv4_cidr --example "10.0.0.10/24" \
+          -- "Address with prefix"; then
+          (( BM_UI_EOF )) && return 1
+          continue
+        fi
+        bm::tui::_csv "$BM_UI_REPLY"
+        BM_TUI_IP4="$BM_TUI_CSV"
+        if ! bm::tui::_ask_kept bm::tui::_v_ipv4_addr "10.0.0.1" "Gateway (router)" "$cur_gw"; then
+          (( BM_UI_EOF )) && return 1
+          continue
+        fi
+        BM_TUI_GW4="$BM_TUI_KEPT"
+        if ! bm::tui::_ask_kept bm::tui::_v_dns4 "10.0.0.53,10.0.0.54" "DNS servers" "$cur_dns"; then
+          (( BM_UI_EOF )) && return 1
+          continue
+        fi
+        BM_TUI_DNS4="$BM_TUI_KEPT"
+        ;;
+    esac
+    return 0
+  done
 }
 
 # Ask for IPv6 settings -> BM_TUI_IP6/GW6/DNS6 (IP6 auto|dhcp|none|CIDR|"" = keep)
@@ -977,24 +997,36 @@ bm::tui::ask_ip6() { # ask_ip6 [--keep] [--profile UUID] <what>
   if (( keep )); then
     items+=(keep "Leave it as it is")
   fi
-  bm::ui::menu -- "IPv6 address for $what" "${items[@]}" || return 1
-  case "$BM_UI_REPLY" in
-    auto) BM_TUI_IP6=auto ;;
-    dhcp) BM_TUI_IP6=dhcp ;;
-    none) BM_TUI_IP6=none ;;
-    keep) BM_TUI_IP6="" ;;
-    static)
-      bm::ui::input --validate bm::tui::_v_ipv6_cidr --example "2001:db8::10/64" \
-        -- "Address with prefix" || return 1
-      bm::tui::_csv "$BM_UI_REPLY"
-      BM_TUI_IP6="$BM_TUI_CSV"
-      bm::tui::_ask_kept bm::tui::_v_ipv6_addr "2001:db8::1" "Gateway (router)" "$cur_gw" || return 1
-      BM_TUI_GW6="$BM_TUI_KEPT"
-      bm::tui::_ask_kept bm::tui::_v_dns6 "2001:db8::53" "DNS servers" "$cur_dns" || return 1
-      BM_TUI_DNS6="$BM_TUI_KEPT"
-      ;;
-  esac
-  return 0
+  while :; do
+    BM_TUI_IP6="" BM_TUI_GW6="" BM_TUI_DNS6=""
+    bm::ui::menu -- "IPv6 address for $what" "${items[@]}" || return 1
+    case "$BM_UI_REPLY" in
+      auto) BM_TUI_IP6=auto ;;
+      dhcp) BM_TUI_IP6=dhcp ;;
+      none) BM_TUI_IP6=none ;;
+      keep) BM_TUI_IP6="" ;;
+      static)
+        if ! bm::ui::input --validate bm::tui::_v_ipv6_cidr --example "2001:db8::10/64" \
+          -- "Address with prefix"; then
+          (( BM_UI_EOF )) && return 1
+          continue
+        fi
+        bm::tui::_csv "$BM_UI_REPLY"
+        BM_TUI_IP6="$BM_TUI_CSV"
+        if ! bm::tui::_ask_kept bm::tui::_v_ipv6_addr "2001:db8::1" "Gateway (router)" "$cur_gw"; then
+          (( BM_UI_EOF )) && return 1
+          continue
+        fi
+        BM_TUI_GW6="$BM_TUI_KEPT"
+        if ! bm::tui::_ask_kept bm::tui::_v_dns6 "2001:db8::53" "DNS servers" "$cur_dns"; then
+          (( BM_UI_EOF )) && return 1
+          continue
+        fi
+        BM_TUI_DNS6="$BM_TUI_KEPT"
+        ;;
+    esac
+    return 0
+  done
 }
 
 bm::tui::_ip6_words() { # describe BM_TUI_IP6/GW6/DNS6 -> BM_TUI_WORDS
@@ -1073,9 +1105,16 @@ bm::tui::review() { # review <subcommand> <summary-line>...
     fi
   fi
   bm::wf::cli_equivalent "$sub"
+  # with the global flags the menus run under, or the command would run
+  # with a different safety net than the one described above
+  local -a gflags=()
+  if (( BM_DRY_RUN )); then gflags+=(-n); fi
+  if (( BM_NO_CHECKPOINT )); then gflags+=(--no-checkpoint); fi
+  if [[ -n "$BM_ROLLBACK_WINDOW" ]]; then gflags+=(--rollback-window "$BM_ROLLBACK_WINDOW"); fi
+  if (( BM_FORCE_UNSAFE )); then gflags+=(--force-unsafe); fi
   local cmd="$BM_WF_CLI"
-  if (( BM_DRY_RUN )); then
-    cmd="$BM_PROG -n ${BM_WF_CLI#"$BM_PROG "}"
+  if (( ${#gflags[@]} > 0 )); then
+    cmd="$BM_PROG ${gflags[*]} ${BM_WF_CLI#"$BM_PROG "}"
   fi
   # never wrapped: it has to stay copy-pasteable
   printf '  %sSame thing as a command:%s\n    %s%s%s\n' "$BM_S_DIM" "$BM_S_RST" "$BM_S_CYAN" "$cmd" "$BM_S_RST" >&2
@@ -1211,7 +1250,19 @@ bm::tui::move_wizard() {
         if ! bm::tui::_went_well; then
           return 0
         fi
-        switched=1
+        case "$BM_TUI_LAST_OUTCOME" in
+          dry-run) switched=2 ;; # practice: only shown, nothing switched
+          noop)
+            # the saved profile already said active-backup; the kernel may not
+            if [[ "$(bm::facts::bond_mode "$bond")" != active-backup ]]; then
+              bm::ui::warn "The saved settings of $bond already say active-backup, but it still runs 802.3ad. Bring the two in line first: main menu > Fix a bond that looks wrong."
+              bm::ui::pause
+              return 0
+            fi
+            switched=1
+            ;;
+          *) switched=1 ;;
+        esac
         ;;
     esac
   fi
@@ -1290,9 +1341,13 @@ bm::tui::move_wizard() {
         ;;
     esac
   done
-  if (( switched )); then
+  if (( switched == 1 )); then
     bm::ui::heading "Remember"
     bm::ui::note "$bond now runs active-backup. Once every cable is on the new switch and its ports are set up for LACP, switch it back: Change a bond > Change how it works > 802.3ad."
+    bm::ui::pause
+  elif (( switched == 2 )); then
+    bm::ui::heading "Remember"
+    bm::ui::note "Practice mode: $bond was not switched and still runs 802.3ad. Done for real, it would run active-backup during the move, and you would switch it back to 802.3ad afterwards."
     bm::ui::pause
   fi
   return 0
@@ -1311,7 +1366,9 @@ bm::tui::_went_well() {
 
 bm::tui::build_wizard() {
   bm::ui::heading "Build a new bond"
-  bm::ui::note "A bond joins two or more network ports into one connection that survives a cable or switch failure. Five short questions; Esc goes back one step."
+  local back_key="Esc goes back one step"
+  bm::ui::fancy || back_key="q goes back one step"
+  bm::ui::note "A bond joins two or more network ports into one connection that survives a cable or switch failure. Five short questions; $back_key."
   bm::tui::ready_to_change || return 0
   local step=1 name="" ports="" mode="" mtu="" rc vid=""
   local ip4="" gw4="" dns4="" vtok="" ipwords=""
@@ -1334,7 +1391,7 @@ bm::tui::build_wizard() {
       2)
         bm::ui::heading "Ports" "Step 2 of 5"
         bm::ui::note "Pick the network ports to join. Two is usual - ideally cabled to two different switches."
-        if ! bm::tui::pick_nics --free --min 1 -- "Ports for $name"; then
+        if ! bm::tui::pick_nics --free --min 1 --on "$ports" -- "Ports for $name"; then
           step=1
           continue
         fi
@@ -1346,7 +1403,7 @@ bm::tui::build_wizard() {
         ;;
       3)
         bm::ui::heading "How the ports work together" "Step 3 of 5"
-        if ! bm::tui::pick_mode; then
+        if ! bm::tui::pick_mode --default "$mode"; then
           step=2
           continue
         fi
@@ -1795,12 +1852,36 @@ bm::tui::_change_opt() {
     bm::tui::_apply_modify "$bond" "Remove option $BM_UI_REPLY from $bond (back to the default)."
     return 0
   fi
+  local arp=0
   for k in $(bm::val::opts_for_mode "$mode"); do
+    # ARP needs an interval AND targets at once: one guided choice below
+    case "$k" in
+      arp_interval) arp=1; continue ;;
+      arp_ip_target) continue ;;
+    esac
     v="${cur[$k]:-}"
     items+=("$k" "$k${v:+ = $v}"$'\t'"$(bm::help::option_help "$k")")
   done
+  if (( arp )); then
+    if [[ -n "${cur[arp_interval]:-}" && "${cur[arp_interval]}" != 0 ]]; then
+      items+=(arp "Check links by ARP"$'\t'"now: ${cur[arp_ip_target]:-?} every ${cur[arp_interval]} ms")
+      items+=(mii "Check links by MII instead"$'\t'"the usual way: the port's own link light")
+    else
+      items+=(arp "Check links by ARP instead of MII"$'\t'"ping an address, e.g. the gateway")
+    fi
+  fi
   bm::ui::menu -- "Which option?" "${items[@]}" || return 0
   k="$BM_UI_REPLY"
+  case "$k" in
+    arp) bm::tui::_change_arp "$bond" "${cur[arp_ip_target]:-}" "${cur[arp_interval]:-}"; return 0 ;;
+    mii)
+      bm::wf::spec_reset
+      BM_SPEC[bond]="$bond"
+      BM_SPEC[opts]="miimon=$(bm::config::get DEFAULT_MIIMON)"
+      bm::tui::_apply_modify "$bond" "Check the links of $bond by MII again (every $(bm::config::get DEFAULT_MIIMON) ms), instead of ARP."
+      return 0
+      ;;
+  esac
   BM_TUI_CTX_OPT="$k"
   bm::ui::note "$(bm::help::option_help "$k")"
   bm::ui::input --default "${cur[$k]:-}" --validate bm::tui::_v_opt_value -- "Value for $k" || return 0
@@ -1808,6 +1889,40 @@ bm::tui::_change_opt() {
   BM_SPEC[bond]="$bond"
   BM_SPEC[opts]="$k=$BM_UI_REPLY"
   bm::tui::_apply_modify "$bond" "Set $k=$BM_UI_REPLY on $bond."
+}
+
+bm::tui::_v_arp_targets() {
+  if bm::val::ip_list v4 "${1// /,}"; then return 0; fi
+  BM_UI_VERR="Type the IPv4 addresses to ping, separated by commas, e.g. 10.0.0.1."
+  return 1
+}
+
+bm::tui::_v_arp_ms() {
+  if [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 10 && 10#$1 <= 60000 )); then return 0; fi
+  BM_UI_VERR="A number of milliseconds, e.g. 1000 (one second)."
+  return 1
+}
+
+# ARP link checks need the interval and the targets together (and replace
+# miimon), so they are one guided question instead of two single options.
+bm::tui::_change_arp() { # _change_arp <bond> [current-targets] [current-ms]
+  local bond="$1" targets="${2:-}" ms="${3:-}"
+  bm::ui::note "The bond pings these addresses; a port whose pings go unanswered is taken out. Useful when a port's link stays up but the switch behind it has failed. The default gateway is the usual choice."
+  if [[ -z "$targets" ]]; then
+    read -r targets _ <<<"$(bm::facts::default_gw4 2>/dev/null || true)" || true
+  fi
+  local -a dflt=()
+  if [[ -n "$targets" ]]; then dflt=(--default "$targets"); fi
+  bm::ui::input "${dflt[@]}" --validate bm::tui::_v_arp_targets --example "10.0.0.1" \
+    -- "Addresses to ping" || return 0
+  bm::tui::_csv "$BM_UI_REPLY"
+  targets="$BM_TUI_CSV"
+  bm::ui::input --default "${ms:-1000}" --validate bm::tui::_v_arp_ms -- "Ping every (ms)" || return 0
+  ms="$((10#$BM_UI_REPLY))"
+  bm::wf::spec_reset
+  BM_SPEC[bond]="$bond"
+  BM_SPEC[opts]="arp_interval=$ms,arp_ip_target=$targets"
+  bm::tui::_apply_modify "$bond" "Check the links of $bond by ARP: ping $targets every $ms ms (instead of MII)."
 }
 
 bm::tui::_change_clone() {
@@ -1935,7 +2050,11 @@ bm::tui::pending_screen() {
   if (( BM_DRY_RUN )); then
     bm::ui::dim "(Practice mode is on: keep/undo will only be shown, not done.)"
   fi
-  bm::ui::menu -- "What do you want to do?" \
+  # Keeping is for a deliberate choice, as at the commit gate: a key typed
+  # ahead (a double Enter on the home screen) is discarded, and Enter alone
+  # means "decide later".
+  bm::ui::_drain
+  bm::ui::menu --default back -- "What do you want to do?" \
     keep "Keep it"$'\t'"the change stays" \
     undo "Undo it now"$'\t'"put everything back as it was" \
     back "Decide later" || return 0
