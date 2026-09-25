@@ -10,8 +10,45 @@ bats tests/unit/facts.bats -f "health" # one group by name filter
 ```
 
 Requires: bats >= 1.5 (uses `run --separate-stderr`), python3, jq.
-The snapshot/checkpoint tests that genuinely need euid 0 skip themselves when
-not run as root; everything else is uid-independent.
+
+### Root and non-root
+
+CI runs the whole suite twice: first as a normal user, then as root
+(`sudo --preserve-env=PATH make test`). Both passes must be green.
+
+- **Tests that need euid 0 call `require_root` as the first line of the
+  test body**, so the unprivileged pass reports them as `skip requires root`
+  instead of failing. They are the tests that make a real change or reach
+  code behind `bm::core::require_root`: applies through the transaction engine
+  (`apply_safety.bats`), `commit` / `rollback` / `snapshot create|restore|prune`
+  (`safety_cli.bats`, `unit/snapshot*.bats`, `unit/ckpt*.bats`), the SSH
+  egress guard (it runs inside the engine, after the root check:
+  `ssh_guard.bats`), and `init` / `bundle` (`tmpdir_cleanup.bats`).
+- **Everything else runs as any user**, including every `--dry-run` test:
+  a dry run is documented to need no root, so those tests must pass without
+  it. If one only needs root to build its fixture, build the fixture another
+  way (see `seed_snapshot` in `safety_cli.bats`) rather than guarding it.
+- **A few tests check what a normal user sees** (the `sudo` hint, the menus
+  forcing practice mode) and skip themselves when run as root. So each pass
+  has some skips; neither may have failures.
+- **The root pass is where the safety engine is actually exercised.** A
+  green unprivileged pass on its own says little about it.
+- **Fixture helpers fail loudly.** `make_snapshot` (which runs the real,
+  root-only `snapshot create`) returns an error instead of an empty id, so a
+  test that forgets `require_root` fails rather than passing vacuously.
+
+CI also runs both passes on **bash 4.4** (the `test-bash44` job builds
+4.4.18, the version family RHEL 8 ships) because the runner's own bash is
+5.x. Do the same locally by putting a bash 4.4 first on `PATH`: the tool,
+the stubs and bats all run `bash` from `PATH`.
+
+To reproduce the unprivileged pass locally from a root shell:
+
+```sh
+chmod -R a+rX .   # 'nobody' must be able to read the checkout
+setpriv --reuid=65534 --regid=65534 --clear-groups \
+  env HOME=/tmp PATH="$PATH" bats -r tests
+```
 
 ## Layout
 
@@ -25,6 +62,8 @@ not run as root; everything else is uid-independent.
   `systemd-run`, `ping`, `modprobe`, `ethtool`, `journalctl`, `logger`,
   `restorecon`, `who`, `ps`). The sandbox prepends this dir to `PATH`, so the
   tool's PATH-resolved external commands hit the shims.
+- `tools/pty-drive` — runs a command in a pseudo-terminal and types keys
+  into it, for the fancy-mode menu tests (see "Driving the guided menus").
 - `tools/mk-proc-bond` — test-only generator (not a shim, not on `PATH`) that
   writes a realistic active-backup `/proc/net/bonding/<bond>` for an arbitrary
   member list. `write_proc_bond` calls it, and so do the nmcli hooks that model
@@ -105,3 +144,40 @@ a real partner whose ports report `Actor/Partner Churn State: churned`.
   `assert_call_order <ere> <ere>...` which pins the ORDER of external commands
   (e.g. swap-member adding and activating the new port before deleting the
   old one).
+
+## Driving the guided menus
+
+Without a terminal the menus run in plain mode (numbered prompts), which is
+what `tests/integration/tui_plain.bats` exercises: it pipes scripted answers
+into `bond_manager.sh --dry-run tui`.
+
+- Answer a menu with the item's **tag** (e.g. `build`, `move`, `go`) or its
+  number; tags keep the scripts readable. `q` goes back (quits on the home
+  screen).
+- Answer a checklist with numbers or tags separated by spaces
+  (`eth2 eth3`); Enter keeps what is ticked.
+- A pause ("Press Enter to go back") needs an empty line.
+- A yes/no question keeps its historical plain-mode behavior: only `y` or
+  `yes` counts as yes.
+- Always wrap a run in `timeout`: a menu that does not notice the end of its
+  input must fail the test, not hang CI. End of input quits cleanly with
+  exit 0.
+- Pass `--dry-run` so the run is identical as root and as a normal user
+  (without it, a non-root run first shows the "practice mode is on" screen).
+
+The fancy (arrow-key) mode only appears on a real terminal.
+`tests/integration/tui_pty.bats` gives it one: `tools/pty-drive` (python3
+standard library) runs the program in a pseudo-terminal, types keys
+(`'\x1b[B'` is Down, `'\r'` Enter, `'\x03'` Ctrl-C), waits for text with
+`@expect:TEXT`, and prints what was drawn plus a final `PTY-EXIT <status>`.
+Assert on the output with the escape codes stripped (`strip_escapes` there).
+The logic behind the fancy mode also lives in pure helpers that are
+unit-tested directly:
+`bm::ui::read_key` (key decoding from piped escape sequences),
+`bm::ui::_nav` / `bm::ui::_view` (cursor and viewport maths), and
+`bm::ui::fit` / `bm::ui::vlen` / `bm::ui::box_lines` (layout). To check
+the real thing by hand in a terminal without touching the host, do what
+`setup_sandbox` does: export the `BM_*` roots to a scratch directory (copy
+`fixtures/sysfs` into its `sys/` and a `fixtures/proc_bonding_*` file into
+its `proc/net/bonding/`), put `tests/stubs` first on `PATH`, and run
+`./bin/bond-manager --dry-run`.

@@ -8,8 +8,9 @@ follows from that.
 
 ## Development setup
 
-Requirements: bash ≥ 4.4 (the code targets 4.4; do not use 5.x-only
-features), [shellcheck](https://www.shellcheck.net/) ≥ 0.9, and
+Requirements: bash ≥ 4.4 (the code targets 4.4, what RHEL 8 ships; do not
+use 5.x-only features — CI runs the whole suite on bash 4.4.18 as well, in
+the `test-bash44` job), [shellcheck](https://www.shellcheck.net/) ≥ 0.9, and
 [bats](https://github.com/bats-core/bats-core) ≥ 1.10 for the test suite.
 
 ```bash
@@ -43,11 +44,14 @@ order and the dependency direction:
 33-ckpt    protection tiers (NM checkpoint / deadman timer / snapshot)
 35-verify  post-apply verification gate
 40-json    JSON emission
-50-ui      whiptail/plain widgets
+45-help    every plain-English text: command help, topics, explanations
+50-ui      pure-bash terminal toolkit (menus, checklists, input, boxes)
 60-plan    transaction engine (lock, plan, ssh guard, apply, commit gate)
 70-workflows  operation workflows (build plans, hand them to the engine)
 75-diag    diagnostics + support bundles
-90-cli     argument parsing, dispatch, output commands, TUI
+90-cli     argument parsing and every command
+95-tui     the guided menus (dashboard, wizards, results)
+99-main    entrypoint: global flags, --help routing, dispatch
 ```
 
 The rules:
@@ -139,7 +143,7 @@ Tests are bats (`make test` runs `bats -r tests/`). The pattern:
 
 3. **Stub external commands with PATH shims.** All external commands
    (`nmcli`, `ip`, `busctl`, `systemctl`, `systemd-run`, `ping`, `ethtool`,
-   `journalctl`, `modprobe`, `logger`, `restorecon`, `whiptail`) are
+   `journalctl`, `modprobe`, `logger`, `restorecon`) are
    PATH-resolved. Put executable stubs in a directory and prepend it to
    `PATH`; have stubs record their argv to a file when you need to assert
    on what would have been executed.
@@ -155,6 +159,42 @@ the `require_root` helper. If you need a writable config/log/backup dir,
 point `BM_CONF`, `BM_LOG_FILE`, `BM_BACKUP_DIR`, `BM_RUN_DIR`,
 `BM_CONN_DIR`, `BM_IFCFG_DIR`, etc. at a temp directory — `setup_sandbox`
 in `tests/helpers.bash` does all of this for you.
+
+## Words and UI code
+
+Anything a person reads should say **what happened and what to do next**,
+in plain words:
+
+- Put explanations in `45-help` so the CLI and the menus say the same
+  thing. Help text stays 7-bit ASCII and within 79 columns (a test checks
+  both): it has to read on a serial console.
+- `bm::core::die MESSAGE CODE HINT`: the `ERROR:` line is a stable contract
+  that scripts and tests match on, so never reword an existing message. Put
+  the advice in the third argument; it prints as a `Next step:` line.
+- In the menus, prefer a list to typing. When typing is unavoidable, pass a
+  validator whose `BM_UI_VERR` says how to fix the value.
+
+The widgets in `50-ui` answer through globals (`BM_UI_REPLY`, ...), return
+0 for an answer and 1 for "back", and set `BM_UI_EOF=1` at end of input.
+Bash pitfalls that bite interactive code under `set -Eeuo pipefail`:
+
+- Every `read` sits in an `if` or `||`: a timeout (status > 128) or end of
+  input (1) would otherwise trip errexit. Every loop must stop on
+  `BM_UI_EOF`.
+- Never end a function with `[[ ... ]] && x` or `(( ... )) && x`: when the
+  test is false the function returns 1 and the caller's errexit fires. Use
+  `if`, or end with `return 0`.
+- Never call something that can `die` inside `$(...)`: the exit only ends
+  the substitution. In the menus, run actions through `bm::tui::run`, which
+  isolates them in a subshell and reports the outcome.
+- Never call a widget inside `while read ... done < <(...)`: it would read
+  the loop's input. Collect with `mapfile` first.
+- Avoid `grep -q` at the end of a pipeline: under `pipefail` the writer's
+  SIGPIPE can turn a match into a failure.
+- Top-level associative arrays must be declared `declare -A NAME=(...)` at
+  column 0 (the unit-test loader rewrites them to `declare -gA`).
+- Bash 4.4: no `EPOCHSECONDS`, `EPOCHREALTIME`, `${x@U}` or `wait -p`. Get
+  the time with `printf -v now '%(%s)T' -1`.
 
 ## Pull request checklist
 

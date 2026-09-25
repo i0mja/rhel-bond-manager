@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""pty-drive: run a command in a pseudo-terminal, type keys, print what it drew.
+
+The arrow-key menus only appear on a real terminal, so a pipe cannot test
+them. This test-only tool (python3 standard library, no extra modules) gives
+them one.
+
+usage: pty-drive [--size COLSxROWS] STEP... -- COMMAND [ARG...]
+
+  STEP  @expect:TEXT   wait (up to 20 s) until TEXT appears in the output
+                       produced since the previous @expect
+        @wait:SECONDS  let the program run for a while
+        anything else  keys to type; backslash escapes are decoded, e.g.
+                       '\\x1b[B' (Down), '\\r' (Enter), '\\x03' (Ctrl-C)
+
+Prints the raw output (escape sequences included) and then a final line
+"PTY-EXIT <status>". Exits 0, or 3 when an @expect timed out (the output so
+far is still printed, to show what the program did instead).
+"""
+import codecs
+import fcntl
+import os
+import pty
+import select
+import signal
+import struct
+import sys
+import termios
+import time
+
+EXPECT_TIMEOUT = 20.0
+EXIT_TIMEOUT = 20.0
+
+
+def main(argv):
+    cols, rows = 100, 32
+    if len(argv) >= 2 and argv[0] == "--size":
+        cols, rows = (int(x) for x in argv[1].split("x"))
+        argv = argv[2:]
+    if "--" not in argv:
+        sys.stderr.write(__doc__)
+        return 2
+    split = argv.index("--")
+    steps, command = argv[:split], argv[split + 1:]
+    if not command:
+        sys.stderr.write(__doc__)
+        return 2
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        os.environ["COLUMNS"], os.environ["LINES"] = str(cols), str(rows)
+        os.execvp(command[0], command)
+
+    out = bytearray()
+    mark = 0  # @expect searches from here
+
+    def pump(seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            if not ready:
+                continue
+            try:
+                data = os.read(fd, 65536)
+            except OSError:
+                return False
+            if not data:
+                return False
+            out.extend(data)
+        return True
+
+    status = 0
+    pump(0.3)
+    for step in steps:
+        if step.startswith("@wait:"):
+            pump(float(step[6:]))
+        elif step.startswith("@expect:"):
+            needle = step[8:].encode()
+            deadline = time.time() + EXPECT_TIMEOUT
+            while needle not in out[mark:] and time.time() < deadline:
+                if not pump(0.1):
+                    break
+            if needle not in out[mark:]:
+                sys.stdout.write(out.decode("utf-8", "replace"))
+                sys.stdout.write("\nPTY-EXPECT-TIMEOUT %s\n" % step[8:])
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                return 3
+            mark = out.index(needle, mark) + len(needle)
+        else:
+            keys = codecs.decode(step, "unicode_escape").encode("latin-1")
+            os.write(fd, keys)
+            pump(0.4)
+
+    deadline = time.time() + EXIT_TIMEOUT
+    code = None
+    while time.time() < deadline:
+        done, wstatus = os.waitpid(pid, os.WNOHANG)
+        if done:
+            code = os.waitstatus_to_exitcode(wstatus) if hasattr(os, "waitstatus_to_exitcode") \
+                else (os.WEXITSTATUS(wstatus) if os.WIFEXITED(wstatus) else 128 + os.WTERMSIG(wstatus))
+            break
+        pump(0.1)
+    pump(0.2)
+    if code is None:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        code = 124
+    sys.stdout.write(out.decode("utf-8", "replace"))
+    sys.stdout.write("\nPTY-EXIT %d\n" % code)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

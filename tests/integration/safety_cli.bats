@@ -13,10 +13,36 @@ setup() {
   printf '[connection]\nid=bond0\ntype=bond\n' >"$BM_CONN_DIR/bond0.nmconnection"
 }
 
-make_snapshot() { # -> echoes the new snapshot id
+make_snapshot() { # -> echoes the new snapshot id (needs root)
   local out
-  out="$("$BM_ARTIFACT" snapshot create 2>/dev/null)"
+  out="$("$BM_ARTIFACT" snapshot create 2>/dev/null)" || true
+  # Fail loudly: an empty id would let a test compare paths like
+  # "conn-.tar.gz" and pass without testing anything (e.g. when not root).
+  if [[ "$out" != "snapshot created: "?* ]]; then
+    printf 'make_snapshot: snapshot create failed (not root?)\n' >&2
+    return 1
+  fi
   printf '%s' "${out##*: }"
+}
+
+# A snapshot fixture made without root, for the dry-run tests: a dry run needs
+# no root, but `snapshot create` (make_snapshot) does. Writes the archive and
+# manifest with the artifact's own bm::snap::create, so the fixture is exactly
+# what `snapshot create` writes, bypassing only its euid gate. It runs in a
+# subshell, so neither the sourced artifact nor the override leaks into the
+# test, and the command under test always runs unmodified via run_cli.
+seed_snapshot() { # -> echoes the new snapshot id
+  local id
+  id="$(
+    load_artifact
+    bm::core::require_root() { :; }
+    bm::snap::create manual 2>/dev/null
+  )" || true
+  if [[ -z "$id" ]]; then
+    printf 'seed_snapshot: could not create a snapshot fixture\n' >&2
+    return 1
+  fi
+  printf '%s' "$id"
 }
 
 # Forget the traces a real command left, so the dry-run assertions below
@@ -37,6 +63,7 @@ apply_leaving_pending() {
 # ---- commit ----------------------------------------------------------------
 
 @test "commit: a real pending change is committed, exit 0, state cleared" {
+  require_root
   apply_leaving_pending
   assert_contains "$output" "confirm with:   bond-manager commit"
 
@@ -48,6 +75,7 @@ apply_leaving_pending() {
 }
 
 @test "commit: a checkpoint that is already gone exits 5 and says so" {
+  require_root
   seed_pending checkpoint 20240101-000000 "modify bond0"
   export BM_STUB_CKPT_DESTROY_RC=1
   run_cli commit
@@ -60,12 +88,14 @@ apply_leaving_pending() {
 }
 
 @test "commit: nothing pending is a precondition error, exit 3" {
+  require_root
   run_cli commit
   [ "$status" -eq 3 ]
   assert_contains "$output" "no pending change to commit"
 }
 
 @test "commit (deadman tier): cancels the timer units" {
+  require_root
   seed_pending deadman 20240101-000000 "modify bond0"
   run_cli commit
   [ "$status" -eq 0 ]
@@ -74,6 +104,7 @@ apply_leaving_pending() {
 }
 
 @test "commit: takes the lock and refuses to run concurrently, exit 4" {
+  require_root
   seed_pending checkpoint 20240101-000000 "modify bond0"
   exec 9>"$BM_RUN_DIR/lock"
   flock -n 9
@@ -87,6 +118,7 @@ apply_leaving_pending() {
 # ---- rollback --------------------------------------------------------------
 
 @test "rollback: a pending change is reverted and the state cleared, exit 0" {
+  require_root
   apply_leaving_pending
   run_cli rollback
   [ "$status" -eq 0 ]
@@ -96,6 +128,7 @@ apply_leaving_pending() {
 }
 
 @test "rollback --snapshot ID: disarms the pending protection before restoring" {
+  require_root
   local snap
   snap="$(make_snapshot)"
   [ -n "$snap" ]
@@ -116,6 +149,7 @@ apply_leaving_pending() {
 }
 
 @test "rollback --snapshot ID with nothing pending just restores" {
+  require_root
   local snap
   snap="$(make_snapshot)"
   printf 'stray\n' >"$BM_CONN_DIR/bond9.nmconnection"
@@ -126,6 +160,7 @@ apply_leaving_pending() {
 }
 
 @test "rollback --deadman with no pending state is a silent no-op, exit 0" {
+  require_root
   local snap
   snap="$(make_snapshot)"
   local before
@@ -145,6 +180,7 @@ apply_leaving_pending() {
 }
 
 @test "rollback --deadman with a pending change does roll it back" {
+  require_root
   apply_leaving_pending
   run_cli -y rollback --deadman
   [ "$status" -eq 0 ]
@@ -154,12 +190,14 @@ apply_leaving_pending() {
 }
 
 @test "rollback: no pending change and no snapshots is a precondition error" {
+  require_root
   run_cli -y rollback
   [ "$status" -eq 3 ]
   assert_contains "$output" "no pending change and no snapshots found"
 }
 
 @test "rollback --snapshot: an unknown id is a precondition error, exit 3" {
+  require_root
   make_snapshot >/dev/null
   run_cli -y rollback --snapshot 19700101-000000
   [ "$status" -eq 3 ]
@@ -173,11 +211,12 @@ apply_leaving_pending() {
   [ "$status" -eq 3 ]
   assert_contains "$output" "no snapshots found in $BM_BACKUP_DIR"
   # a clean precondition error, not a stack trace or an empty-id restore
-  assert_not_contains "$output" "not found\nERROR"
+  assert_not_contains "$output" $'not found\nERROR'  # ANSI-C: a real newline
   assert_no_nmcli_mutations
 }
 
 @test "snapshot restore: the newest snapshot is restored by default" {
+  require_root
   make_snapshot >/dev/null
   printf 'stray\n' >"$BM_CONN_DIR/bond9.nmconnection"
   run_cli -y snapshot restore
@@ -186,6 +225,7 @@ apply_leaving_pending() {
 }
 
 @test "snapshot create/list/prune round-trip" {
+  require_root
   local a b
   a="$(make_snapshot)"
   b="$(make_snapshot)"
@@ -204,6 +244,7 @@ apply_leaving_pending() {
 }
 
 @test "snapshot prune: keeps the snapshot a pending change depends on" {
+  require_root
   local a b
   a="$(make_snapshot)"
   b="$(make_snapshot)"
@@ -217,6 +258,7 @@ apply_leaving_pending() {
 }
 
 @test "snapshot create: takes the lock, exit 4 when held" {
+  require_root
   exec 9>"$BM_RUN_DIR/lock"
   flock -n 9
   run_cli snapshot create
@@ -270,7 +312,7 @@ assert_dry_run_wrote_nothing() { # assert_dry_run_wrote_nothing <before-state>
 
 @test "dry-run rollback --snapshot: shows the diff, takes no pre-restore snapshot" {
   local snap
-  snap="$(make_snapshot)"
+  snap="$(seed_snapshot)"
   printf 'stray\n' >"$BM_CONN_DIR/bond9.nmconnection"
   clear_side_effects
   local before
@@ -295,8 +337,9 @@ assert_dry_run_wrote_nothing() { # assert_dry_run_wrote_nothing <before-state>
 
 @test "dry-run snapshot prune: deletes nothing" {
   local a b
-  a="$(make_snapshot)"
-  b="$(make_snapshot)"
+  a="$(seed_snapshot)"
+  b="$(seed_snapshot)"
+  [ "$a" != "$b" ] # two real snapshots, so "the older one survives" means something
   printf 'MAX_BACKUPS="1"\n' >>"$BM_CONF"
   touch -d '2020-01-01 00:00:01' "$BM_BACKUP_DIR/conn-$a.tar.gz"
   clear_side_effects
@@ -313,7 +356,7 @@ assert_dry_run_wrote_nothing() { # assert_dry_run_wrote_nothing <before-state>
 
 @test "dry-run snapshot restore: no pre-restore snapshot, no reload" {
   local snap
-  snap="$(make_snapshot)"
+  snap="$(seed_snapshot)"
   clear_side_effects
   local before
   before="$(tree_state "$BM_CONN_DIR" "$BM_IFCFG_DIR" "$BM_BACKUP_DIR" "$BM_RUN_DIR")"

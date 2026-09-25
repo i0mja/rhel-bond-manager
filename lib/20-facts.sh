@@ -45,6 +45,72 @@ bm::facts::nic_bond_master() { # bond the NIC is currently enslaved to, if any
   [[ -n "$link" ]] && basename "$link" || true
 }
 
+# First line of a (sysfs) file into BM_READ1; rc 1 when unreadable/empty.
+# Reading some attributes of a down link fails with EINVAL — that is "no
+# value", never an error worth surfacing.
+BM_READ1=""
+bm::facts::_read1() {
+  BM_READ1=""
+  [[ -r "$1" ]] || return 1
+  { IFS= read -r BM_READ1 <"$1"; } 2>/dev/null || true
+  [[ -n "$BM_READ1" ]]
+}
+
+# Physical link in plain terms: up | no-link (cable/switch) | off (admin
+# down) | unknown. carrier is authoritative when readable; fixture trees and
+# odd drivers only have operstate, so fall back to it.
+BM_LINK=unknown
+bm::facts::_link_of() { # _link_of <sysfs-dir> -> BM_LINK
+  local d="$1" flags
+  BM_LINK=unknown
+  [[ -e "$d" ]] || return 0
+  if bm::facts::_read1 "$d/flags" && [[ "$BM_READ1" =~ ^0x[0-9a-fA-F]+$ ]]; then
+    flags=$(( BM_READ1 ))
+    if (( (flags & 1) == 0 )); then
+      BM_LINK=off
+      return 0
+    fi
+  fi
+  if bm::facts::_read1 "$d/carrier"; then
+    case "$BM_READ1" in
+      1) BM_LINK=up; return 0 ;;
+      0) BM_LINK=no-link; return 0 ;;
+    esac
+  fi
+  if bm::facts::_read1 "$d/operstate"; then
+    case "$BM_READ1" in
+      up) BM_LINK=up ;;
+      down | lowerlayerdown | dormant | notpresent) BM_LINK=no-link ;;
+    esac
+  fi
+  return 0
+}
+
+bm::facts::nic_link() { # nic_link <nic> -> up | no-link | off | unknown
+  bm::facts::_link_of "$BM_SYS_ROOT/class/net/$1"
+  printf '%s\n' "$BM_LINK"
+}
+
+# Everything the pickers and `nics` show about one NIC, without a subshell
+# per field. Sets BM_NIC_{LINK,SPEED,MASTER,MTU}.
+bm::facts::nic_info() { # nic_info <nic>
+  local d="$BM_SYS_ROOT/class/net/$1" t
+  BM_NIC_LINK=unknown BM_NIC_SPEED=unknown BM_NIC_MASTER="" BM_NIC_MTU=unknown
+  [[ -e "$d" ]] || return 1
+  bm::facts::_link_of "$d"
+  BM_NIC_LINK="$BM_LINK"
+  if bm::facts::_read1 "$d/speed" && [[ "$BM_READ1" =~ ^[0-9]+$ ]] \
+    && (( BM_READ1 > 0 && BM_READ1 < 4000000 )); then
+    BM_NIC_SPEED="$BM_READ1"
+  fi
+  if [[ -L "$d/master" ]]; then
+    t="$(readlink "$d/master" 2>/dev/null || true)"
+    BM_NIC_MASTER="${t##*/}"
+  fi
+  if bm::facts::_read1 "$d/mtu"; then BM_NIC_MTU="$BM_READ1"; fi
+  return 0
+}
+
 bm::facts::nic_link_failures() { # from the member's proc slave section
   local bond="$1" nic="$2"
   [[ -r "$BM_PROC_ROOT/net/bonding/$bond" ]] || { echo unknown; return; }
@@ -251,6 +317,26 @@ bm::facts::bond_health() {
 
   printf '%s\n' "$verdict"
   printf '%s\n' "${reasons[@]:-}"
+}
+
+# Kernel VLAN interfaces from /proc/net/vlan/config: "dev vid parent" lines.
+bm::facts::kernel_vlans() {
+  local f="$BM_PROC_ROOT/net/vlan/config"
+  [[ -r "$f" ]] || return 0
+  awk -F'|' 'NR > 2 && NF >= 3 {
+      d = $1; v = $2; p = $3
+      gsub(/[[:space:]]/, "", d); gsub(/[[:space:]]/, "", v); gsub(/[[:space:]]/, "", p)
+      if (d != "") print d, v, p
+    }' "$f"
+}
+
+bm::facts::vlan_parent() { # vlan_parent <dev> -> parent device, or nothing
+  local dev="$1" p
+  p="$(bm::facts::kernel_vlans | awk -v d="$dev" '$1 == d { print $3; exit }')"
+  if [[ -z "$p" && "$dev" == *.* ]] && bm::facts::bond_exists_kernel "${dev%.*}"; then
+    p="${dev%.*}"
+  fi
+  printf '%s' "$p"
 }
 
 # ---- routing / ssh context ------------------------------------------------

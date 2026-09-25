@@ -133,13 +133,22 @@ bm::diag::_redact() { # mask IPv4 addresses and MACs on stdin
     -e 's/([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/MAC-REDACTED/g'
 }
 
-bm::diag::bundle() { # bundle [output-path] [redact:0|1]
+# Collect a support bundle. The archive path is returned in BM_BUNDLE_PATH
+# (not on stdout): running this inside $(...) would leak the scratch
+# directory, see bm::core::ensure_tmpdir.
+BM_BUNDLE_PATH=""
+bm::diag::bundle() { # bundle [output-path] [redact:0|1] -> BM_BUNDLE_PATH
   local out="${1:-}" redact="${2:-0}"
+  BM_BUNDLE_PATH=""
   bm::core::require_root
   mkdir -p "$BM_SUPPORT_DIR"
   local ts dir archive
   ts="$(date +'%Y%m%d-%H%M%S')"
-  dir="$(bm::core::tmpdir)/bundle-$ts"
+  if ! bm::core::ensure_tmpdir; then
+    bm::log::error "could not create a temporary directory in ${TMPDIR:-/tmp}"
+    return 1
+  fi
+  dir="${BM_TMPDIR:?}/bundle-$ts"
   mkdir -p "$dir"
   [[ -n "$out" ]] || out="$BM_SUPPORT_DIR/support_$ts.tar.gz"
 
@@ -183,5 +192,5 @@ bm::diag::bundle() { # bundle [output-path] [redact:0|1]
   chmod 0640 "$out" 2>/dev/null || true
   rm -rf "$dir"
   bm::log::info "support bundle created at $out (redacted=$redact)"
-  printf '%s\n' "$out"
+  BM_BUNDLE_PATH="$out"
 }

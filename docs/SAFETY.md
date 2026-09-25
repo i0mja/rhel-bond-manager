@@ -82,13 +82,13 @@ undoes a *create*: connections added after the checkpoint are deleted and
 newly-connected devices are disconnected, not merely "restored".
 
 `commit` calls `CheckpointDestroy` (keep the changes); `rollback` calls
-`CheckpointRollback`; the interactive gate's `e` key calls
+`CheckpointRollback`; the interactive gate's `E` key calls
 `CheckpointAdjustRollbackTimeout` to add 300 seconds.
 
 **If `CheckpointDestroy` fails, the commit is not reported as success.**
 A checkpoint that no longer exists means NetworkManager already used it —
 the rollback timeout expired and the change was reverted server-side.
-`commit` (and the `c` key in the gate, and the `--yes` auto-commit) then
+`commit` (and the `K` key in the gate, and the `--yes` auto-commit) then
 prints that the checkpoint was already gone and that the change has most
 likely been rolled back, clears the pending state, and exits **5**. Check
 what actually happened with `bond-manager status`.
@@ -100,14 +100,28 @@ when you pass `--no-checkpoint`. Before the first step:
 
 ```
 systemd-run --collect --unit bond-manager-deadman-<pid>-<epoch> \
-    --on-active=<window>s  <bond-manager> rollback --snapshot <ID> --deadman --yes
+    --on-active=<window>s --timer-property=AccuracySec=1s \
+    <bond-manager> rollback --snapshot <ID> --deadman --yes
 ```
 
-If you never commit, the timer fires and restores the pre-change snapshot,
-then reloads NetworkManager. `commit` stops the timer unit. This tier
-survives losing your session (systemd runs the rollback), but it is weaker
-than tier 1: the rollback is profile-level (snapshot restore + reload), and
-it depends on the timer actually firing on a functioning system.
+`AccuracySec=1s` matters: a transient timer otherwise fires anywhere up to a
+minute after its deadline, long after the operator was told the change
+would be undone.
+
+If you never commit, the timer fires, restores the pre-change snapshot,
+reloads NetworkManager, and then **puts the running network back** (see
+[Re-applying after a restore](#re-applying-after-a-restore)): a reload
+alone only re-reads the profiles, and an active bond would keep running
+with the settings that cut you off. `commit` stops the timer unit. This
+tier survives losing your session (systemd runs the rollback), but it is
+weaker than tier 1: it rebuilds the pre-change state from the saved
+profiles instead of NetworkManager restoring its own, and it depends on the
+timer actually firing on a functioning system.
+
+The rollback runs as the timer's own service, `<unit>.service`. Disarming
+the change from there stops only `<unit>.timer`: stopping the service would
+make systemd kill every process of the unit, the rollback included, before
+anything was restored. (Versions before 3.1 did exactly that.)
 
 The timer runs bond-manager from systemd, with no shell and no working
 directory, so the tool refuses to arm a deadman timer unless the path it
@@ -117,6 +131,14 @@ from `$0`, the entrypoint actually invoked.) A timer that fires after the
 operator already committed or rolled back finds no pending state and does
 nothing.
 
+That same rule means the timer cannot handle one case: the window running
+out **while the operator is still at the gate**. The gate process holds the
+lock the timer's rollback needs, and by the time the timer fires the gate
+has already cleared the pending state. So on this tier the gate performs
+the rollback itself when the countdown reaches zero, and only then reports
+the change as reverted. If the snapshot restore reports problems, it says
+so. (Up to 3.0 it announced a rollback here that never happened.)
+
 ### Tier 3 — `snapshot` (manual)
 
 Used when neither busctl nor systemd-run is available. The tar snapshot is
@@ -124,6 +146,33 @@ taken (it always is, in every tier), but nothing automatic will revert the
 change — the interactive gate offers only commit/rollback with no
 countdown, and if you lose your session you must run
 `bond-manager rollback` yourself (from a console if need be).
+
+### The commit gate
+
+After verification passes, an interactive run shows a countdown:
+
+```
+┌─ Keep this change? ───────────────────────────────────────────┐
+│ ✔ All checks passed - your change is live.                     │
+│ If you do nothing, it is UNDONE automatically when the time    │
+│ runs out.                                                      │
+│   K  keep it       U  undo it now       E  5 more minutes      │
+└────────────────────────────────────────────────────────────────┘
+Keep this change?  [K]eep  [U]ndo  [E]+5 min   Auto-undo in 1:52
+```
+
+- `K` commits, `U` rolls back, `E` extends the window by 300 s (tier 1
+  only). `c`, `r` and `e` are accepted too; any other key explains what to
+  press. On tier 3 there is no countdown.
+- Type-ahead is discarded when the gate appears, so a stray key typed
+  during the apply can never answer it. The "Apply this plan?" question
+  before the change always needs a typed `y` + Enter.
+- If the gate's terminal goes away (end of input: the SSH connection
+  dropped), it does not spin or guess. Protection stays armed, the way to
+  finish from another session is printed, and the run exits **6**.
+- On plain terminals (`--plain`, serial consoles) the gate is the single
+  line `Verification passed. c=commit r=rollback e=extend (auto-rollback in
+  N s) :` with the same keys.
 
 ### The window
 
@@ -182,7 +231,12 @@ deadline=1787921730
 created=2026-08-25T14:15:30+0000
 pid=41337
 summary=create bond bond0 (802.3ad, members ens1f0,ens1f1)
+affected=bond0 ens1f0 ens1f1
 ```
+
+`affected` lists the devices the change touches, which a rollback re-applies
+(see below). State written by 3.0 has no such line; rolling that back
+restores the saved profiles and says to re-apply them by hand.
 
 Because the state is on disk, **commit and rollback work from a brand-new
 session** after a disconnect:
@@ -211,7 +265,37 @@ profiles. With no snapshots at all, the command stops with a precondition
 error (exit 3) instead of a confusing failure.
 
 A deadman timer that fires when nothing is pending — because the operator
-already committed or rolled back — logs that fact and does nothing.
+already committed or rolled back — logs that fact and does nothing. One
+armed for a different snapshot than the waiting change's does nothing
+either: that change has its own timer.
+
+### Re-applying after a restore
+
+A snapshot restore brings back the saved profiles, and NetworkManager's
+reload re-reads them, but connections that are already active keep running
+with whatever the change applied. Whenever a *pending change* is undone
+from its snapshot (the deadman timer, `rollback`, `U` at the gate, a failed
+step or verification on tiers 2 and 3, or a checkpoint that had already
+expired), bond-manager therefore compares the profiles of the `affected`
+devices before and after the restore, and then:
+
+1. deletes a VLAN or bond device whose profile the restore removed (the
+   change created it), VLANs first;
+2. takes a port out of its bond when the restore removed its profile (the
+   change added it) and NetworkManager has not already done so;
+3. brings up every profile the restore brought back or changed, bonds
+   first, then all of their ports and VLANs (NetworkManager does not
+   reliably re-attach them to a re-activated bond), then other ports and
+   VLANs.
+
+Profiles the restore did not change are left alone, so undoing a VLAN add
+deletes the VLAN without bouncing the bond under your session. A profile
+with `connection.autoconnect no` is left down. Every failure is shown (not
+only logged) with the command to retry, and the rollback exits non-zero.
+
+`rollback --snapshot ID` and `snapshot restore` of a *named* snapshot stay
+profile-level: they say that running connections keep their settings until
+brought up again.
 
 One honest caveat: `/run` is tmpfs. A reboot clears the pending state (and
 any checkpoint/timer with it). After a reboot, work from
@@ -366,12 +450,15 @@ prunable snapshots plus the pinned one, rather than nine.
 | Plan step fails mid-apply | Engine rolls back through the armed tier | Pre-change state, exit 5 |
 | Verification fails | Same | Pre-change state, exit 5 |
 | Change severs your SSH session — tier 1 | NM checkpoint expires server-side | NM restores device + profile state at the deadline; run `rollback` afterwards to clear the pending state |
-| Change severs your SSH session — tier 2 | Deadman timer | systemd runs `bond-manager rollback --snapshot ID`; profiles restored, NM reloaded |
+| Change severs your SSH session — tier 2 | Deadman timer | systemd runs `bond-manager rollback --snapshot ID --deadman`; profiles restored, NM reloaded, and the affected bond, ports and VLANs brought up again with the restored settings (a bond the change created is deleted) |
 | Change severs your SSH session — tier 3 | Guard refused this upfront (unless `--force-unsafe`) | You need console access; run `bond-manager rollback` there |
 | bond-manager process killed (SIGKILL, OOM) mid-window | Protection is armed *outside* the process | Checkpoint/timer fires at deadline; or commit/rollback from a new session via the state file |
 | Operator walks away without confirming | Auto-rollback deadline | Change reverted (tier 1/2); tier 3 waits for a manual decision |
 | Second admin starts a change concurrently | `flock` in `/run/bond-manager` | Second invocation exits 4, naming the holder |
-| Verification passes but the app is broken anyway | Commit gate window | Press `r`, or `bond-manager rollback` before/after commit (post-commit: snapshot restore) |
+| Verification passes but the app is broken anyway | Commit gate window | Press `U`, or `bond-manager rollback` before/after commit (post-commit: snapshot restore) |
+| Operator sits at the gate until the window expires — tier 2 | The gate itself (it holds the lock the timer needs) | The gate restores the snapshot and reports it; exit 5 |
+| The gate's terminal goes away (end of input) | Protection stays armed | The gate prints how to `commit`/`rollback` from another session and exits 6; the deadline still applies |
+| Ctrl-C during a change started from the menus | The action is stopped; protection stays armed | The menus show the pending change with its deadline and offer keep/undo |
 | Bad change committed days ago | Snapshots | `snapshot list` → `snapshot diff ID` → `snapshot restore ID` |
 | Host reboots mid-window | Snapshot on disk (state in `/run` is lost) | Verify with `status`; restore the snapshot manually if needed |
 | `commit` runs after the window expired (tier 1) | `CheckpointDestroy` fails — the checkpoint is gone | Reported as exit 5 with "most likely rolled back", never as success; confirm with `status` |

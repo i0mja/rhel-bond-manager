@@ -30,6 +30,10 @@ bm::lock::acquire() {
 BM_PLAN_DESCS=()
 BM_PLAN_CMDS=()
 
+# How the last apply ended, in one word, for the menus to explain:
+# noop | dry-run | cancelled | committed | rolled-back | expired | pending | lost
+BM_PLAN_OUTCOME=""
+
 bm::plan::reset() {
   BM_PLAN_DESCS=()
   BM_PLAN_CMDS=()
@@ -65,7 +69,7 @@ bm::plan::render() { # human-readable plan
 # name containing $(...), a semicolon, whitespace) must come out inert.
 bm::plan::_shq() {
   local v="$1"
-  if [[ "$v" =~ ^[A-Za-z0-9_@%+=:,./-]*$ ]]; then
+  if [[ -n "$v" && "$v" =~ ^[A-Za-z0-9_@%+=:,./-]*$ ]]; then # '' must show
     printf '%s' "$v"
   else
     printf "'%s'" "${v//\'/\'\\\'\'}"
@@ -141,26 +145,29 @@ bm::plan::execute() {
 bm::plan::ssh_guard() { # ssh_guard <tier> <affected-devs...>
   local tier="$1"
   shift
-  local egress
+  local egress parent
   egress="$(bm::facts::ssh_egress_dev || true)"
   [[ -n "$egress" ]] || return 0
-  local dev
+  # A session on eth2.100 dies just as surely when eth2 goes into a bond.
+  parent="$(bm::facts::vlan_parent "$egress")"
+  local dev hit="" via=""
   for dev in "$@"; do
-    [[ "$dev" == "$egress" ]] || continue
-    if [[ "$tier" == checkpoint ]]; then
-      bm::log::say "$(bm::core::c_warn "NOTE: this change touches '$egress', which carries your SSH session.")"
-      bm::log::say "$(bm::core::c_warn "NetworkManager will auto-rollback in $(bm::plan::_window)s unless you commit.")"
-      return 0
-    fi
-    if (( BM_FORCE_UNSAFE )); then
-      bm::log::say "$(bm::core::c_warn "WARNING: proceeding without checkpoint protection on your SSH egress device ($egress).")"
-      return 0
-    fi
-    printf '%s: %s this change touches %s, which carries your SSH session, and NetworkManager checkpoints are unavailable (tier: %s).\nUse a console, or re-run with --force-unsafe to accept the risk of losing access.\n' \
-      "$BM_PROG" "$(bm::core::c_err ERROR:)" "'$egress'" "$tier" >&2
-    return 1
+    if [[ "$dev" == "$egress" ]]; then hit="$egress" via=""; break; fi
+    if [[ -n "$parent" && "$dev" == "$parent" && -z "$hit" ]]; then hit="$parent" via=" (through $egress)"; fi
   done
-  return 0
+  [[ -n "$hit" ]] || return 0
+  if [[ "$tier" == checkpoint ]]; then
+    bm::log::say "$(bm::core::c_warn "NOTE: this change touches '$hit', which carries your SSH session$via.")"
+    bm::log::say "$(bm::core::c_warn "NetworkManager will auto-rollback in $(bm::plan::_window)s unless you commit.")"
+    return 0
+  fi
+  if (( BM_FORCE_UNSAFE )); then
+    bm::log::say "$(bm::core::c_warn "WARNING: proceeding without checkpoint protection on your SSH egress device ($egress).")"
+    return 0
+  fi
+  printf '%s: %s this change touches %s, which carries your SSH session%s, and NetworkManager checkpoints are unavailable (tier: %s).\nUse a console, or re-run with --force-unsafe to accept the risk of losing access.\n' \
+    "$BM_PROG" "$(bm::core::c_err ERROR:)" "'$hit'" "$via" "$tier" >&2
+  return 1
 }
 
 bm::plan::_window() {
@@ -187,11 +194,13 @@ bm::plan::apply() {
   bm::log::set_op "$op"
 
   if (( ${#BM_PLAN_DESCS[@]} == 0 )); then
+    BM_PLAN_OUTCOME=noop
     bm::log::say "Nothing to do — already in the requested state."
     return "$BM_EX_OK"
   fi
 
   if (( BM_DRY_RUN )); then
+    BM_PLAN_OUTCOME=dry-run
     bm::plan::render
     echo
     echo "(dry-run: no commands executed, no files written, no snapshot taken)"
@@ -215,8 +224,10 @@ bm::plan::apply() {
   bm::plan::render
   echo
   bm::log::say "Protection tier: $tier (auto-rollback window: ${window}s)"
+  bm::log::say "  $(bm::help::tier_sentence "$tier")"
   if ! (( BM_ASSUME_YES )); then
     if ! bm::ui::yesno "Apply this plan?"; then
+      BM_PLAN_OUTCOME=cancelled
       bm::log::say "aborted before any change"
       return "$BM_EX_OK"
     fi
@@ -229,6 +240,8 @@ bm::plan::apply() {
   snap="$(bm::snap::create "$op")" || \
     bm::core::die "snapshot creation failed — aborting before any change" "$BM_EX_ERR"
   bm::log::say "snapshot: $snap"
+  # saved with the pending state: a rollback re-applies these connections
+  BM_CKPT_AFFECTED="${BM_PLAN_AFFECTED[*]:-}"
   bm::ckpt::arm "$window" "$snap" "$summary"
   if [[ "$BM_CKPT_TIER" != "$tier" ]]; then
     # arming fell back a tier; re-check the ssh guard under the real tier.
@@ -245,8 +258,14 @@ bm::plan::apply() {
   local failed_step=""
   if ! failed_step="$(bm::plan::execute)"; then
     bm::log::say "$(bm::core::c_err "step $((failed_step + 1)) failed — rolling back")"
-    bm::ckpt::rollback_pending || bm::log::warn "rollback reported problems; inspect manually"
-    bm::log::say "rolled back to snapshot $snap"
+    if bm::ckpt::rollback_pending; then
+      bm::log::say "rolled back to snapshot $snap"
+      bm::log::say "Your network is back the way it was: the failed step above left nothing half-done."
+    else
+      bm::log::say "rolled back to snapshot $snap"
+      bm::log::warn "rollback reported problems (see above); inspect manually"
+    fi
+    BM_PLAN_OUTCOME=rolled-back
     return "$BM_EX_VERIFY"
   fi
 
@@ -259,8 +278,14 @@ bm::plan::apply() {
 
   if bm::verify::failed; then
     bm::log::say "$(bm::core::c_err "verification FAILED — rolling back")"
-    bm::ckpt::rollback_pending || bm::log::warn "rollback reported problems; inspect manually"
-    bm::log::say "rolled back to snapshot $snap"
+    if bm::ckpt::rollback_pending; then
+      bm::log::say "rolled back to snapshot $snap"
+      bm::log::say "Your network is back the way it was. The FAIL lines above say what did not check out."
+    else
+      bm::log::say "rolled back to snapshot $snap"
+      bm::log::warn "rollback reported problems (see above); inspect manually"
+    fi
+    BM_PLAN_OUTCOME=rolled-back
     return "$BM_EX_VERIFY"
   fi
 
@@ -272,9 +297,11 @@ bm::plan::apply() {
     local crc=0
     bm::ckpt::commit >/dev/null || crc=$?
     if (( crc == BM_EX_CKPT_LOST )); then
+      BM_PLAN_OUTCOME=lost
       bm::log::say "$(bm::core::c_err "the checkpoint expired before it could be committed — NetworkManager has most likely rolled this change back")"
       return "$BM_EX_VERIFY"
     fi
+    BM_PLAN_OUTCOME=committed
     bm::log::say "$(bm::core::c_ok "change applied and committed (verification passed)")"
     return "$BM_EX_OK"
   fi
@@ -282,68 +309,209 @@ bm::plan::apply() {
   bm::plan::commit_gate "$snap"
 }
 
+# No terminal to ask on (or the terminal went away): leave protection armed
+# and say exactly how to finish from another session.
+bm::plan::_gate_no_tty() {
+  bm::log::say "No TTY to confirm on. Protection stays armed:"
+  bm::log::say "  confirm with:   $BM_PROG commit"
+  bm::log::say "  or revert with: $BM_PROG rollback"
+  if [[ "$BM_CKPT_TIER" == snapshot ]]; then
+    bm::log::say "$(bm::core::c_warn "Snapshot-only protection: nothing will roll this back automatically.")"
+  else
+    bm::log::say "Auto-rollback at the deadline if you do neither."
+  fi
+  BM_PLAN_OUTCOME=pending
+  return "$BM_EX_PARTIAL"
+}
+
+# The deadline passed while the operator sat at the prompt. On the
+# checkpoint tier NetworkManager rolls back by itself. On the deadman tier
+# the timer's own rollback cannot help: this process still holds the lock
+# (and transient timers may fire late), so it would either be refused or
+# find nothing pending. Restore the snapshot here instead of announcing a
+# rollback that never happened.
+bm::plan::_gate_expired() { # _gate_expired <snapshot-id>
+  local snap="$1"
+  echo
+  BM_PLAN_OUTCOME=expired
+  if [[ "$BM_CKPT_TIER" == deadman ]]; then
+    if bm::ckpt::rollback_pending; then
+      bm::log::say "$(bm::core::c_err "auto-rollback deadline reached — the change has been reverted")"
+      bm::log::say "rolled back to snapshot $snap"
+    else
+      bm::log::say "$(bm::core::c_err "auto-rollback deadline reached — restoring snapshot $snap reported problems; inspect manually")"
+    fi
+    return "$BM_EX_VERIFY"
+  fi
+  bm::log::say "$(bm::core::c_err "auto-rollback deadline reached — the change has been reverted")"
+  bm::ckpt::clear_pending
+  return "$BM_EX_VERIFY"
+}
+
+bm::plan::_gate_keep() { # _gate_keep -> rc of the gate
+  local crc=0
+  bm::ckpt::commit >/dev/null || crc=$?
+  if (( crc == BM_EX_CKPT_LOST )); then
+    BM_PLAN_OUTCOME=lost
+    bm::log::say "$(bm::core::c_err "the checkpoint had already expired — NetworkManager has most likely rolled this change back")"
+    bm::log::say "check the result with: $BM_PROG status"
+    return "$BM_EX_VERIFY"
+  fi
+  BM_PLAN_OUTCOME=committed
+  bm::log::say "$(bm::core::c_ok "change committed")"
+  return "$BM_EX_OK"
+}
+
+bm::plan::_gate_undo() { # _gate_undo <snapshot-id>
+  bm::ckpt::rollback_pending || bm::log::warn "rollback reported problems"
+  bm::log::say "rolled back to snapshot $1"
+  BM_PLAN_OUTCOME=rolled-back
+  return "$BM_EX_VERIFY"
+}
+
+bm::plan::_gate_extend() { # _gate_extend <seconds-left> -> 0 when extended
+  local remaining="$1" add=300
+  if [[ "$BM_CKPT_TIER" == checkpoint && -n "$BM_CKPT_PATH" ]]; then
+    if bm::ckpt::dbus_extend "$BM_CKPT_PATH" $(( remaining + add )); then
+      BM_CKPT_DEADLINE=$(( $(bm::core::epoch) + remaining + add ))
+      bm::ckpt::_write_state # other sessions and the menus count down from it
+      return 0
+    fi
+  fi
+  return 1
+}
+
 # Interactive commit gate: count down toward the auto-rollback deadline.
+# K (or c) keeps the change, U (or r) undoes it, E adds five minutes on the
+# checkpoint tier. End of input on the terminal behaves like having no
+# terminal at all: protection stays armed and the way out is printed.
 bm::plan::commit_gate() {
   local snap="$1"
   if ! bm::core::is_tty; then
-    # non-interactive without --yes: keep protection armed and instruct
-    bm::log::say "No TTY to confirm on. Protection stays armed:"
-    bm::log::say "  confirm with:   $BM_PROG commit"
-    bm::log::say "  or revert with: $BM_PROG rollback"
-    if [[ "$BM_CKPT_TIER" == snapshot ]]; then
-      bm::log::say "$(bm::core::c_warn "Snapshot-only protection: nothing will roll this back automatically.")"
-    else
-      bm::log::say "Auto-rollback at the deadline if you do neither."
-    fi
+    bm::plan::_gate_no_tty
     return "$BM_EX_PARTIAL"
   fi
+  bm::ui::_ensure_init
+  if bm::ui::fancy; then
+    bm::plan::_gate_fancy "$snap"
+    return $?
+  fi
 
-  local key remaining
+  local key remaining now rc
+  # Keys typed while the plan ran are not answers: the operator has not seen
+  # the verification result yet.
+  while IFS= read -rsn1 -t 0.01 key; do :; done
   while :; do
-    remaining=$(( ${BM_CKPT_DEADLINE:-0} - $(bm::core::epoch) ))
+    printf -v now '%(%s)T' -1
+    remaining=$(( ${BM_CKPT_DEADLINE:-0} - now ))
     if [[ "$BM_CKPT_TIER" == snapshot ]]; then
       remaining=999999 # no timer armed; purely manual decision
     fi
     if (( remaining <= 0 )); then
-      echo
-      bm::log::say "$(bm::core::c_err "auto-rollback deadline reached — the change has been reverted")"
-      bm::ckpt::clear_pending
-      return "$BM_EX_VERIFY"
+      bm::plan::_gate_expired "$snap"
+      return $?
     fi
     if [[ "$BM_CKPT_TIER" == snapshot ]]; then
       printf '\rVerification passed. c=commit r=rollback : '
-    else
+    elif [[ "$BM_CKPT_TIER" == checkpoint ]]; then
       printf '\rVerification passed. c=commit r=rollback e=extend (auto-rollback in %4ds) : ' "$remaining"
+    else # only a checkpoint can be extended
+      printf '\rVerification passed. c=commit r=rollback (auto-rollback in %4ds) : ' "$remaining"
     fi
-    if read -r -t 2 -n 1 key; then
+    rc=0
+    read -r -t 2 -n 1 key || rc=$?
+    if (( rc > 128 )); then
+      continue # timeout: refresh the countdown
+    fi
+    if (( rc != 0 )); then
       echo
-      case "$key" in
-        c | C)
-          local crc=0
-          bm::ckpt::commit >/dev/null || crc=$?
-          if (( crc == BM_EX_CKPT_LOST )); then
-            bm::log::say "$(bm::core::c_err "the checkpoint had already expired — NetworkManager has most likely rolled this change back")"
-            bm::log::say "check the result with: $BM_PROG status"
-            return "$BM_EX_VERIFY"
-          fi
-          bm::log::say "$(bm::core::c_ok "change committed")"
-          return "$BM_EX_OK"
-          ;;
-        r | R)
-          bm::ckpt::rollback_pending || bm::log::warn "rollback reported problems"
-          bm::log::say "rolled back to snapshot $snap"
-          return "$BM_EX_VERIFY"
-          ;;
-        e | E)
-          if [[ "$BM_CKPT_TIER" == checkpoint && -n "$BM_CKPT_PATH" ]]; then
-            local add=300
-            if bm::ckpt::dbus_extend "$BM_CKPT_PATH" $(( remaining + add )); then
-              BM_CKPT_DEADLINE=$(( $(bm::core::epoch) + remaining + add ))
-              bm::log::say "extended by ${add}s"
-            fi
-          fi
-          ;;
-      esac
+      bm::plan::_gate_no_tty
+      return "$BM_EX_PARTIAL"
     fi
+    echo
+    case "$key" in
+      c | C | k | K)
+        bm::plan::_gate_keep
+        return $?
+        ;;
+      r | R | u | U)
+        bm::plan::_gate_undo "$snap"
+        return $?
+        ;;
+      e | E)
+        if bm::plan::_gate_extend "$remaining"; then
+          bm::log::say "extended by 300s"
+        else
+          bm::log::say "Only a NetworkManager checkpoint can be extended; this change is protected differently."
+        fi
+        ;;
+      *)
+        bm::log::say "Press c (or K) to keep the change, r (or U) to undo it."
+        ;;
+    esac
+  done
+}
+
+bm::plan::_gate_fancy() { # _gate_fancy <snapshot-id>
+  local snap="$1" remaining now rc msg="" grc
+  bm::ui::gate_intro "$BM_CKPT_TIER"
+  bm::ui::_raw_on
+  bm::ui::_drain
+  while :; do
+    printf -v now '%(%s)T' -1
+    remaining=$(( ${BM_CKPT_DEADLINE:-0} - now ))
+    if [[ "$BM_CKPT_TIER" == snapshot ]]; then
+      remaining=999999
+    fi
+    if (( remaining <= 0 )); then
+      bm::ui::_raw_off
+      bm::ui::_commit_block
+      bm::plan::_gate_expired "$snap"
+      return $?
+    fi
+    bm::ui::gate_status "$remaining" "$BM_CKPT_TIER" "$msg"
+    rc=0
+    bm::ui::read_key 1 || rc=$?
+    if (( rc == 2 )); then
+      bm::ui::_raw_off
+      bm::ui::_commit_block
+      echo
+      bm::plan::_gate_no_tty
+      return "$BM_EX_PARTIAL"
+    fi
+    (( rc == 0 )) || continue
+    msg=""
+    case "$BM_UI_KEY" in
+      k | K | c | C)
+        bm::ui::_raw_off
+        bm::ui::_commit_block
+        grc=0
+        bm::plan::_gate_keep || grc=$?
+        return "$grc"
+        ;;
+      u | U | r | R)
+        bm::ui::_raw_off
+        bm::ui::_commit_block
+        grc=0
+        bm::plan::_gate_undo "$snap" || grc=$?
+        return "$grc"
+        ;;
+      e | E)
+        if [[ "$BM_CKPT_TIER" != checkpoint ]]; then
+          msg="Extending is only possible with NetworkManager's automatic undo."
+        elif bm::plan::_gate_extend "$remaining"; then
+          msg="Added 5 minutes."
+        else
+          msg="Could not extend - decide before the time runs out."
+        fi
+        ;;
+      RESIZE)
+        BM_UI_RESIZED=0
+        bm::ui::_size
+        ;;
+      *)
+        msg="Press K to keep the change or U to undo it."
+        ;;
+    esac
   done
 }

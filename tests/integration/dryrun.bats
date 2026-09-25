@@ -133,6 +133,23 @@ assert_nothing_touched() {
   assert_not_contains "$output" "miimon"
 }
 
+@test "dry-run modify: switching to ARP link checks drops miimon (and back again)" {
+  stub_nm_bond0_profile                                  # mode=active-backup,miimon=100
+  run_cli --dry-run modify bond0 --arp-interval 1000 --arp-targets 10.0.0.1,10.0.0.2
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "bond.options mode=active-backup,arp_interval=1000,arp_ip_target=10.0.0.1,10.0.0.2"
+  assert_contains "$output" "ARP link checks replace miimon"
+
+  stub_nm_conn 11111111-1111-1111-1111-111111111111 \
+    connection.id=bond0 connection.type=bond connection.interface-name=bond0 \
+    'bond.options=mode=active-backup,arp_interval=1000,arp_ip_target=10.0.0.1'
+  run_cli --dry-run modify bond0 --miimon 100
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "bond.options mode=active-backup,miimon=100"
+  assert_contains "$output" "MII link checks replace ARP"
+  refute grep -q 'bond.options .*arp_ip_target' <<<"$output"
+}
+
 @test "CLI rejects unknown mode, rc 2" {
   run_cli --dry-run create bond9 --mode round-robin --members eth2
   [ "$status" -eq 2 ]
@@ -166,6 +183,31 @@ assert_nothing_touched() {
   assert_contains "$output" "Re-activate bond 'bond0' to apply changes"
   assert_contains "$output" "(dry-run: no commands executed, no files written, no snapshot taken)"
   assert_nothing_touched
+}
+
+@test "dry-run modify: --ip4 dhcp drops the old fixed address and gateway" {
+  stub_nm_bond0_profile
+  run_cli --dry-run modify bond0 --ip4 dhcp
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "ipv4.method auto ipv4.addresses '' ipv4.gateway ''"
+}
+
+@test "dry-run modify: --gw4 none and --dns4 none clear them (shown quoted, so it can be pasted)" {
+  stub_nm_bond0_profile
+  run_cli --dry-run modify bond0 --ip4 10.0.5.10/24 --gw4 none --dns4 none
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "ipv4.method manual ipv4.addresses 10.0.5.10/24 ipv4.gateway '' ipv4.dns ''"
+  run_cli --dry-run modify bond0 --ip6 2001:db8::10/64 --gw6 none --dns6 none
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "ipv6.gateway '' ipv6.dns ''"
+}
+
+@test "dry-run create: spaces inside a --vlan value do not split it into two VLANs" {
+  run_cli --dry-run create bond9 --mode active-backup --members eth2,eth3 \
+    --vlan "120: ip4=10.0.0.5/24; dns4=10.0.0.53, 10.0.0.54"
+  [ "$status" -eq 0 ]
+  assert_not_contains "$output" "invalid VLAN id"
+  assert_contains "$output" "ipv4.dns 10.0.0.53,10.0.0.54"
 }
 
 @test "dry-run modify: --del-opt removes a key from the rendered options" {

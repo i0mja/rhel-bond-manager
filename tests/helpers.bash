@@ -328,3 +328,13 @@ assert_no_nmcli_mutations() {
 require_root() { # skip a test that genuinely needs euid 0
   [[ "$EUID" -eq 0 ]] || skip "requires root"
 }
+
+# `! cmd` never fails a bats test (errexit ignores negated commands); use
+# this to assert that a command fails.
+refute() { # refute <cmd> [args...]
+  if "$@"; then
+    printf 'expected this to fail: %s\n' "$*" >&2
+    return 1
+  fi
+  return 0
+}

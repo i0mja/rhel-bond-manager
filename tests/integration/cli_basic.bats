@@ -10,13 +10,13 @@ setup() {
 @test "--version prints name and version, rc 0" {
   run_cli --version
   [ "$status" -eq 0 ]
-  [ "$output" = "bond-manager 3.0.0" ]
+  [ "$output" = "bond-manager 3.1.0" ]
 }
 
 @test "version subcommand matches -V" {
   run_cli version
   [ "$status" -eq 0 ]
-  [ "$output" = "bond-manager 3.0.0" ]
+  [ "$output" = "bond-manager 3.1.0" ]
 }
 
 @test "--help shows commands, modes and exit-code contract, rc 0" {

@@ -5,6 +5,226 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-09-25
+
+Anyone should be able to pick this tool up at 2am and not get hurt. This
+release rebuilds the menus in pure bash and makes every screen, prompt and
+error explain itself in plain words. The safety engine is unchanged except
+for the fixes below; exit codes (except one, see *Changed*) and the JSON
+schema are unchanged.
+
+### Added
+
+- **Built-in guided menus** (`bond-manager` on a terminal, or
+  `bond-manager tui`), written in plain bash: no whiptail, nothing to
+  install.
+  - A home dashboard shows every bond's health, its ports (link, speed,
+    active port), the port carrying *your SSH connection*, the safety net
+    this server gives you, and a live banner when a change is waiting to be
+    kept.
+  - Jobs are named in plain language, each with a step-by-step wizard:
+    *Check my bonds*, *Move a bond to a new switch* (including the LACP
+    cross-switch situation), *Build a new bond*, *Change a bond* (add/remove
+    port, mode, preferred port, IP, MTU, VLANs, advanced options, clone,
+    delete), *Fix a bond that looks wrong*, *Undo & safety*, *Tools* and
+    *Help*.
+  - Choices come from lists with a plain note on every item. Typed values
+    are validated on the spot with a message that says how to fix them.
+  - A review screen summarises every change in plain words, warns early
+    when it touches the SSH connection, and shows the equivalent command
+    line.
+  - **Practice mode** (key `p`) runs every job as a dry run. It is forced
+    on, with an explanation, when changes are impossible (not root,
+    NetworkManager down).
+  - A result panel says what happened and what to do next.
+  - Arrow keys, `j`/`k`, `1`-`9`, Esc/`q` for back, and Space for check
+    boxes. Numbered prompts are used on serial consoles, dumb terminals,
+    pipes and with `--plain`. Output falls back to ASCII without UTF-8 (or
+    with `BM_ASCII=1`), and `NO_COLOR` is honored.
+- **IPv6 in the menus**: *Change a bond → IP address* and a VLAN's
+  address offer IPv4 or IPv6. For IPv6 the options are SLAAC, DHCPv6, a
+  fixed address with gateway and DNS (validated as you type), or off. A new
+  VLAN can get both.
+- **`bond-manager nics [--all]`**: every network port with its link state,
+  speed, bond, addresses and a plain verdict ("free - good to use", "no
+  link - cable or switch port?", "has an IP - probably in use", "carries
+  your SSH connection"), plus a ready-made `create` example. It is
+  read-only, needs no root, and never calls nmcli.
+- **`bond-manager help [COMMAND|TOPIC]`** and **`COMMAND --help`**: plain
+  English with copy-paste examples, always starting from a `-n` preview.
+  The topics are `basics`, `modes`, `lacp`, `safety`, `practice`, `moving`,
+  `glossary`, `keys` and `exit-codes`.
+- **"Next step" hints** on errors, on their own line under the unchanged
+  `ERROR:` line:
+  - a missing port gives the closest name plus `bond-manager nics`;
+  - a port already in another bond says how to free it;
+  - a mistyped mode gives its alias (`lacp` -> `802.3ad`);
+  - a missing bond gives the closest bond;
+  - a bond NetworkManager doesn't manage is explained;
+  - a non-root run gives the same command with `sudo`;
+  - a malformed address shows the expected format.
+- **"Did you mean"** suggestions for unknown commands (by spelling, and by
+  meaning: `move` suggests `swap-member`, `undo` suggests `rollback`) and
+  for unknown flags. A stray mode, port list or address typed without its
+  flag gets a hint too (`did you mean '--mode active-backup'?`).
+- `--help` output now leads with "New here?" and a *Common tasks* cheat
+  sheet. `doctor` ends with the safety net in plain words and a next step.
+- [docs/GUIDE.md](docs/GUIDE.md): the beginner's guide.
+- **A tour in the README**: an animated terminal at the top, and 30 real
+  screens in eight chapters that open with a click. `make tour` records
+  them from the real menus against a fake server (`build/tour/`), so they
+  are never out of date; the same screens are published as a click-through
+  page on GitHub Pages.
+
+### Changed
+
+- **The commit gate is a clear box** with a live countdown that changes
+  colour as time runs out. `K` keeps the change, `U` undoes it, `E` adds 5
+  minutes; `c`/`r`/`e` still work. Other keys explain what to press.
+- **`yes/no` questions stay typed answers** (y + Enter). Type-ahead is
+  discarded before the gate, so a stray key never answers it.
+- **A flag given without its value** (`--mode` at the end of the line, or
+  followed by another flag) is now a usage error, exit 2 with an example.
+  It used to exit 1 with a raw shell message.
+- **An unknown command** prints a suggestion and a pointer to `help`
+  instead of dumping the whole usage text. It still exits 2.
+- **The deadman timer is armed with `AccuracySec=1s`**, so it fires at the
+  deadline instead of up to a minute late.
+- **whiptail is no longer used**, and `doctor` no longer lists it.
+- **`bm::main` moved to `lib/99-main.sh`** so that dispatching to the menus
+  (`lib/95-tui.sh`) is a downward call. The plain-English text lives in
+  `lib/45-help.sh`.
+
+### Fixed
+
+- **The deadman timer (tier 2) never undid anything.** Its rollback
+  disarmed the change by stopping `<unit>.service`, which is the service
+  running that very rollback, so systemd killed it before the snapshot was
+  restored. It now stops only the timer.
+- **A rollback from the snapshot left the running network as the change
+  set it** (tiers 2 and 3, and a checkpoint that had already expired).
+  NetworkManager's reload only re-reads profiles, so a change that cut the
+  SSH session stayed live. The pending state now records the devices a
+  change touches (`affected=`), and after the restore bond-manager deletes
+  what the change created and brings the restored bonds, their ports and
+  VLANs up again, showing any failure with the command to retry. Profiles
+  the restore did not change are left alone. See *Re-applying after a
+  restore* in docs/SAFETY.md.
+- **Deadman tier: an unanswered change was never undone.** When the
+  countdown ran out at the interactive prompt, the gate announced "the
+  change has been reverted" and cleared the pending state. The deadman
+  timer then either could not take the lock (the gate still held it) or
+  found nothing pending, so nothing was reverted. The gate now restores the
+  snapshot itself on that tier. If the restore reports problems, it says
+  so.
+- **The commit gate spun at 100% CPU** when its terminal reached end of
+  input (e.g. the SSH connection went away mid-countdown). End of input now
+  keeps protection armed, prints how to commit or roll back from another
+  session, and exits 6.
+- **Menus:**
+  - Committing or rolling back a waiting change from the menus kept the
+    lock open for the rest of the session, so every later change failed
+    with "another instance is running".
+  - An error in a menu action (including "must be run as root") exited the
+    whole program; now every action runs isolated and the menus explain
+    the result.
+  - A validation error ended a wizard with "exit code 2 (see log)"; the
+    error and its next step are now shown, and wizards validate while you
+    type.
+  - Non-root users filled in a whole wizard before being told they needed
+    root. Changes are now checked up front, with practice mode offered.
+  - The plan could be hidden behind the whiptail "Apply this plan?"
+    dialog; it now stays on screen above the question.
+- **Every `init` and `bundle` leaked a `/tmp/bond-manager.XXXXXX`
+  directory.** The scratch directory was created inside `$(...)`, so the
+  exit cleanup never knew about it. It is now created in the running shell
+  (and in a menu action's own subshell, which cleans up after itself).
+- **"Keep or undo?" after the safety net had already acted.** The screen
+  checked once and then waited. If the timer undid the change meanwhile,
+  "Undo it now" restored the newest snapshot, which by then was the copy
+  of the change itself, and reported "Finished"; "Keep it" reported
+  "nothing was changed". Both now check again and say the change is no
+  longer waiting, and the menus' undo only ever undoes the waiting change.
+- **The result panel** promised an automatic undo on the snapshot-only
+  tier, where nothing is armed; it now says nothing will undo the change.
+  A support bundle made in practice mode was reported as "nothing was
+  changed", and declining a snapshot restore showed "Finished" instead of
+  "Cancelled".
+- **Changing an IP address kept the old gateway and DNS** although the
+  prompt said "Enter for none". The menus now show the current values
+  ("Enter keeps 10.0.0.1, none removes it"), and `--gw4`, `--gw6`,
+  `--dns4` and `--dns6` accept `none` to clear them. Switching to DHCP (or
+  no address) now drops the old fixed address and gateway, which
+  NetworkManager would otherwise keep next to DHCP (and refuses with
+  `ipv4.method disabled`).
+- **A VLAN whose address or DNS list contained a space**
+  (`10.0.0.53, 10.0.0.54`) was split into a bogus second VLAN, in the
+  build wizard and with `--vlan`; the build then failed with "invalid VLAN
+  id". Lists are now joined with commas.
+- **Plans and the "same thing as a command" line showed an empty argument
+  as nothing**, so a pasted command lost it; it is now shown as `''`.
+- After a failed step or verification, "Your network is back the way it
+  was" was printed even when the rollback reported problems.
+- **A quick double Enter on the home screen kept a waiting change.** "Keep
+  it" was pre-selected on "Keep or undo?" and the second Enter, typed
+  ahead, answered it. Type-ahead is now discarded there and Enter means
+  "Decide later"; keeping takes a deliberate choice, as at the gate.
+- **Ctrl-C in the menus:** at a plain prompt (`--plain`, serial consoles)
+  it did nothing, because bash's line read ignores a trapped signal; it
+  now goes back. In the arrow-key menus one Ctrl-C left a flag behind that
+  backed out of every later screen a second after it appeared, unwinding
+  the whole wizard; it now backs out of one screen.
+- **The plain commit gate** offered `e=extend` on the timer tier, where
+  only a checkpoint can be extended, and ignored other keys silently; it
+  now offers `e` only on the checkpoint tier and says which keys to press.
+- **Build wizard:** Back at the address, gateway or DNS question jumped to
+  the mode question and forgot the chosen mode (so Enter switched 802.3ad
+  back to active-backup). It now goes back to the address menu, and going
+  back keeps earlier answers (mode preselected, ports still ticked). In
+  plain mode it says "q goes back", not "Esc".
+- **Move wizard (LACP bond):** after switching to active-backup in
+  practice mode, or when the saved settings already said active-backup, it
+  said "bond1 now runs active-backup" although it still ran 802.3ad. It
+  now says what really happened, and stops the move when the kernel still
+  runs 802.3ad.
+- **"Same thing as a command"** dropped the global flags the menus ran
+  with (`--no-checkpoint`, `--rollback-window`, `--force-unsafe`), so the
+  copied command ran under a different safety net.
+- **ARP link monitoring:** the menus listed `arp_interval` and
+  `arp_ip_target` as single options, but neither can be set alone. They are
+  now one guided choice ("Check links by ARP": addresses to ping and how
+  often), and `modify` switches link monitoring cleanly: asking for ARP
+  drops `miimon`, and asking for `miimon` drops the ARP options.
+- Quitting with a change waiting printed the keep and undo commands run
+  together on one line; they are now two lines.
+- **Plain numbered prompts:** `010` picked item 8 (bash read it as octal)
+  and `08`/`09` printed a raw bash error; numbers are now always decimal.
+  The home menu listed Quit twice, and its `?) help` hint disappeared when
+  the current directory held one-character file names.
+- **`nics`:** on an 80-column terminal the NOTE column spilled into the
+  next row. Columns are now as wide as their content and a long note wraps
+  under its own column.
+- **SSH over a VLAN on a plain port was not protected.** With the session
+  on `eth2.100`, `eth2` was offered as "free" by `nics` and the menus, and
+  the SSH guard let a change put it into a bond, cutting the session. The
+  guard now treats the port under the session's VLAN as carrying it
+  (refused below the checkpoint tier, warned about on it), and `nics` and
+  the menus say so.
+- **The commit gate's `E` (+5 minutes)** extended NetworkManager's timer
+  but not the saved deadline, so the menus, `doctor` and other sessions
+  counted down to an undo 5 minutes too early.
+- **The plain commit gate** (`--plain`, serial consoles) took a key typed
+  while the change was running as its answer, before the verification
+  result was shown. Type-ahead is now discarded there too.
+- **Removing or replacing a port with no link** in the menus warned that
+  it "will not carry traffic" and asked to confirm; that warning is now
+  only given when adding a port.
+- **`--dns6` was never validated** (`--dns4` was). A bad IPv6 DNS server
+  now fails up front with the expected format, instead of reaching nmcli.
+- **The CLI equivalent shown for `add-member` / `remove-member`** used
+  `--members`, which those commands reject. One function now builds the
+  equivalent for every subcommand, quoting values that need it.
+
 ## [3.0.0] - 2026-08-25
 
 Ground-up rebuild. The tool is now compiled from modules in `lib/` into the

@@ -227,34 +227,67 @@ bm::nm::delete() { bm::nm::run connection delete "$1"; }
 
 bm::nm::reload() { bm::nm::run connection reload; }
 
+bm::nm::device_delete() { bm::nm::run device delete "$1"; } # software devices only
+
+bm::nm::device_disconnect() { bm::nm::run device disconnect "$1"; }
+
+# Every profile with the interface it binds to: lines
+# "ifname<US>uuid<US>type<US>active-device".
+bm::nm::ifname_index() {
+  local rec uuid name type dev ifname
+  while IFS= read -r rec; do
+    IFS=$'\x1f' read -r uuid name type dev <<<"$rec"
+    ifname="$(bm::nm::con_get "$uuid" connection.interface-name)"
+    printf '%s\x1f%s\x1f%s\x1f%s\n' "${ifname:-$dev}" "$uuid" "$type" "$dev"
+  done < <(bm::nm::con_list)
+}
+
+# A profile's settings, for telling whether it changed: the lower-case
+# setting lines only (upper-case sections are runtime state), without the
+# activation timestamp.
+bm::nm::con_settings() { # con_settings <uuid>
+  nmcli -t connection show "$1" 2>/dev/null \
+    | grep -v -e '^[A-Z]' -e '^connection\.timestamp[:=]' | LC_ALL=C sort || true
+}
+
 # Build the nmcli property arguments for an IP spec and store them in the
 # global array BM_NM_IP_ARGS. family: 4|6; method: dhcp|auto|none|static.
 bm::nm::ip_args() { # ip_args <4|6> <method> <addrs> <gw> <dns>
   local fam="$1" method="$2" addrs="$3" gw="$4" dns="$5"
   BM_NM_IP_ARGS=()
   local p="ipv$fam"
+  # Leaving a fixed address drops it (and its gateway): NetworkManager keeps
+  # ipv4.addresses next to DHCP, and refuses them with 'disabled'. A gateway
+  # or DNS list of "none" clears it.
   case "$method" in
     dhcp | auto)
-      BM_NM_IP_ARGS+=("$p.method" auto)
+      BM_NM_IP_ARGS+=("$p.method" auto "$p.addresses" "" "$p.gateway" "")
       ;;
     none | disabled)
       # ipv4 has had 'disabled' forever; ipv6 uses 'ignore' for NM < 1.20
       if [[ "$fam" == 6 ]]; then
-        BM_NM_IP_ARGS+=("$p.method" ignore)
+        BM_NM_IP_ARGS+=("$p.method" ignore "$p.addresses" "" "$p.gateway" "")
       else
-        BM_NM_IP_ARGS+=("$p.method" disabled)
+        BM_NM_IP_ARGS+=("$p.method" disabled "$p.addresses" "" "$p.gateway" "")
       fi
       ;;
     static)
       BM_NM_IP_ARGS+=("$p.method" manual "$p.addresses" "$addrs")
-      [[ -n "$gw" ]] && BM_NM_IP_ARGS+=("$p.gateway" "$gw")
+      if [[ "$gw" == none ]]; then
+        BM_NM_IP_ARGS+=("$p.gateway" "")
+      elif [[ -n "$gw" ]]; then
+        BM_NM_IP_ARGS+=("$p.gateway" "$gw")
+      fi
       ;;
     *)
       return 1
       ;;
   esac
-  if [[ -n "$dns" ]]; then
-    BM_NM_IP_ARGS+=("$p.dns" "${dns// /,}")
+  if [[ "$dns" == none ]]; then
+    BM_NM_IP_ARGS+=("$p.dns" "")
+  elif [[ -n "$dns" ]]; then
+    bm::core::split_list "$dns"
+    BM_NM_IP_ARGS+=("$p.dns" "$(bm::core::join , "${BM_LIST[@]}")")
   fi
   return 0
 }

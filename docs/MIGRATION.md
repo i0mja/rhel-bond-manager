@@ -87,6 +87,12 @@ Migration / Repair / Safety / Support). It now drives exactly the same
 workflow code as the CLI and prints the CLI equivalent of every action
 before applying it.
 
+From 3.1 the menus are built in (plain bash, arrow keys, numbered prompts
+on serial consoles and with `--plain`): whiptail is no longer used, so
+the `newt` package is not needed. The grouping is now by job: *Check my
+bonds*, *Move a bond to a new switch*, *Build*, *Change*, *Fix*,
+*Undo & safety*, *Tools*, *Help*.
+
 ## Changed — action may be needed
 
 ### JSON output: breaking for consumers
