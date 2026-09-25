@@ -22,15 +22,15 @@ declare -A BM_MODE_OPTS=(
   [balance-alb]="primary primary_reselect"
 )
 
-# One-line operator guidance per mode, used by help and the TUI.
+# One plain sentence per mode, used by help and the TUI.
 declare -A BM_MODE_HELP=(
-  [balance-rr]="Round-robin. Needs switch EtherChannel/static LAG; can reorder packets."
-  [active-backup]="Failover: one active member, others standby. No switch config needed."
-  [balance-xor]="Hash-based load balance. Needs switch EtherChannel/static LAG."
-  [broadcast]="Transmit everything on all members. Special-purpose fault tolerance."
-  [802.3ad]="LACP aggregation. Switch ports MUST be configured as an LACP bundle."
-  [balance-tlb]="Adaptive transmit balance. No switch config needed."
-  [balance-alb]="Adaptive tx+rx balance (ARP negotiation). No switch config needed."
+  [balance-rr]="Sends packets in turn on each port. Switch needs a static port-channel."
+  [active-backup]="Simple failover: one port works, the other waits. Works with any switch."
+  [balance-xor]="Shares traffic by address. Switch needs a static port-channel."
+  [broadcast]="Sends everything on every port. Special cases only."
+  [802.3ad]="LACP: all ports carry traffic. The switch MUST be set up for LACP."
+  [balance-tlb]="Shares outgoing traffic only. No switch setup needed."
+  [balance-alb]="Shares traffic in both directions. No switch setup needed."
 )
 
 bm::val::mode() {

@@ -87,6 +87,7 @@ bm::ckpt::deadman_arm() { # deadman_arm <timeout-secs> <snapshot-id> -> unit nam
   local unit
   unit="bond-manager-deadman-$$-$(date +%s)"
   systemd-run --collect --unit "$unit" --on-active="${timeout}s" \
+    --timer-property=AccuracySec=1s \
     "$BM_SELF" rollback --snapshot "$snap" --deadman --yes >/dev/null 2>&1 || return 1
   printf '%s\n' "$unit"
 }

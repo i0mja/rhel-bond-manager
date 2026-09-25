@@ -4,7 +4,7 @@
 [[ -n "${BM_LIB_CORE:-}" ]] && return 0
 BM_LIB_CORE=1
 
-BM_VERSION="3.0.0"
+BM_VERSION="3.1.0"
 BM_PROG="bond-manager"
 
 # Typed exit codes (stable contract, see docs/bond-manager.8).
@@ -43,6 +43,13 @@ BM_NO_CHECKPOINT=0
 BM_FORCE_UNSAFE=0
 BM_ROLLBACK_WINDOW=""   # empty = use config default
 BM_SELF=""              # absolute path of the running script, set in main
+BM_CMDLINE=""           # shell-quoted argv of this invocation (for hints)
+BM_CUR_CMD=""           # subcommand being run (for "see: help CMD" hints)
+
+# Terminal state saved by the interactive widgets; restored on exit so a
+# crash or Ctrl-C never leaves the operator's terminal without echo.
+BM_TTY_SAVED=""
+BM_TTY_CURSOR_HIDDEN=0
 
 bm::core::timestamp() { date +'%Y-%m-%dT%H:%M:%S%z'; }
 bm::core::epoch() { date +%s; }
@@ -54,7 +61,7 @@ bm::core::is_tty() { [[ -t 0 && -t 1 ]]; }
 # ---- color ----------------------------------------------------------------
 BM_COLOR=0
 bm::core::init_color() {
-  if [[ -n "${NO_COLOR:-}" || "${BM_NO_COLOR:-0}" == 1 || ! -t 1 ]]; then
+  if [[ -n "${NO_COLOR:-}" || "${BM_NO_COLOR:-0}" == 1 || ! -t 1 || "${TERM:-}" == dumb ]]; then
     BM_COLOR=0
   else
     BM_COLOR=1
@@ -67,17 +74,32 @@ bm::core::c_ok()   { bm::core::c '32' "$1"; }
 bm::core::c_warn() { bm::core::c '33' "$1"; }
 bm::core::c_err()  { bm::core::c '31' "$1"; }
 bm::core::c_bold() { bm::core::c '1'  "$1"; }
+bm::core::c_dim()  { bm::core::c '2'  "$1"; }
 
 # ---- error handling -------------------------------------------------------
-bm::core::die() { # die <message> [exit-code]
-  local msg="$1" code="${2:-$BM_EX_ERR}"
+# The ERROR line is a stable, test-asserted contract. A hint — what to do
+# next, in plain words — goes on its own line underneath so it never changes
+# the message scripts may match on.
+bm::core::die() { # die <message> [exit-code] [next-step hint]
+  local msg="$1" code="${2:-$BM_EX_ERR}" hint="${3:-}"
   bm::log::error "$msg"
   printf '%s: %s %s\n' "$BM_PROG" "$(bm::core::c_err ERROR:)" "$msg" >&2
+  if [[ -z "$hint" && "$code" == "$BM_EX_USAGE" && -n "$BM_CUR_CMD" ]]; then
+    hint="see examples: $BM_PROG help $BM_CUR_CMD"
+  fi
+  if [[ -n "$hint" ]]; then
+    printf '  %s %s\n' "$(bm::core::c_bold 'Next step:')" "$hint" >&2
+  fi
   exit "$code"
 }
 
 bm::core::require_root() {
-  bm::core::is_root || bm::core::die "this operation must be run as root" "$BM_EX_PRECONDITION"
+  bm::core::is_root && return 0
+  local hint="start it with sudo: sudo $BM_PROG"
+  if [[ -n "$BM_CMDLINE" ]]; then
+    hint="run it again with sudo: sudo $BM_PROG ${BM_CMDLINE% }"
+  fi
+  bm::core::die "this operation must be run as root" "$BM_EX_PRECONDITION" "$hint"
 }
 
 bm::core::on_error() { # ERR trap: log a compact function-stack trace
@@ -103,7 +125,22 @@ bm::core::tmpdir() { # lazily create a private temp dir, echo its path
   printf '%s' "$BM_TMPDIR"
 }
 bm::core::cleanup() {
+  bm::core::term_restore
   [[ -n "$BM_TMPDIR" && -d "$BM_TMPDIR" ]] && rm -rf "$BM_TMPDIR"
+  return 0
+}
+
+# Undo whatever the interactive widgets did to the terminal: line mode and
+# echo back on, cursor visible, colors reset. Safe to call at any time.
+bm::core::term_restore() {
+  if [[ -n "$BM_TTY_SAVED" && -t 0 ]]; then
+    stty "$BM_TTY_SAVED" 2>/dev/null || true
+  fi
+  BM_TTY_SAVED=""
+  if (( BM_TTY_CURSOR_HIDDEN )); then
+    printf '\033[?25h\033[0m' >&2 2>/dev/null || true
+    BM_TTY_CURSOR_HIDDEN=0
+  fi
   return 0
 }
 
@@ -129,4 +166,58 @@ bm::core::in_list() { # in_list <needle> [haystack...]
 bm::core::split_list() {
   local raw="${1//,/ }"
   read -r -a BM_LIST <<<"$raw"
+}
+
+# ---- "did you mean" -------------------------------------------------------
+
+# Levenshtein distance between two short words; result in BM_EDIT_DIST.
+BM_EDIT_DIST=0
+bm::core::edit_distance() { # edit_distance <a> <b>
+  local a="$1" b="$2"
+  local la=${#a} lb=${#b} i j cost del ins sub best
+  local -a prev=() cur=()
+  for ((j = 0; j <= lb; j++)); do prev[j]=$j; done
+  for ((i = 1; i <= la; i++)); do
+    cur=()
+    cur[0]=$i
+    for ((j = 1; j <= lb; j++)); do
+      cost=1
+      if [[ "${a:i-1:1}" == "${b:j-1:1}" ]]; then cost=0; fi
+      del=$(( prev[j] + 1 ))
+      ins=$(( cur[j - 1] + 1 ))
+      sub=$(( prev[j - 1] + cost ))
+      best=$del
+      if (( ins < best )); then best=$ins; fi
+      if (( sub < best )); then best=$sub; fi
+      cur[j]=$best
+    done
+    prev=("${cur[@]}")
+  done
+  BM_EDIT_DIST=${prev[lb]}
+}
+
+# Print the candidate closest to <word> (typo or unambiguous-ish prefix), or
+# nothing when no candidate is plausibly what the operator meant.
+bm::core::closest() { # closest <word> <candidate>...
+  local word="${1,,}" c lc best="" bestd=999 max
+  shift || true
+  [[ -n "$word" ]] || return 0
+  max=$(( ${#word} / 3 ))
+  if (( max < 1 )); then max=1; fi
+  for c in "$@"; do
+    [[ -n "$c" ]] || continue
+    lc="${c,,}"
+    bm::core::edit_distance "$word" "$lc"
+    if (( ${#word} >= 3 )) && [[ "$lc" == "$word"* ]] && (( BM_EDIT_DIST > 1 )); then
+      BM_EDIT_DIST=1
+    fi
+    if (( BM_EDIT_DIST < bestd )); then
+      bestd=$BM_EDIT_DIST
+      best="$c"
+    fi
+  done
+  if [[ -n "$best" ]] && (( bestd <= max )); then
+    printf '%s\n' "$best"
+  fi
+  return 0
 }

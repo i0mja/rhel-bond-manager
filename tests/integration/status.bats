@@ -30,7 +30,7 @@ setup() {
   [ "$status" -eq 0 ]
   assert_valid_json "$output"
   [ "$(printf '%s' "$output" | jq -r '.schema_version')" = "1" ]
-  [ "$(printf '%s' "$output" | jq -r '.tool_version')" = "3.0.0" ]
+  [ "$(printf '%s' "$output" | jq -r '.tool_version')" = "3.1.0" ]
   [ "$(printf '%s' "$output" | jq -r '.bonds | length')" = "2" ]
   [ "$(printf '%s' "$output" | jq -r '.bonds[] | select(.name=="bond0") | .health')" = "healthy" ]
   [ "$(printf '%s' "$output" | jq -r '.bonds[] | select(.name=="bond0") | .mode')" = "active-backup" ]

@@ -110,7 +110,9 @@ setup() {
   run bm::ckpt::deadman_arm 120 20240101-000000
   [ "$status" -eq 0 ]
   [[ "$output" =~ ^bond-manager-deadman-[0-9]+-[0-9]+$ ]]
-  assert_called "^systemd-run --collect --unit $output --on-active=120s $BM_ARTIFACT rollback --snapshot 20240101-000000 --deadman --yes$"
+  # AccuracySec=1s: a transient timer otherwise fires up to a minute late,
+  # long after the operator was told the change would be undone.
+  assert_called "^systemd-run --collect --unit $output --on-active=120s --timer-property=AccuracySec=1s $BM_ARTIFACT rollback --snapshot 20240101-000000 --deadman --yes$"
 }
 
 @test "deadman_arm: refuses to arm when BM_SELF is not an executable path" {

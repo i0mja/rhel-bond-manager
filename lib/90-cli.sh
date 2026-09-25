@@ -7,6 +7,12 @@ bm::cli::usage() {
   cat <<EOF
 $BM_PROG v$BM_VERSION — safe NetworkManager bond management for RHEL-like systems
 
+New here? Run  sudo $BM_PROG  for guided menus (with a practice mode).
+Explain one command: $BM_PROG help COMMAND   Plain-words intro: $BM_PROG help basics
+
+Common tasks:
+$(bm::help::common_tasks)
+
 Usage: $BM_PROG [GLOBAL FLAGS] <command> [ARGS]
        $BM_PROG                      (interactive TUI when run on a terminal)
 
@@ -17,12 +23,12 @@ Global flags:
       --debug               Mirror log records to stderr
       --quiet               Suppress progress messages
       --no-color            Disable colored output (NO_COLOR is also honored)
-      --plain               Force plain prompts (skip whiptail)
+      --plain               Plain numbered menus (serial consoles, basic terminals)
       --rollback-window S   Auto-rollback window in seconds (default: config)
       --no-checkpoint       Skip NM checkpoints (fall back to deadman/snapshot)
       --force-unsafe        Allow touching your SSH egress device w/o checkpoint
   -V, --version             Print version
-  -h, --help                This help
+  -h, --help                This help (after a command: help for that command)
 
 Read-only commands (no root, write nothing):
   list                      One line per bond: name, mode, health
@@ -30,9 +36,11 @@ Read-only commands (no root, write nothing):
   status [BOND]             Health summary; exit 0 healthy / 10 degraded / 11 down
   diagnose BOND [--extended] [--target IP]
   verify BOND               Re-run the verification checks against kernel state
+  nics [--all]              Network ports: link, speed, bond, "free - good to use"
   doctor                    Environment preflight + protection-tier report
   config show|path          Effective configuration / config file path
   completion bash           Emit bash completion script
+  help [COMMAND|TOPIC]      Plain-English help with examples
 
 Change commands (root; guarded by plan → snapshot → checkpoint → verify):
   create BOND --mode MODE --members IF1,IF2 [options]   Create a bond
@@ -67,13 +75,116 @@ Exit codes: 0 ok/no-op | 1 error | 2 usage | 3 precondition | 4 locked
             10 degraded | 11 down
 
 Legacy flags: --status ≡ status, --export-json PATH ≡ status --json > PATH
+
+Help topics ($BM_PROG help TOPIC): ${BM_HELP_TOPICS[*]}
 EOF
+}
+
+# A flag that needs a value got none (or got the next flag instead).
+bm::cli::_need_arg() { # _need_arg <flag> <value>
+  local flag="$1" val="${2:-}" ex=""
+  if [[ -n "$val" && "$val" != --* ]]; then
+    return 0
+  fi
+  case "$flag" in
+    --mode) ex="--mode active-backup" ;;
+    --members) ex="--members ens1f0,ens1f1" ;;
+    --opt) ex="--opt miimon=100" ;;
+    --del-opt) ex="--del-opt primary" ;;
+    --mtu) ex="--mtu 9000" ;;
+    --ip4) ex="--ip4 10.0.0.10/24 (or dhcp / none)" ;;
+    --gw4) ex="--gw4 10.0.0.1" ;;
+    --dns4) ex="--dns4 10.0.0.53,10.0.0.54" ;;
+    --ip6) ex="--ip6 2001:db8::10/64 (or auto / dhcp / none)" ;;
+    --gw6) ex="--gw6 2001:db8::1" ;;
+    --dns6) ex="--dns6 2001:db8::53" ;;
+    --vlan) ex="--vlan 120" ;;
+    --miimon) ex="--miimon 100" ;;
+    --primary) ex="--primary ens1f0" ;;
+    --lacp-rate) ex="--lacp-rate fast" ;;
+    --xmit-hash) ex="--xmit-hash layer3+4" ;;
+    --arp-interval) ex="--arp-interval 1000" ;;
+    --arp-targets) ex="--arp-targets 10.0.0.1" ;;
+    --min-links) ex="--min-links 1" ;;
+    --old) ex="--old ens1f0" ;;
+    --new) ex="--new ens2f0" ;;
+    --target) ex="--target 10.0.0.1" ;;
+    --snapshot) ex="--snapshot $(date +%Y%m%d)-120000 (see: $BM_PROG snapshot list)" ;;
+    --output) ex="--output /root/bond-support.tar.gz" ;;
+    --rollback-window) ex="--rollback-window 300" ;;
+    --export-json) ex="--export-json /var/lib/metrics/bonds.json" ;;
+  esac
+  bm::core::die "flag '$flag' needs a value" "$BM_EX_USAGE" "${ex:+for example: $ex}"
+}
+
+BM_CLI_CHANGE_FLAGS=(--mode --members --opt --del-opt --mtu --ip4 --gw4 --dns4 --ip6 --gw6
+  --dns6 --vlan --miimon --primary --lacp-rate --xmit-hash --arp-interval --arp-targets
+  --min-links --no-activate --copy-ip --copy-vlans --keep-vlans --old --new)
+
+# What the operator probably meant by an unknown flag or a stray word.
+bm::cli::_flag_hint() { # _flag_hint <token>
+  local t="$1" m near n all=1
+  if [[ "$t" != -* ]]; then
+    m="$(bm::help::mode_alias "$t")"
+    if [[ -n "$m" ]]; then
+      printf "did you mean '--mode %s'?" "$m"
+      return 0
+    fi
+    if bm::val::ipv4_cidr "$t"; then
+      printf "did you mean '--ip4 %s'?" "$t"
+      return 0
+    fi
+    bm::core::split_list "$t"
+    for n in "${BM_LIST[@]}"; do
+      bm::facts::nic_exists "$n" || all=0
+    done
+    if (( all && ${#BM_LIST[@]} > 0 )); then
+      printf "did you mean '--members %s'?" "$t"
+      return 0
+    fi
+    printf 'values go after the flag they belong to, e.g. --mode active-backup - see: %s help %s' \
+      "$BM_PROG" "${BM_CUR_CMD:-}"
+    return 0
+  fi
+  near="$(bm::core::closest "$t" "${BM_CLI_CHANGE_FLAGS[@]}")"
+  if [[ -n "$near" ]]; then
+    printf "did you mean '%s'? (all flags: %s help %s)" "$near" "$BM_PROG" "${BM_CUR_CMD:-}"
+  else
+    printf 'see the flags this command takes: %s help %s' "$BM_PROG" "${BM_CUR_CMD:-}"
+  fi
 }
 
 # ---- read-only output commands --------------------------------------------
 
 bm::cli::preflight_read() {
-  bm::core::have_cmd nmcli || bm::core::die "nmcli not found; install NetworkManager" "$BM_EX_PRECONDITION"
+  bm::core::have_cmd nmcli || bm::core::die "nmcli not found; install NetworkManager" "$BM_EX_PRECONDITION" \
+    "install it with: dnf install NetworkManager && systemctl enable --now NetworkManager"
+}
+
+# Can changes run at all right now? Never dies (the menus ask before every
+# wizard). 0 = yes; 3 = no, with BM_CLI_BLOCKER=no-nmcli|not-root|nm-inactive
+# and a plain explanation in BM_CLI_BLOCKER_MSG.
+BM_CLI_BLOCKER=""
+BM_CLI_BLOCKER_MSG=""
+bm::cli::mutate_blocker() {
+  BM_CLI_BLOCKER=""
+  BM_CLI_BLOCKER_MSG=""
+  if ! bm::core::have_cmd nmcli; then
+    BM_CLI_BLOCKER=no-nmcli
+    BM_CLI_BLOCKER_MSG="NetworkManager (nmcli) is not installed, so nothing can be changed."
+    return "$BM_EX_PRECONDITION"
+  fi
+  if ! bm::core::is_root; then
+    BM_CLI_BLOCKER=not-root
+    BM_CLI_BLOCKER_MSG="You are not root, so changes are not possible. Start bond-manager with sudo to make real changes."
+    return "$BM_EX_PRECONDITION"
+  fi
+  if bm::core::have_cmd systemctl && ! systemctl is-active --quiet NetworkManager; then
+    BM_CLI_BLOCKER=nm-inactive
+    BM_CLI_BLOCKER_MSG="NetworkManager is not running. Start it first: systemctl enable --now NetworkManager"
+    return "$BM_EX_PRECONDITION"
+  fi
+  return 0
 }
 
 bm::cli::preflight_mutate() {
@@ -82,7 +193,8 @@ bm::cli::preflight_mutate() {
   (( BM_DRY_RUN )) && return 0
   bm::core::require_root
   if bm::core::have_cmd systemctl && ! systemctl is-active --quiet NetworkManager; then
-    bm::core::die "NetworkManager is not active (systemctl enable --now NetworkManager)" "$BM_EX_PRECONDITION"
+    bm::core::die "NetworkManager is not active (systemctl enable --now NetworkManager)" "$BM_EX_PRECONDITION" \
+      "start it with: systemctl enable --now NetworkManager"
   fi
   if [[ ! -e "$BM_PROC_ROOT/net/bonding" ]] && bm::core::have_cmd modprobe; then
     modprobe bonding 2>/dev/null || bm::log::warn "could not load bonding module (NM may load it on demand)"
@@ -322,7 +434,7 @@ bm::cli::cmd_doctor() {
       hard_fail=1
     fi
   done
-  for t in ethtool journalctl whiptail flock logger restorecon; do
+  for t in ethtool journalctl flock logger restorecon; do
     if bm::core::have_cmd "$t"; then
       bm::cli::_doc_check ok "$t present"
     else
@@ -346,9 +458,12 @@ bm::cli::cmd_doctor() {
   echo
   if (( hard_fail )); then
     echo "verdict: $(bm::core::c_err 'not ready')"
+    echo "  Next step: fix the FAIL lines above, then run '$BM_PROG doctor' again."
     return "$BM_EX_PRECONDITION"
   fi
   echo "verdict: $(bm::core::c_ok ready) (protection tier: $tier)"
+  echo "  $(bm::help::tier_sentence "$tier")"
+  echo "  Next step: '$BM_PROG list' to see your bonds, or 'sudo $BM_PROG' for guided menus."
   return "$BM_EX_OK"
 }
 
@@ -366,6 +481,153 @@ bm::cli::cmd_config() {
   esac
 }
 
+# ---- nics ---------------------------------------------------------------------
+
+# Does <nic> carry this session's SSH traffic? True for the egress device
+# itself, and for the members of a bond (or of a bond under a VLAN) that is.
+bm::cli::_carries_ssh() { # _carries_ssh <nic> <master> <ssh-dev> <ssh-parent>
+  local n="$1" master="$2" dev="$3" parent="$4"
+  [[ -n "$dev" ]] || return 1
+  [[ "$n" == "$dev" ]] && return 0
+  [[ -n "$master" && ( "$master" == "$dev" || "$master" == "$parent" ) ]] && return 0
+  return 1
+}
+
+bm::cli::cmd_nics() {
+  local all=0
+  while (( $# )); do
+    case "$1" in
+      --all) all=1; shift ;;
+      *) bm::core::die "unknown flag '$1'" "$BM_EX_USAGE" "the only flag is --all" ;;
+    esac
+  done
+  if (( BM_JSON )); then
+    bm::core::die "nics has no JSON output yet" "$BM_EX_USAGE" "for bonds use: $BM_PROG --json list"
+  fi
+  local ssh_dev ssh_parent=""
+  ssh_dev="$(bm::facts::ssh_egress_dev || true)"
+  if [[ -n "$ssh_dev" ]]; then
+    ssh_parent="$(bm::facts::vlan_parent "$ssh_dev")"
+  fi
+
+  local d n hidden=0 allowed
+  local -a names=()
+  for d in "$BM_SYS_ROOT"/class/net/*; do
+    [[ -e "$d" ]] || continue
+    n="${d##*/}"
+    [[ "$n" == lo ]] && continue
+    bm::facts::bond_exists_kernel "$n" && continue # a bond is not a port
+    if ! bm::facts::nic_allowed "$n" && (( ! all )); then
+      hidden=$(( hidden + 1 ))
+      continue
+    fi
+    names+=("$n")
+  done
+
+  if (( ${#names[@]} == 0 )); then
+    echo "No network ports found that bond-manager may use."
+    if (( hidden > 0 )); then
+      echo "($hidden hidden by the NIC policy - see them with: $BM_PROG nics --all)"
+    fi
+    return "$BM_EX_OK"
+  fi
+
+  printf '%-15s %-8s %-6s %-10s %-20s %s\n' NIC LINK SPEED IN-BOND ADDRESSES NOTE
+  local link speed inbond addrs first extra note active
+  local -a free_up=() addr_list=()
+  for n in "${names[@]}"; do
+    bm::facts::nic_info "$n" || true
+    case "$BM_NIC_LINK" in
+      up) link=up ;;
+      no-link) link="no link" ;;
+      off) link=off ;;
+      *) link="?" ;;
+    esac
+    speed="$(bm::help::speed_label "$BM_NIC_SPEED")"
+    inbond="${BM_NIC_MASTER:--}"
+    mapfile -t addr_list < <(bm::facts::dev_addrs "$n" | grep -v '^fe80:' || true)
+    first="${addr_list[0]:-}"
+    extra=""
+    if (( ${#addr_list[@]} > 1 )); then extra=" +$(( ${#addr_list[@]} - 1 ))"; fi
+    addrs="${first:--}$extra"
+    allowed=1
+    bm::facts::nic_allowed "$n" || allowed=0
+    local vpar
+    vpar="$(bm::facts::vlan_parent "$n")"
+    if (( ! allowed )); then
+      note="$(bm::core::c_dim "hidden by the NIC policy")"
+    elif [[ -n "$vpar" ]]; then
+      note="VLAN interface on $vpar"
+      if [[ "$n" == "$ssh_dev" ]]; then note+=" - $(bm::core::c_warn "carries your SSH connection")"; fi
+    elif bm::cli::_carries_ssh "$n" "$BM_NIC_MASTER" "$ssh_dev" "$ssh_parent"; then
+      note="$(bm::core::c_warn "carries your SSH connection")"
+      [[ -n "$BM_NIC_MASTER" ]] && note="$(bm::core::c_warn "in $BM_NIC_MASTER - carries your SSH connection")"
+    elif [[ -n "$BM_NIC_MASTER" ]]; then
+      active="$(bm::facts::bond_proc_value "$BM_NIC_MASTER" "Currently Active Slave")"
+      note="in $BM_NIC_MASTER"
+      [[ "$active" == "$n" ]] && note+=" (active)"
+    elif [[ -n "$first" ]]; then
+      note="$(bm::core::c_warn "has an IP - probably in use")"
+    elif [[ "$BM_NIC_LINK" == up ]]; then
+      note="$(bm::core::c_ok "free - good to use")"
+      free_up+=("$n")
+    elif [[ "$BM_NIC_LINK" == no-link ]]; then
+      note="$(bm::core::c_warn "free, but no link - cable or switch port?")"
+    elif [[ "$BM_NIC_LINK" == off ]]; then
+      note="$(bm::core::c_warn "free, but switched off (ip link set $n up)")"
+    else
+      note="free"
+    fi
+    printf '%-15s %-8s %-6s %-10s %-20s %s\n' "$n" "$link" "$speed" "$inbond" "$addrs" "$note"
+  done
+
+  echo
+  if (( ${#free_up[@]} >= 2 )); then
+    local b=0
+    while bm::facts::bond_exists_kernel "bond$b" || bm::facts::nic_exists "bond$b"; do
+      b=$(( b + 1 ))
+    done
+    echo "Tip: build a bond from two free ports (preview first, -n changes nothing):"
+    echo "  $BM_PROG -n create bond$b --mode active-backup --members ${free_up[0]},${free_up[1]}"
+  elif (( ${#free_up[@]} == 1 )); then
+    echo "Tip: '${free_up[0]}' is free - add it to a bond, or use it to move one: $BM_PROG help swap-member"
+  fi
+  if (( hidden > 0 )); then
+    echo "($hidden more hidden by the NIC policy - see them with: $BM_PROG nics --all)"
+  fi
+  return "$BM_EX_OK"
+}
+
+# ---- help ---------------------------------------------------------------------
+
+bm::cli::cmd_help() {
+  local x="${1:-}"
+  if [[ -z "$x" ]]; then
+    bm::cli::usage
+    return "$BM_EX_OK"
+  fi
+  if bm::help::is_command "$x"; then
+    bm::help::command "$x"
+    return "$BM_EX_OK"
+  fi
+  if bm::help::is_topic "$x"; then
+    bm::help::topic "$x"
+    return "$BM_EX_OK"
+  fi
+  local sug
+  sug="$(bm::help::synonym "$x")"
+  if [[ -z "$sug" ]]; then
+    sug="$(bm::core::closest "$x" "${BM_HELP_COMMANDS[@]}" "${BM_HELP_TOPICS[@]}")"
+  fi
+  printf '%s: no help for "%s"\n' "$BM_PROG" "$x" >&2
+  if [[ -n "$sug" ]]; then
+    printf '  Did you mean: %s help %s\n' "$BM_PROG" "$sug" >&2
+  fi
+  printf '  Commands: %s\n' "${BM_HELP_COMMANDS[*]}" >&2
+  printf '  Topics:   %s\n' "${BM_HELP_TOPICS[*]}" >&2
+  return "$BM_EX_USAGE"
+}
+
 # ---- mutation command parsers ---------------------------------------------
 
 # Parse shared create/modify flags into BM_SPEC. Consumes "$@" after the
@@ -375,32 +637,32 @@ bm::cli::_parse_change_flags() {
   local -a vlan_tokens=()
   while (( $# )); do
     case "$1" in
-      --mode) BM_SPEC[mode]="${2:?}"; shift 2 ;;
-      --members) BM_SPEC[members]="${2:?}"; shift 2 ;;
-      --opt) opt_pairs+=("${2:?}"); shift 2 ;;
-      --del-opt) BM_SPEC[del_opts]="${BM_SPEC[del_opts]:-} ${2:?}"; shift 2 ;;
-      --mtu) BM_SPEC[mtu]="${2:?}"; shift 2 ;;
-      --ip4) BM_SPEC[ip4]="${2:?}"; shift 2 ;;
-      --gw4) BM_SPEC[gw4]="${2:?}"; shift 2 ;;
-      --dns4) BM_SPEC[dns4]="${2:?}"; shift 2 ;;
-      --ip6) BM_SPEC[ip6]="${2:?}"; shift 2 ;;
-      --gw6) BM_SPEC[gw6]="${2:?}"; shift 2 ;;
-      --dns6) BM_SPEC[dns6]="${2:?}"; shift 2 ;;
-      --vlan) vlan_tokens+=("${2:?}"); shift 2 ;;
-      --miimon) opt_pairs+=("miimon=${2:?}"); shift 2 ;;
-      --primary) opt_pairs+=("primary=${2:?}"); shift 2 ;;
-      --lacp-rate) opt_pairs+=("lacp_rate=${2:?}"); shift 2 ;;
-      --xmit-hash) opt_pairs+=("xmit_hash_policy=${2:?}"); shift 2 ;;
-      --arp-interval) opt_pairs+=("arp_interval=${2:?}"); shift 2 ;;
-      --arp-targets) opt_pairs+=("arp_ip_target=${2:?}"); shift 2 ;;
-      --min-links) opt_pairs+=("min_links=${2:?}"); shift 2 ;;
+      --mode) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[mode]="$2"; shift 2 ;;
+      --members) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[members]="$2"; shift 2 ;;
+      --opt) bm::cli::_need_arg "$1" "${2-}"; opt_pairs+=("$2"); shift 2 ;;
+      --del-opt) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[del_opts]="${BM_SPEC[del_opts]:-} $2"; shift 2 ;;
+      --mtu) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[mtu]="$2"; shift 2 ;;
+      --ip4) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[ip4]="$2"; shift 2 ;;
+      --gw4) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[gw4]="$2"; shift 2 ;;
+      --dns4) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[dns4]="$2"; shift 2 ;;
+      --ip6) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[ip6]="$2"; shift 2 ;;
+      --gw6) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[gw6]="$2"; shift 2 ;;
+      --dns6) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[dns6]="$2"; shift 2 ;;
+      --vlan) bm::cli::_need_arg "$1" "${2-}"; vlan_tokens+=("$2"); shift 2 ;;
+      --miimon) bm::cli::_need_arg "$1" "${2-}"; opt_pairs+=("miimon=$2"); shift 2 ;;
+      --primary) bm::cli::_need_arg "$1" "${2-}"; opt_pairs+=("primary=$2"); shift 2 ;;
+      --lacp-rate) bm::cli::_need_arg "$1" "${2-}"; opt_pairs+=("lacp_rate=$2"); shift 2 ;;
+      --xmit-hash) bm::cli::_need_arg "$1" "${2-}"; opt_pairs+=("xmit_hash_policy=$2"); shift 2 ;;
+      --arp-interval) bm::cli::_need_arg "$1" "${2-}"; opt_pairs+=("arp_interval=$2"); shift 2 ;;
+      --arp-targets) bm::cli::_need_arg "$1" "${2-}"; opt_pairs+=("arp_ip_target=$2"); shift 2 ;;
+      --min-links) bm::cli::_need_arg "$1" "${2-}"; opt_pairs+=("min_links=$2"); shift 2 ;;
       --no-activate) BM_SPEC[activate]=0; shift ;;
       --copy-ip) BM_SPEC[copy_ip]=1; shift ;;
       --copy-vlans) BM_SPEC[copy_vlans]=1; shift ;;
       --keep-vlans) BM_SPEC[keep_vlans]=1; shift ;;
-      --old) BM_SPEC[old]="${2:?}"; shift 2 ;;
-      --new) BM_SPEC[new]="${2:?}"; shift 2 ;;
-      *) bm::core::die "unknown flag '$1'" "$BM_EX_USAGE" ;;
+      --old) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[old]="$2"; shift 2 ;;
+      --new) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[new]="$2"; shift 2 ;;
+      *) bm::core::die "unknown flag '$1'" "$BM_EX_USAGE" "$(bm::cli::_flag_hint "$1")" ;;
     esac
   done
   if (( ${#opt_pairs[@]} > 0 )); then
@@ -560,7 +822,7 @@ bm::cli::cmd_diagnose() {
   while (( $# )); do
     case "$1" in
       --extended) level=extended; shift ;;
-      --target) target="${2:?}"; shift 2 ;;
+      --target) bm::cli::_need_arg "$1" "${2-}"; target="$2"; shift 2 ;;
       -*) bm::core::die "unknown flag '$1'" "$BM_EX_USAGE" ;;
       *) bond="$1"; shift ;;
     esac
@@ -605,7 +867,7 @@ bm::cli::cmd_rollback() {
   local snapshot="" deadman=0
   while (( $# )); do
     case "$1" in
-      --snapshot) snapshot="${2:?}"; shift 2 ;;
+      --snapshot) bm::cli::_need_arg "$1" "${2-}"; snapshot="$2"; shift 2 ;;
       --deadman) deadman=1; shift ;;
       *) bm::core::die "usage: $BM_PROG rollback [--snapshot ID]" "$BM_EX_USAGE" ;;
     esac
@@ -735,7 +997,7 @@ bm::cli::cmd_bundle() {
   local out="" redact=0
   while (( $# )); do
     case "$1" in
-      --output) out="${2:?}"; shift 2 ;;
+      --output) bm::cli::_need_arg "$1" "${2-}"; out="$2"; shift 2 ;;
       --redact) redact=1; shift ;;
       *) bm::core::die "usage: $BM_PROG bundle [--output PATH] [--redact]" "$BM_EX_USAGE" ;;
     esac
@@ -765,10 +1027,16 @@ _bond_manager() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="list show status diagnose doctor create modify add-member remove-member swap-member remove vlan clone repair verify snapshot commit rollback bundle init config completion help"
+  commands="list show status diagnose doctor nics create modify add-member remove-member swap-member remove vlan clone repair verify snapshot commit rollback bundle init config completion help tui version"
   case "$prev" in
-    show|status|diagnose|modify|add-member|remove-member|swap-member|remove|repair|verify)
+    show|status|diagnose|modify|add-member|remove-member|swap-member|remove|repair|verify|clone)
       COMPREPLY=( $(compgen -W "$(bond-manager list 2>/dev/null | awk '{print $1}')" -- "$cur") )
+      return ;;
+    --old|--new|--members|--primary)
+      COMPREPLY=( $(compgen -W "$(ls /sys/class/net 2>/dev/null)" -- "$cur") )
+      return ;;
+    help)
+      COMPREPLY=( $(compgen -W "$commands basics modes lacp safety practice moving glossary keys exit-codes" -- "$cur") )
       return ;;
     --mode)
       COMPREPLY=( $(compgen -W "balance-rr active-backup balance-xor broadcast 802.3ad balance-tlb balance-alb" -- "$cur") )
@@ -791,425 +1059,4 @@ _bond_manager() {
 }
 complete -F _bond_manager bond-manager
 EOF
-}
-
-# ---- TUI ------------------------------------------------------------------
-
-bm::cli::tui_create() {
-  bm::wf::spec_reset
-  local bond
-  if ! bond="$(bm::ui::input "New bond name" "bond0")"; then return 0; fi
-  BM_SPEC[bond]="$bond"
-
-  local -a mode_items=()
-  local m
-  for m in "${BM_MODES[@]}"; do
-    mode_items+=("$m" "${BM_MODE_HELP[$m]}")
-  done
-  local mode
-  if ! mode="$(bm::ui::menu "Bond mode:" "${mode_items[@]}")"; then return 0; fi
-  BM_SPEC[mode]="$mode"
-
-  local members
-  if ! members="$(bm::ui::pick_nics "Select member interfaces for $bond")"; then return 0; fi
-  BM_SPEC[members]="${members// /,}"
-
-  local ipmode
-  if ! ipmode="$(bm::ui::menu "IPv4 configuration:" \
-    dhcp "DHCP" static "Static address" none "No IPv4 on the bond")"; then return 0; fi
-  case "$ipmode" in
-    dhcp) BM_SPEC[ip4]=dhcp ;;
-    none) BM_SPEC[ip4]=none ;;
-    static)
-      local addr gw dns
-      if ! addr="$(bm::ui::input "IPv4 address/prefix (e.g. 10.0.0.10/24)")"; then return 0; fi
-      if ! gw="$(bm::ui::input "IPv4 gateway (blank for none)")"; then return 0; fi
-      if ! dns="$(bm::ui::input "DNS servers, comma-separated (blank for none)")"; then return 0; fi
-      BM_SPEC[ip4]="$addr"
-      [[ -n "$gw" ]] && BM_SPEC[gw4]="$gw"
-      [[ -n "$dns" ]] && BM_SPEC[dns4]="$dns"
-      ;;
-  esac
-
-  if bm::ui::yesno "Add a VLAN on top of $bond?"; then
-    local vid
-    if ! vid="$(bm::ui::input "VLAN ID (1-4094)")"; then return 0; fi
-    local vtok="$vid"
-    if bm::ui::yesno "Put the IP on the VLAN interface instead of the bond?"; then
-      local vaddr vgw
-      if ! vaddr="$(bm::ui::input "VLAN IPv4 address/prefix (or 'dhcp')")"; then return 0; fi
-      if [[ "$vaddr" == dhcp ]]; then
-        vtok+=":ip4=dhcp"
-      else
-        if ! vgw="$(bm::ui::input "VLAN IPv4 gateway (blank for none)")"; then return 0; fi
-        vtok+=":ip4=$vaddr${vgw:+;gw4=$vgw}"
-      fi
-      BM_SPEC[ip4]=none
-      unset "BM_SPEC[gw4]" "BM_SPEC[dns4]"
-    fi
-    BM_SPEC[vlans]="$vtok"
-  fi
-
-  bm::wf::print_cli_equivalent create
-  local rc=0
-  ( bm::wf::create ) || rc=$?
-  bm::cli::_tui_show_rc "$rc"
-}
-
-# TUI workflows run in a subshell (see the '( bm::wf::... )' call sites) so a
-# validation failure — which calls bm::core::die, i.e. exit — returns the
-# operator to the menu instead of dropping them out of the program.
-bm::cli::_tui_show_rc() {
-  local rc="$1"
-  case "$rc" in
-    0) : ;;
-    "$BM_EX_VERIFY") bm::ui::msg "The change FAILED verification and was rolled back." ;;
-    *) bm::ui::msg "Operation ended with exit code $rc (see $BM_LOG_FILE)." ;;
-  esac
-}
-
-bm::cli::tui_edit() {
-  local bond
-  if ! bond="$(bm::ui::pick_bond)"; then return 0; fi
-  local action
-  if ! action="$(bm::ui::menu "Edit '$bond':" \
-    add "Add member interfaces" \
-    remove "Remove member interfaces" \
-    tune "Change mode / bond options" \
-    vlan "Add a VLAN" \
-    ip "Change IPv4/IPv6 on the bond" \
-    back "Back")"; then return 0; fi
-  local rc=0
-  case "$action" in
-    back) return 0 ;;
-    add)
-      local members
-      if ! members="$(bm::ui::pick_nics "Interfaces to add to $bond")"; then return 0; fi
-      bm::wf::spec_reset
-      BM_SPEC[bond]="$bond"
-      BM_SPEC[members]="${members// /,}"
-      bm::wf::print_cli_equivalent add-member
-      ( bm::wf::add_members ) || rc=$?
-      ;;
-    remove)
-      local cur
-      cur="$(bm::facts::bond_members "$bond" | paste -sd' ' -)"
-      local rem
-      if ! rem="$(bm::ui::input "Members to remove (current: ${cur:-none})")"; then return 0; fi
-      [[ -n "$rem" ]] || return 0
-      bm::wf::spec_reset
-      BM_SPEC[bond]="$bond"
-      BM_SPEC[members]="${rem// /,}"
-      bm::wf::print_cli_equivalent remove-member
-      ( bm::wf::remove_members ) || rc=$?
-      ;;
-    tune)
-      bm::wf::spec_reset
-      BM_SPEC[bond]="$bond"
-      local newmode
-      if ! newmode="$(bm::ui::input "New mode (blank to keep; one of: ${BM_MODES[*]})")"; then return 0; fi
-      [[ -n "$newmode" ]] && BM_SPEC[mode]="$newmode"
-      local opts
-      if ! opts="$(bm::ui::input "Options to set, comma-separated key=value (blank for none)")"; then return 0; fi
-      [[ -n "$opts" ]] && BM_SPEC[opts]="$opts"
-      bm::wf::print_cli_equivalent modify
-      ( bm::wf::modify ) || rc=$?
-      ;;
-    vlan)
-      local vid
-      if ! vid="$(bm::ui::input "VLAN ID to add on $bond")"; then return 0; fi
-      [[ -n "$vid" ]] || return 0
-      local vtok="$vid" vaddr vgw
-      if bm::ui::yesno "Configure IPv4 on the new VLAN interface?"; then
-        if ! vaddr="$(bm::ui::input "IPv4 address/prefix (or 'dhcp')")"; then return 0; fi
-        if [[ "$vaddr" == dhcp ]]; then
-          vtok+=":ip4=dhcp"
-        elif [[ -n "$vaddr" ]]; then
-          if ! vgw="$(bm::ui::input "IPv4 gateway (blank for none)")"; then return 0; fi
-          vtok+=":ip4=$vaddr${vgw:+;gw4=$vgw}"
-        fi
-      fi
-      bm::wf::spec_reset
-      BM_SPEC[bond]="$bond"
-      BM_SPEC[vlans]="$vtok"
-      bm::log::say "CLI equivalent: $BM_PROG vlan add $bond '$vtok'"
-      ( bm::wf::vlan_add ) || rc=$?
-      ;;
-    ip)
-      bm::wf::spec_reset
-      BM_SPEC[bond]="$bond"
-      local ipmode
-      if ! ipmode="$(bm::ui::menu "IPv4 configuration:" \
-        dhcp "DHCP" static "Static address" none "Disable IPv4" keep "Leave IPv4 unchanged")"; then return 0; fi
-      case "$ipmode" in
-        dhcp) BM_SPEC[ip4]=dhcp ;;
-        none) BM_SPEC[ip4]=none ;;
-        static)
-          local addr gw dns
-          if ! addr="$(bm::ui::input "IPv4 address/prefix")"; then return 0; fi
-          if ! gw="$(bm::ui::input "IPv4 gateway (blank for none)")"; then return 0; fi
-          if ! dns="$(bm::ui::input "DNS servers (blank for none)")"; then return 0; fi
-          BM_SPEC[ip4]="$addr"
-          [[ -n "$gw" ]] && BM_SPEC[gw4]="$gw"
-          [[ -n "$dns" ]] && BM_SPEC[dns4]="$dns"
-          ;;
-      esac
-      bm::wf::print_cli_equivalent modify
-      ( bm::wf::modify ) || rc=$?
-      ;;
-  esac
-  bm::cli::_tui_show_rc "$rc"
-}
-
-bm::cli::tui_loop() {
-  bm::ui::init
-  while :; do
-    local choice
-    if ! choice="$(bm::ui::menu "Main menu — $(bm::ui::title)" \
-      status "Status: all bonds (health, members, addresses)" \
-      diagnose "Status: diagnose a bond" \
-      extended "Status: extended diagnostics" \
-      create "Change: create a new bond" \
-      edit "Change: edit an existing bond" \
-      delete "Change: remove a bond" \
-      swap "Migration: swap a member NIC (add new, then remove old)" \
-      clone "Migration: clone a bond to new NICs" \
-      repair "Repair: rebuild member profiles from kernel state" \
-      snapshots "Safety: snapshots (list / restore)" \
-      pending "Safety: commit or roll back a pending change" \
-      bundle "Support: create a support bundle" \
-      doctor "About: environment doctor" \
-      quit "Exit")"; then
-      break
-    fi
-    local rc=0
-    case "$choice" in
-      status)
-        local out
-        out="$(bm::cli::cmd_status 2>&1 || true)"
-        bm::ui::msg "${out:-No bonds found.}"
-        ;;
-      diagnose | extended)
-        local bond target
-        if bond="$(bm::ui::pick_bond)"; then
-          if ! target="$(bm::ui::input "Ping target (blank = default gateway)")"; then target=""; fi
-          local lvl=basic
-          [[ "$choice" == extended ]] && lvl=extended
-          bm::ui::msg "$(bm::diag::run "$bond" "$lvl" "$target" 2>&1 || true)"
-        fi
-        ;;
-      create) bm::cli::tui_create ;;
-      edit) bm::cli::tui_edit ;;
-      delete)
-        local bond
-        if bond="$(bm::ui::pick_bond)"; then
-          bm::wf::spec_reset
-          BM_SPEC[bond]="$bond"
-          bm::log::say "CLI equivalent: $BM_PROG remove $bond"
-          ( bm::wf::remove ) || rc=$?
-          bm::cli::_tui_show_rc "$rc"
-        fi
-        ;;
-      swap)
-        local bond old new
-        if bond="$(bm::ui::pick_bond)"; then
-          local cur
-          cur="$(bm::facts::bond_members "$bond" | paste -sd' ' -)"
-          if old="$(bm::ui::input "Member to replace (current: ${cur:-none})")" && [[ -n "$old" ]]; then
-            if new="$(bm::ui::pick_nics "Replacement NIC for $old" "$old")" && [[ -n "$new" ]]; then
-              new="${new%% *}"
-              bm::wf::spec_reset
-              BM_SPEC[bond]="$bond"
-              BM_SPEC[old]="$old"
-              BM_SPEC[new]="$new"
-              bm::log::say "CLI equivalent: $BM_PROG swap-member $bond --old $old --new $new"
-              ( bm::wf::swap_member ) || rc=$?
-              bm::cli::_tui_show_rc "$rc"
-            fi
-          fi
-        fi
-        ;;
-      clone)
-        local src dst members
-        if src="$(bm::ui::pick_bond)"; then
-          if dst="$(bm::ui::input "New bond name" "bond1")" && [[ -n "$dst" ]]; then
-            if members="$(bm::ui::pick_nics "Member interfaces for $dst")"; then
-              bm::wf::spec_reset
-              BM_SPEC[src]="$src"
-              BM_SPEC[bond]="$dst"
-              BM_SPEC[members]="${members// /,}"
-              bm::ui::yesno "Copy IP configuration from $src?" && BM_SPEC[copy_ip]=1
-              bm::ui::yesno "Clone VLANs from $src?" && BM_SPEC[copy_vlans]=1
-              bm::log::say "CLI equivalent: $BM_PROG clone $src $dst --members ${BM_SPEC[members]}${BM_SPEC[copy_ip]:+ --copy-ip}${BM_SPEC[copy_vlans]:+ --copy-vlans}"
-              ( bm::wf::clone ) || rc=$?
-              bm::cli::_tui_show_rc "$rc"
-            fi
-          fi
-        fi
-        ;;
-      repair)
-        local bond
-        if bond="$(bm::ui::pick_bond)"; then
-          bm::wf::spec_reset
-          BM_SPEC[bond]="$bond"
-          bm::log::say "CLI equivalent: $BM_PROG repair $bond"
-          ( bm::wf::repair ) || rc=$?
-          bm::cli::_tui_show_rc "$rc"
-        fi
-        ;;
-      snapshots)
-        local out
-        out="$(bm::cli::cmd_snapshot list 2>&1 || true)"
-        bm::ui::msg "$out"
-        if bm::ui::yesno "Restore a snapshot now?"; then
-          local id
-          if id="$(bm::ui::input "Snapshot ID (blank = most recent)")"; then
-            if [[ -n "$id" ]]; then
-              bm::cli::cmd_rollback --snapshot "$id" || rc=$?
-            else
-              bm::cli::cmd_rollback || rc=$?
-            fi
-            bm::cli::_tui_show_rc "$rc"
-          fi
-        fi
-        ;;
-      pending)
-        if bm::ckpt::load_pending; then
-          if bm::ui::yesno "Pending change: ${BM_PENDING_SUMMARY:-?}. Commit it? (No = roll back)"; then
-            bm::cli::cmd_commit || rc=$?
-          else
-            bm::cli::cmd_rollback || rc=$?
-          fi
-          bm::cli::_tui_show_rc "$rc"
-        else
-          bm::ui::msg "No pending change."
-        fi
-        ;;
-      bundle)
-        local out
-        if bm::ui::yesno "Redact IPs/MACs from the bundle (for off-site tickets)?"; then
-          out="$(bm::cli::cmd_bundle --redact 2>&1 || true)"
-        else
-          out="$(bm::cli::cmd_bundle 2>&1 || true)"
-        fi
-        bm::ui::msg "$out"
-        ;;
-      doctor)
-        bm::ui::msg "$(bm::cli::cmd_doctor 2>&1 || true)"
-        ;;
-      quit) break ;;
-    esac
-  done
-}
-
-# ---- main -----------------------------------------------------------------
-
-bm::main() {
-  bm::core::init_traps
-
-  local -a args=()
-  local legacy_export=""
-  local legacy_status=0
-  while (( $# )); do
-    case "$1" in
-      -n | --dry-run) BM_DRY_RUN=1; shift ;;
-      -y | --yes) BM_ASSUME_YES=1; shift ;;
-      --json) BM_JSON=1; shift ;;
-      --debug) BM_DEBUG=1; shift ;;
-      --quiet) BM_QUIET=1; shift ;;
-      --no-color) BM_NO_COLOR=1; shift ;;
-      --plain) BM_PLAIN=1; shift ;;
-      --rollback-window) BM_ROLLBACK_WINDOW="${2:?}"; shift 2 ;;
-      --no-checkpoint) BM_NO_CHECKPOINT=1; shift ;;
-      --force-unsafe) BM_FORCE_UNSAFE=1; shift ;;
-      -V | --version) printf '%s %s\n' "$BM_PROG" "$BM_VERSION"; return 0 ;;
-      -h | --help) bm::cli::usage; return 0 ;;
-      --status) legacy_status=1; shift ;;                       # v2.x compat
-      --export-json) legacy_export="${2:?}"; shift 2 ;;          # v2.x compat
-      --) shift; while (( $# )); do args+=("$1"); shift; done ;;
-      *) args+=("$1"); shift ;;
-    esac
-  done
-
-  bm::core::init_color
-  bm::config::load
-  # The deadman timer re-executes this program from systemd, so BM_SELF must
-  # be the entrypoint that was actually invoked ($0) — not the module file
-  # that happens to define bm::main, which is what BASH_SOURCE[0] resolves to
-  # under the dev entrypoint (and is not executable).
-  BM_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
-  if [[ ! -x "$BM_SELF" ]]; then
-    BM_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
-  fi
-
-  if [[ -n "$BM_ROLLBACK_WINDOW" ]] && ! bm::val::uint "$BM_ROLLBACK_WINDOW" 10 86400; then
-    bm::core::die "--rollback-window must be 10..86400 seconds" "$BM_EX_USAGE"
-  fi
-
-  # legacy one-flag invocations
-  if [[ -n "$legacy_export" ]]; then
-    bm::cli::preflight_read
-    mkdir -p "$(dirname "$legacy_export")"
-    BM_JSON=1
-    bm::cli::_bonds_json_doc >"$legacy_export"
-    echo "JSON written to $legacy_export"
-    if (( legacy_status )); then
-      BM_JSON=0
-      local lrc=0
-      bm::cli::cmd_status || lrc=$?
-      return "$lrc"
-    fi
-    return 0
-  fi
-  if (( legacy_status )); then
-    args=(status)
-  fi
-
-  local cmd="${args[0]:-}"
-  local -a rest=("${args[@]:1}")
-
-  if [[ -z "$cmd" ]]; then
-    if bm::core::is_tty; then
-      bm::cli::preflight_read
-      bm::cli::tui_loop
-      return 0
-    fi
-    bm::cli::usage >&2
-    return "$BM_EX_USAGE"
-  fi
-
-  local rc=0
-  case "$cmd" in
-    list) bm::cli::cmd_list "${rest[@]}" || rc=$? ;;
-    show) bm::cli::cmd_show "${rest[@]}" || rc=$? ;;
-    status) bm::cli::cmd_status "${rest[@]}" || rc=$? ;;
-    diagnose) bm::cli::cmd_diagnose "${rest[@]}" || rc=$? ;;
-    doctor) bm::cli::cmd_doctor "${rest[@]}" || rc=$? ;;
-    create) bm::cli::cmd_create "${rest[@]}" || rc=$? ;;
-    modify) bm::cli::cmd_modify "${rest[@]}" || rc=$? ;;
-    add-member) bm::cli::cmd_add_member "${rest[@]}" || rc=$? ;;
-    remove-member) bm::cli::cmd_remove_member "${rest[@]}" || rc=$? ;;
-    swap-member) bm::cli::cmd_swap_member "${rest[@]}" || rc=$? ;;
-    remove | delete) bm::cli::cmd_remove "${rest[@]}" || rc=$? ;;
-    vlan) bm::cli::cmd_vlan "${rest[@]}" || rc=$? ;;
-    clone) bm::cli::cmd_clone "${rest[@]}" || rc=$? ;;
-    repair) bm::cli::cmd_repair "${rest[@]}" || rc=$? ;;
-    verify) bm::cli::cmd_verify "${rest[@]}" || rc=$? ;;
-    snapshot) bm::cli::cmd_snapshot "${rest[@]}" || rc=$? ;;
-    commit) bm::cli::cmd_commit "${rest[@]}" || rc=$? ;;
-    rollback) bm::cli::cmd_rollback "${rest[@]}" || rc=$? ;;
-    bundle | support-bundle) bm::cli::cmd_bundle "${rest[@]}" || rc=$? ;;
-    init) bm::cli::cmd_init "${rest[@]}" || rc=$? ;;
-    config) bm::cli::cmd_config "${rest[@]}" || rc=$? ;;
-    completion) bm::cli::cmd_completion "${rest[@]}" || rc=$? ;;
-    tui) bm::cli::preflight_read; bm::cli::tui_loop || rc=$? ;;
-    help) bm::cli::usage ;;
-    version) printf '%s %s\n' "$BM_PROG" "$BM_VERSION" ;;
-    *)
-      printf '%s: unknown command "%s"\n\n' "$BM_PROG" "$cmd" >&2
-      bm::cli::usage >&2
-      rc="$BM_EX_USAGE"
-      ;;
-  esac
-  return "$rc"
 }
