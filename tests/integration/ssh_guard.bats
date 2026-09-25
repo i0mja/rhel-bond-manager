@@ -24,6 +24,7 @@ stub_vlan_120() {
 # ---- refusal ---------------------------------------------------------------
 
 @test "guard: refuses a change to the SSH egress bond when checkpoints are unavailable" {
+  require_root
   export BM_STUB_BUSCTL_PING_RC=1            # deadman tier
   stub_ssh_session 10.1.2.3 bond0
 
@@ -40,6 +41,7 @@ stub_vlan_120() {
 }
 
 @test "guard: sees VLAN interfaces — a session on bond0.120 protects bond0" {
+  require_root
   export BM_STUB_BUSCTL_PING_RC=1
   stub_vlan_120
   stub_ssh_session 10.1.2.3 bond0.120
@@ -52,6 +54,7 @@ stub_vlan_120() {
 }
 
 @test "guard: sees member NICs — a session on eth0 protects a swap on bond0" {
+  require_root
   export BM_STUB_BUSCTL_PING_RC=1
   stub_ssh_session 10.1.2.3 eth0
 
@@ -62,6 +65,7 @@ stub_vlan_120() {
 }
 
 @test "guard: --no-checkpoint on the egress device is refused as well" {
+  require_root
   stub_ssh_session 10.1.2.3 bond0
   run_cli -y --no-checkpoint modify bond0 --opt miimon=250
   [ "$status" -eq 3 ]
@@ -71,6 +75,7 @@ stub_vlan_120() {
 }
 
 @test "guard: a device the change does not touch is not protected" {
+  require_root
   export BM_STUB_BUSCTL_PING_RC=1
   mk_sys_nic ens9 up 1000 52:54:00:12:34:09
   stub_ssh_session 10.1.2.3 ens9
@@ -82,6 +87,7 @@ stub_vlan_120() {
 }
 
 @test "guard: no SSH session at all means no guard" {
+  require_root
   export BM_STUB_BUSCTL_PING_RC=1
   run_cli -y modify bond0 --opt miimon=250
   [ "$status" -eq 0 ]
@@ -91,6 +97,7 @@ stub_vlan_120() {
 # ---- override and warn paths -----------------------------------------------
 
 @test "guard: --force-unsafe accepts the risk and applies the change" {
+  require_root
   export BM_STUB_BUSCTL_PING_RC=1
   stub_ssh_session 10.1.2.3 bond0
 
@@ -102,6 +109,7 @@ stub_vlan_120() {
 }
 
 @test "guard: under checkpoint protection it only warns" {
+  require_root
   stub_ssh_session 10.1.2.3 bond0            # busctl answers => checkpoint tier
   run_cli -y modify bond0 --opt miimon=250
   [ "$status" -eq 0 ]
@@ -112,6 +120,7 @@ stub_vlan_120() {
 }
 
 @test "guard: a checkpoint that cannot be created is re-checked, and disarmed on refusal" {
+  require_root
   # probe says 'checkpoint' (D-Bus answers) so the first guard pass only
   # warns — but CheckpointCreate then fails and the run falls back to the
   # deadman tier, where the same change is unacceptable.

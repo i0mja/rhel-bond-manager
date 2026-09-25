@@ -35,6 +35,7 @@ HOOK
 # ---- swap-member ordering: the defining safety invariant --------------------
 
 @test "swap-member: the replacement is added and up BEFORE the old port is deleted" {
+  require_root
   hook_swap_eth1_to_eth2
   run_cli -y swap-member bond0 --old eth1 --new eth2
   [ "$status" -eq 0 ]
@@ -50,6 +51,7 @@ HOOK
 }
 
 @test "swap-member: the old port is NOT deleted when the replacement never enslaves" {
+  require_root
   # no hook: eth2 is never enslaved, so the await step times out and fails
   run_cli -y swap-member bond0 --old eth1 --new eth2
   [ "$status" -eq 5 ]
@@ -60,6 +62,7 @@ HOOK
 }
 
 @test "swap-member: verification proves the new member is in and the old one out" {
+  require_root
   hook_swap_eth1_to_eth2
   run_cli -y swap-member bond0 --old eth1 --new eth2
   [ "$status" -eq 0 ]
@@ -68,6 +71,7 @@ HOOK
 }
 
 @test "swap-member: a still-enslaved old member fails verification and rolls back" {
+  require_root
   # the delete goes through but the kernel keeps eth1 enslaved (stale profile
   # elsewhere, driver refusing release): the change must not be committed
   install_nmcli_hook <<'HOOK'
@@ -87,6 +91,7 @@ HOOK
 # ---- step failure ----------------------------------------------------------
 
 @test "step failure: the run exits 5, rolls back and leaves nothing pending" {
+  require_root
   export BM_STUB_NMCLI_FAIL_RE='connection up'
   run_cli -y modify bond0 --opt miimon=250
   [ "$status" -eq 5 ]
@@ -101,6 +106,7 @@ HOOK
 }
 
 @test "step failure: verification never runs after a failed step" {
+  require_root
   export BM_STUB_NMCLI_FAIL_RE='connection modify'
   run_cli -y modify bond0 --opt miimon=250
   [ "$status" -eq 5 ]
@@ -110,6 +116,7 @@ HOOK
 }
 
 @test "step failure without checkpoints: the snapshot is restored instead" {
+  require_root
   export BM_STUB_BUSCTL_PING_RC=1          # no NM D-Bus => deadman tier
   export BM_STUB_NMCLI_FAIL_RE='connection up'
   printf '[connection]\nid=bond0\n' >"$BM_CONN_DIR/bond0.nmconnection"
@@ -127,6 +134,7 @@ HOOK
 # ---- verification failure --------------------------------------------------
 
 @test "verification failure: a bond that never comes up is rolled back, exit 5" {
+  require_root
   scenario_bond0_down                 # members fine, bond operstate down
   run_cli -y modify bond0 --opt miimon=250
   [ "$status" -eq 5 ]
@@ -140,6 +148,7 @@ HOOK
 }
 
 @test "verification failure: a bond that never appears in the kernel rolls back" {
+  require_root
   run_cli -y create bond9 --mode active-backup --members eth2,eth3
   [ "$status" -eq 5 ]
   assert_contains "$output" "bond 'bond9' not present in kernel"
@@ -149,6 +158,7 @@ HOOK
 }
 
 @test "verification failure: the checkpoint is never destroyed (nothing committed)" {
+  require_root
   scenario_bond0_down
   run_cli -y modify bond0 --opt miimon=250
   [ "$status" -eq 5 ]
@@ -158,6 +168,7 @@ HOOK
 # ---- successful apply ------------------------------------------------------
 
 @test "successful apply: snapshot, arm, execute, verify, commit — exit 0" {
+  require_root
   run_cli -y modify bond0 --opt miimon=250
   [ "$status" -eq 0 ]
   assert_call_order \
@@ -171,6 +182,7 @@ HOOK
 }
 
 @test "successful apply: the rollback window is re-budgeted after verification" {
+  require_root
   # applying consumes the window; without a re-budget the operator could be
   # left with seconds (or nothing) to decide
   run_cli -y --rollback-window 300 modify bond0 --opt miimon=250
@@ -179,6 +191,7 @@ HOOK
 }
 
 @test "no-op plan: nothing is snapshotted, armed or executed" {
+  require_root
   run_cli -y modify bond0 --opt miimon=100
   [ "$status" -eq 0 ]
   assert_contains "$output" "Nothing to do"
@@ -190,6 +203,7 @@ HOOK
 # ---- the confirmation gate on a non-TTY ------------------------------------
 
 @test "no TTY and no --yes: protection stays armed and the run exits 6" {
+  require_root
   run bash -c "printf 'y\n' | '$BM_ARTIFACT' modify bond0 --opt miimon=250"
   [ "$status" -eq 6 ]
   assert_contains "$output" "No TTY to confirm on. Protection stays armed:"
@@ -201,6 +215,7 @@ HOOK
 }
 
 @test "no TTY, snapshot-only tier: no auto-rollback is promised" {
+  require_root
   # nothing is armed that could revert this on its own — saying otherwise
   # would leave an operator waiting for a rollback that never comes
   export BM_STUB_BUSCTL_PING_RC=1
@@ -216,6 +231,7 @@ HOOK
 # ---- expect-state driven workflows -----------------------------------------
 
 @test "--no-activate: a bond left down verifies with expect-state any, exit 0" {
+  require_root
   run_cli -y create bond9 --mode active-backup --members eth2,eth3 --no-activate
   [ "$status" -eq 0 ]
   assert_contains "$output" "bond 'bond9' is not present in the kernel"
@@ -225,6 +241,7 @@ HOOK
 }
 
 @test "remove-member: removing the last member is a success, not a rollback" {
+  require_root
   # bond0 with a single member; releasing it takes the bond down, which is
   # the correct outcome and must not fail its own verification gate
   write_proc_bond bond0 eth0 eth0
@@ -244,6 +261,7 @@ HOOK
 }
 
 @test "remove-member: a member that stays enslaved fails verification" {
+  require_root
   write_proc_bond bond0 eth0 eth0
   run_cli -y remove-member bond0 eth0          # no hook: the kernel keeps it
   [ "$status" -eq 5 ]
@@ -292,6 +310,7 @@ HOOK
 # ---- pending-change interlock ---------------------------------------------
 
 @test "a pending change blocks a new one until it is committed or rolled back" {
+  require_root
   seed_pending checkpoint 20240101-000000 "modify bond0"
   run_cli -y modify bond0 --opt miimon=250
   [ "$status" -eq 3 ]

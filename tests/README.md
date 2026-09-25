@@ -10,8 +10,40 @@ bats tests/unit/facts.bats -f "health" # one group by name filter
 ```
 
 Requires: bats >= 1.5 (uses `run --separate-stderr`), python3, jq.
-The snapshot/checkpoint tests that genuinely need euid 0 skip themselves when
-not run as root; everything else is uid-independent.
+
+### Root and non-root
+
+CI runs the whole suite twice: first as a normal user, then as root
+(`sudo --preserve-env=PATH make test`). Both passes must be green.
+
+- **Tests that need euid 0 call `require_root` as the first line of the
+  test body**, so the unprivileged pass reports them as `skip requires root`
+  instead of failing. They are the tests that make a real change or reach
+  code behind `bm::core::require_root`: applies through the transaction engine
+  (`apply_safety.bats`), `commit` / `rollback` / `snapshot create|restore|prune`
+  (`safety_cli.bats`, `unit/snapshot*.bats`, `unit/ckpt*.bats`), the SSH
+  egress guard (it runs inside the engine, after the root check:
+  `ssh_guard.bats`), and `init` / `bundle` (`tmpdir_cleanup.bats`).
+- **Everything else runs as any user**, including every `--dry-run` test:
+  a dry run is documented to need no root, so those tests must pass without
+  it. If one only needs root to build its fixture, build the fixture another
+  way (see `seed_snapshot` in `safety_cli.bats`) rather than guarding it.
+- **A few tests check what a normal user sees** (the `sudo` hint, the menus
+  forcing practice mode) and skip themselves when run as root. So each pass
+  has some skips; neither may have failures.
+- **The root pass is where the safety engine is actually exercised.** A
+  green unprivileged pass on its own says little about it.
+- **Fixture helpers fail loudly.** `make_snapshot` (which runs the real,
+  root-only `snapshot create`) returns an error instead of an empty id, so a
+  test that forgets `require_root` fails rather than passing vacuously.
+
+To reproduce the unprivileged pass locally from a root shell:
+
+```sh
+chmod -R a+rX .   # 'nobody' must be able to read the checkout
+setpriv --reuid=65534 --regid=65534 --clear-groups \
+  env HOME=/tmp PATH="$PATH" bats -r tests
+```
 
 ## Layout
 
