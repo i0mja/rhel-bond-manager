@@ -70,6 +70,11 @@ schema are unchanged.
 - `--help` output now leads with "New here?" and a *Common tasks* cheat
   sheet. `doctor` ends with the safety net in plain words and a next step.
 - [docs/GUIDE.md](docs/GUIDE.md): the beginner's guide.
+- **A tour in the README**: an animated terminal at the top, and 30 real
+  screens in eight chapters that open with a click. `make tour` records
+  them from the real menus against a fake server (`build/tour/`), so they
+  are never out of date; the same screens are published as a click-through
+  page on GitHub Pages.
 
 ### Changed
 

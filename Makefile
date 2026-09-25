@@ -7,6 +7,8 @@
 #   make check       check-dist + lint + test
 #   make man         validate that docs/bond-manager.8 renders cleanly
 #   make install     install script + man page (PREFIX=/usr/local, DESTDIR-aware)
+#   make tour        record the README tour from the real menus (needs pyte)
+#   make tour-render re-render the tour from docs/tour/tour.json
 
 SHELL := bash
 
@@ -17,7 +19,7 @@ MANDIR  ?= $(PREFIX)/share/man/man8
 DIST := bond_manager.sh
 MAN  := docs/bond-manager.8
 
-.PHONY: all dist check-dist lint test check man install uninstall
+.PHONY: all dist check-dist lint test check man install uninstall tour tour-render
 
 all: dist
 
@@ -77,3 +79,13 @@ install:
 
 uninstall:
 	rm -f "$(DESTDIR)$(SBINDIR)/bond-manager" "$(DESTDIR)$(MANDIR)/bond-manager.8"
+
+# The README tour: real screens recorded in a pseudo-terminal against the
+# fake server in build/tour/sandbox.sh, rendered as SVGs, README chapters and
+# the GitHub Pages page. Recording needs python3 + pyte; rendering only python3.
+tour: dist
+	python3 build/tour/capture.py
+	python3 build/tour/render.py
+
+tour-render:
+	python3 build/tour/render.py

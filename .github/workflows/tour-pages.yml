@@ -1,0 +1,54 @@
+name: Tour site
+
+# Publishes docs/tour (the click-through tour linked from the README) to
+# GitHub Pages. Pages must be switched on once, by a repository admin:
+# Settings > Pages > Build and deployment > Source: GitHub Actions.
+# Until then this workflow says so and skips the deploy instead of failing.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/tour/**'
+      - '.github/workflows/tour-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: tour-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Check that GitHub Pages is switched on
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          source="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq .build_type 2>/dev/null || true)"
+          if [[ "$source" == workflow ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Tour not published::GitHub Pages is not set to deploy from GitHub Actions. Turn it on under Settings > Pages > Build and deployment > Source: GitHub Actions, then re-run this workflow."
+          fi
+      - uses: actions/checkout@v4
+        if: steps.pages.outputs.enabled == 'true'
+      - uses: actions/configure-pages@v5
+        if: steps.pages.outputs.enabled == 'true'
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.pages.outputs.enabled == 'true'
+        with:
+          path: docs/tour
+      - id: deploy
+        if: steps.pages.outputs.enabled == 'true'
+        uses: actions/deploy-pages@v4
