@@ -5,6 +5,118 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-09-25
+
+Anyone should be able to pick this tool up at 2am and not get hurt. This
+release rebuilds the menus in pure bash and makes every screen, prompt and
+error explain itself in plain words. The safety engine is unchanged except
+for the fixes below; exit codes (except one, see *Changed*) and the JSON
+schema are unchanged.
+
+### Added
+
+- **Built-in guided menus** (`bond-manager` on a terminal, or
+  `bond-manager tui`), written in plain bash: no whiptail, nothing to
+  install.
+  - A home dashboard shows every bond's health, its ports (link, speed,
+    active port), the port carrying *your SSH connection*, the safety net
+    this server gives you, and a live banner when a change is waiting to be
+    kept.
+  - Jobs are named in plain language, each with a step-by-step wizard:
+    *Check my bonds*, *Move a bond to a new switch* (including the LACP
+    cross-switch situation), *Build a new bond*, *Change a bond* (add/remove
+    port, mode, preferred port, IP, MTU, VLANs, advanced options, clone,
+    delete), *Fix a bond that looks wrong*, *Undo & safety*, *Tools* and
+    *Help*.
+  - Choices come from lists with a plain note on every item. Typed values
+    are validated on the spot with a message that says how to fix them.
+  - A review screen summarises every change in plain words, warns early
+    when it touches the SSH connection, and shows the equivalent command
+    line.
+  - **Practice mode** (key `p`) runs every job as a dry run. It is forced
+    on, with an explanation, when changes are impossible (not root,
+    NetworkManager down).
+  - A result panel says what happened and what to do next.
+  - Arrow keys, `j`/`k`, `1`-`9`, Esc/`q` for back, and Space for check
+    boxes. Numbered prompts are used on serial consoles, dumb terminals,
+    pipes and with `--plain`. Output falls back to ASCII without UTF-8 (or
+    with `BM_ASCII=1`), and `NO_COLOR` is honored.
+- **`bond-manager nics [--all]`**: every network port with its link state,
+  speed, bond, addresses and a plain verdict ("free - good to use", "no
+  link - cable or switch port?", "has an IP - probably in use", "carries
+  your SSH connection"), plus a ready-made `create` example. It is
+  read-only, needs no root, and never calls nmcli.
+- **`bond-manager help [COMMAND|TOPIC]`** and **`COMMAND --help`**: plain
+  English with copy-paste examples, always starting from a `-n` preview.
+  The topics are `basics`, `modes`, `lacp`, `safety`, `practice`, `moving`,
+  `glossary`, `keys` and `exit-codes`.
+- **"Next step" hints** on errors, on their own line under the unchanged
+  `ERROR:` line:
+  - a missing port gives the closest name plus `bond-manager nics`;
+  - a port already in another bond says how to free it;
+  - a mistyped mode gives its alias (`lacp` -> `802.3ad`);
+  - a missing bond gives the closest bond;
+  - a bond NetworkManager doesn't manage is explained;
+  - a non-root run gives the same command with `sudo`;
+  - a malformed address shows the expected format.
+- **"Did you mean"** suggestions for unknown commands (by spelling, and by
+  meaning: `move` suggests `swap-member`, `undo` suggests `rollback`) and
+  for unknown flags. A stray mode, port list or address typed without its
+  flag gets a hint too (`did you mean '--mode active-backup'?`).
+- `--help` output now leads with "New here?" and a *Common tasks* cheat
+  sheet. `doctor` ends with the safety net in plain words and a next step.
+- [docs/GUIDE.md](docs/GUIDE.md): the beginner's guide.
+
+### Changed
+
+- **The commit gate is a clear box** with a live countdown that changes
+  colour as time runs out. `K` keeps the change, `U` undoes it, `E` adds 5
+  minutes; `c`/`r`/`e` still work. Other keys explain what to press.
+- **`yes/no` questions stay typed answers** (y + Enter). Type-ahead is
+  discarded before the gate, so a stray key never answers it.
+- **A flag given without its value** (`--mode` at the end of the line, or
+  followed by another flag) is now a usage error, exit 2 with an example.
+  It used to exit 1 with a raw shell message.
+- **An unknown command** prints a suggestion and a pointer to `help`
+  instead of dumping the whole usage text. It still exits 2.
+- **The deadman timer is armed with `AccuracySec=1s`**, so it fires at the
+  deadline instead of up to a minute late.
+- **whiptail is no longer used**, and `doctor` no longer lists it.
+- **`bm::main` moved to `lib/99-main.sh`** so that dispatching to the menus
+  (`lib/95-tui.sh`) is a downward call. The plain-English text lives in
+  `lib/45-help.sh`.
+
+### Fixed
+
+- **Deadman tier: an unanswered change was never undone.** When the
+  countdown ran out at the interactive prompt, the gate announced "the
+  change has been reverted" and cleared the pending state. The deadman
+  timer then either could not take the lock (the gate still held it) or
+  found nothing pending, so nothing was reverted. The gate now restores the
+  snapshot itself on that tier. If the restore reports problems, it says
+  so.
+- **The commit gate spun at 100% CPU** when its terminal reached end of
+  input (e.g. the SSH connection went away mid-countdown). End of input now
+  keeps protection armed, prints how to commit or roll back from another
+  session, and exits 6.
+- **Menus:**
+  - Committing or rolling back a waiting change from the menus kept the
+    lock open for the rest of the session, so every later change failed
+    with "another instance is running".
+  - An error in a menu action (including "must be run as root") exited the
+    whole program; now every action runs isolated and the menus explain
+    the result.
+  - A validation error ended a wizard with "exit code 2 (see log)"; the
+    error and its next step are now shown, and wizards validate while you
+    type.
+  - Non-root users filled in a whole wizard before being told they needed
+    root. Changes are now checked up front, with practice mode offered.
+  - The plan could be hidden behind the whiptail "Apply this plan?"
+    dialog; it now stays on screen above the question.
+- **The CLI equivalent shown for `add-member` / `remove-member`** used
+  `--members`, which those commands reject. One function now builds the
+  equivalent for every subcommand, quoting values that need it.
+
 ## [3.0.0] - 2026-08-25
 
 Ground-up rebuild. The tool is now compiled from modules in `lib/` into the

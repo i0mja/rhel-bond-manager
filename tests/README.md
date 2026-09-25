@@ -105,3 +105,34 @@ a real partner whose ports report `Actor/Partner Churn State: churned`.
   `assert_call_order <ere> <ere>...` which pins the ORDER of external commands
   (e.g. swap-member adding and activating the new port before deleting the
   old one).
+
+## Driving the guided menus
+
+Without a terminal the menus run in plain mode (numbered prompts), which is
+what `tests/integration/tui_plain.bats` exercises: it pipes scripted answers
+into `bond_manager.sh --dry-run tui`.
+
+- Answer a menu with the item's **tag** (e.g. `build`, `move`, `go`) or its
+  number; tags keep the scripts readable. `q` goes back (quits on the home
+  screen).
+- Answer a checklist with numbers or tags separated by spaces
+  (`eth2 eth3`); Enter keeps what is ticked.
+- A pause ("Press Enter to go back") needs an empty line.
+- A yes/no question keeps its historical plain-mode behavior: only `y` or
+  `yes` counts as yes.
+- Always wrap a run in `timeout`: a menu that does not notice the end of its
+  input must fail the test, not hang CI. End of input quits cleanly with
+  exit 0.
+- Pass `--dry-run` so the run is identical as root and as a normal user
+  (without it, a non-root run first shows the "practice mode is on" screen).
+
+The fancy (arrow-key) mode needs a real terminal and is not part of the
+suite. Its logic lives in pure helpers that are unit-tested instead:
+`bm::ui::read_key` (key decoding from piped escape sequences),
+`bm::ui::_nav` / `bm::ui::_view` (cursor and viewport maths), and
+`bm::ui::fit` / `bm::ui::vlen` / `bm::ui::box_lines` (layout). To check
+the real thing by hand in a terminal without touching the host, do what
+`setup_sandbox` does: export the `BM_*` roots to a scratch directory (copy
+`fixtures/sysfs` into its `sys/` and a `fixtures/proc_bonding_*` file into
+its `proc/net/bonding/`), put `tests/stubs` first on `PATH`, and run
+`./bin/bond-manager --dry-run`.

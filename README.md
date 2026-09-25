@@ -6,6 +6,11 @@ bond you're changing.**
 
 That's the job this was written for.
 
+> **New to bonding, or to this tool?** Read the
+> [beginner's guide](docs/GUIDE.md), or just run `sudo bond-manager` and
+> follow the menus: every screen explains itself, and **practice mode**
+> (press `p`) lets you try anything without changing the server.
+
 A rack is being migrated to a new switch. The servers are bonded, they're in
 production, and nobody has scheduled an outage — because with bonding you
 shouldn't need one. The bond is *designed* to survive losing a leg, so you
@@ -137,23 +142,38 @@ VLAN riding on the bond, and including under `sudo`, which strips
 checkpoint protection takes an explicit `--force-unsafe` and a deliberate
 decision, not a shrug.
 
-### It teaches you the CLI
+### It explains itself
 
-The menu-driven TUI is there for 2am, when nobody wants to recall flag names
-from memory. But every wizard prints the exact command line it just built:
+The guided menus are there for 2am, when nobody wants to recall flag names
+from memory. They ask one plain question at a time. Ports and modes are
+picked from lists that say *"free - good to use"* or *"no link - cable or
+switch port?"*, and typos are caught while you type. Every change ends with
+a summary in plain words and the exact command line it built:
 
 ```
-CLI equivalent: bond-manager swap-member bond0 --old ens1f0 --new ens2f0
+Same thing as a command:
+  bond-manager swap-member bond0 --old ens1f0 --new ens2f0
 ```
 
 Click through the first host, paste that into your runbook, script the other
-thirty-nine. The TUI is a teaching tool that puts itself out of a job.
+thirty-nine. The menus are a teaching tool that puts itself out of a job.
+
+The command line explains itself too. Every error ends with a *Next step*,
+typos get a *did you mean*, and `bond-manager help COMMAND` shows plain
+words and copy-paste examples:
+
+```
+$ bond-manager create bond1 active-backup
+bond-manager: ERROR: unknown flag 'active-backup'
+  Next step: did you mean '--mode active-backup'?
+```
 
 ## The 30-second version
 
 ```bash
 bond-manager doctor      # can this host protect me? which tier do I get?
 bond-manager list        # what have I got, and is it healthy?
+bond-manager nics        # which ports are free, which have a link?
 bond-manager -n swap-member bond0 --old ens1f0 --new ens2f0
                          # show me the plan; change absolutely nothing
 ```
@@ -164,11 +184,12 @@ verify — then press `c` to commit, or just walk away and let it undo itself.
 ## It's one file
 
 No packages, no runtime, no `pip install` on an air-gapped box, no
-dependency you have to justify to a change board. `scp` one auditable bash
-script to `/usr/local/sbin` and it runs on what RHEL 8/9 already ships. You
-can read the whole thing in an afternoon. So can your security team.
+dependency you have to justify to a change board. Not even whiptail: the
+menus are plain bash. `scp` one auditable bash script to `/usr/local/sbin`
+and it runs on what RHEL 8/9 already ships. You can read the whole thing.
+So can your security team.
 
-*(It's developed as 15 focused modules under `lib/` and compiled into that
+*(It's developed as 18 focused modules under `lib/` and compiled into that
 single file by `make dist`. The modularity is for us; the single file is for
 you.)*
 
@@ -269,8 +290,9 @@ Then:
 ```bash
 bond-manager doctor          # preflight: tools, NM, protection tier
 sudo bond-manager init       # optional: install default config + logrotate policy
-bond-manager                 # interactive TUI (on a terminal)
-bond-manager --help          # full CLI reference
+sudo bond-manager            # guided menus (on a terminal); press p to practise
+bond-manager --help          # common tasks + full CLI reference
+bond-manager help basics     # what a bond is, in plain words
 ```
 
 ## CLI reference
@@ -282,6 +304,8 @@ bond-manager [GLOBAL FLAGS] <command> [ARGS]
 Global flags: `-n/--dry-run`, `-y/--yes`, `--json`, `--debug`, `--quiet`,
 `--no-color` (`NO_COLOR` honored), `--plain`, `--rollback-window S`,
 `--no-checkpoint`, `--force-unsafe`, `-V/--version`, `-h/--help`.
+`--help` after a command shows that command's help, e.g.
+`bond-manager swap-member --help`.
 
 ### Read-only commands (no root, write nothing)
 
@@ -292,6 +316,8 @@ Global flags: `-n/--dry-run`, `-y/--yes`, `--json`, `--debug`, `--quiet`,
 | `status [BOND]` | Health summary; exit 0 healthy / 10 degraded / 11 down |
 | `diagnose BOND [--extended] [--target IP]` | Kernel state, member detail, LACP partner, reachability |
 | `doctor` | Environment preflight + protection-tier report |
+| `nics [--all]` | Every network port: link, speed, bond, addresses, and a plain verdict ("free - good to use", "has an IP - probably in use", "carries your SSH connection") |
+| `help [COMMAND\|TOPIC]` | Plain-English help with copy-paste examples; topics: `basics modes lacp safety practice moving glossary keys exit-codes` |
 | `config show\|path` | Effective configuration / config file path |
 | `completion bash` | Emit bash completion script |
 | `verify BOND` | Re-run the verification gate against current state; read-only, exit 1 if a check fails |
@@ -510,22 +536,41 @@ bond-manager status bond0 --json      # {"schema_version":1,"bonds":[{"name":"bo
 (Output of `bond-manager --json show bond0`. The inventory document wraps a
 `bonds` array and adds `generated`, `host`, and `tool_version`.)
 
-## The TUI
+## The guided menus (TUI)
 
-Run `bond-manager` with no arguments on a terminal to get a menu-driven TUI
-(whiptail when installed, plain prompts otherwise; force plain with
-`--plain`). It covers status, diagnostics, create/edit/remove, member swap,
-clone, repair, snapshots, pending-change commit/rollback, support bundles,
-and doctor — through the **same workflow code** as the CLI, so every guard
-(validation, snapshot, checkpoint, verify) applies identically.
+Run `bond-manager` with no arguments on a terminal (or `bond-manager tui`)
+to get the guided menus. Nothing extra needs to be installed: they are
+plain bash.
 
-Before applying, each TUI action prints its CLI equivalent, e.g.:
+- **A home dashboard.** Every bond with its health, its ports (link, speed,
+  which one is active), which port carries *your SSH connection*, and which
+  safety net this server gives you. A change that is still waiting to be
+  kept shows up as a banner with a live countdown.
+- **Plain-language jobs.** *Check my bonds*, *Move a bond to a new switch*,
+  *Build a new bond*, *Change a bond*, *Fix a bond that looks wrong*,
+  *Undo & safety*, *Tools*, *Help*. Each wizard shows "Step 2 of 5", explains
+  why it asks, and goes back one step with Esc.
+- **Pick, don't type.** Ports, modes, members, VLANs and snapshots come
+  from lists with a plain note on each. Typed values (names, addresses)
+  are checked on the spot with a message that says how to fix them.
+- **A review before anything happens.** A summary in plain words, early
+  warnings (e.g. the change touches your SSH connection), and the
+  equivalent command line. Then the engine shows the exact plan and asks
+  once more.
+- **Practice mode** (`p` on the home screen): every job runs as a dry run.
+  It is forced on, with an explanation, when changes are impossible (not
+  root, NetworkManager down).
+- **A countdown you can't miss** after every change: `K` keep, `U` undo,
+  `E` five more minutes. Do nothing and it is undone.
+- **Every guard still applies.** The menus call the same workflow code as
+  the CLI (validation, snapshot, checkpoint, verification). Every action
+  runs isolated, so an error explains itself and returns you to the menu.
 
-```
-CLI equivalent: bond-manager create bond0 --mode 802.3ad --members ens1f0,ens1f1 --ip4 none --vlan '120:ip4=10.20.30.40/24;gw4=10.20.30.1'
-```
-
-so a change rehearsed in the TUI can be scripted for the rest of the fleet.
+Keys: arrows or `j`/`k` move, Enter chooses, `1`-`9` jump, Esc or `q` go
+back, Space ticks a check box. On serial consoles, dumb terminals or with
+`--plain` the menus are numbered prompts instead. Box drawing falls back to
+ASCII without a UTF-8 locale (or with `BM_ASCII=1`), and `NO_COLOR` is
+honored.
 
 ## Configuration
 
@@ -598,9 +643,10 @@ and never touched by a restore.
 Fair question. A tool whose failure mode is "server unreachable until
 someone drives to the datacenter" should have to show its work.
 
-- **289 tests**, across 21 files, run on every change — unit tests for the
+- **412 tests**, across 31 files, run on every change — unit tests for the
   parsers and the safety logic, integration tests that drive the real
-  compiled script end to end.
+  compiled script end to end, including the guided menus driven by
+  scripted keystrokes.
 - The tests **stub `nmcli`, `ip`, `busctl` and `systemd-run` as PATH shims**
   and point the tool at fixture `/proc` and `/sys` trees, so the whole
   transaction engine is exercised without a NetworkManager anywhere in
@@ -646,11 +692,14 @@ lib/30-snap.sh        # snapshots of both profile stores, with manifests; reconc
 lib/33-ckpt.sh        # protection tiers: NM checkpoint / deadman timer / snapshot
 lib/35-verify.sh      # post-apply verification gate
 lib/40-json.sh        # RFC 8259-correct JSON emission
-lib/50-ui.sh          # whiptail/plain prompt widgets
+lib/45-help.sh        # every plain-English text: command help, topics, explanations
+lib/50-ui.sh          # pure-bash terminal toolkit: menus, checklists, input, boxes
 lib/60-plan.sh        # transaction engine: lock, plan, ssh guard, apply, commit gate
 lib/70-workflows.sh   # create/modify/members/vlan/clone/repair/remove workflows
 lib/75-diag.sh        # diagnostics + support bundles
-lib/90-cli.sh         # argument parsing, dispatch, output commands, TUI
+lib/90-cli.sh         # argument parsing and every command
+lib/95-tui.sh         # the guided menus: dashboard, wizards, results
+lib/99-main.sh        # entrypoint: global flags, --help routing, dispatch
 build/build.sh        # deterministic compiler producing bond_manager.sh
 ```
 
@@ -683,8 +732,9 @@ checklist.
   release understands.
 - **Protection tier 1** needs `busctl` and NM reachable on D-Bus; **tier 2**
   needs `systemd-run`. Without either, changes still work snapshot-protected.
-- **whiptail is optional** (`dnf install newt`); the TUI falls back to plain
-  prompts without it.
+- **Nothing extra for the menus.** They are plain bash (no whiptail,
+  no dialog) and fall back to numbered prompts on serial consoles and dumb
+  terminals.
 - `ethtool`, `journalctl`, `logger`, `restorecon` are optional and degrade
   gracefully (`doctor` reports what is missing). `flock` (util-linux) is
   needed for mutating commands.
@@ -694,6 +744,8 @@ checklist.
 
 ## Documentation
 
+- [docs/GUIDE.md](docs/GUIDE.md): the beginner's guide. What a bond is,
+  the menus, the safety net, and step-by-step recipes.
 - [docs/SAFETY.md](docs/SAFETY.md) — the safety model in depth: tiers, SSH
   egress guard, pending-change state, deadman timer, failure matrix,
   recovery runbook.

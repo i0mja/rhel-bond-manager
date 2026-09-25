@@ -1,4 +1,4 @@
-.TH BOND\-MANAGER 8 "2026-08-25" "bond\-manager 3.0.0" "System Administration"
+.TH BOND\-MANAGER 8 "2026-09-25" "bond\-manager 3.1.0" "System Administration"
 .SH NAME
 bond\-manager \- safe NetworkManager bond management for RHEL-like systems
 .SH SYNOPSIS
@@ -9,7 +9,7 @@ bond\-manager \- safe NetworkManager bond management for RHEL-like systems
 .br
 .B bond\-manager
 .RS 4
-(with no command on a terminal: interactive whiptail TUI)
+(with no command on a terminal: the guided menus)
 .RE
 .SH DESCRIPTION
 .B bond\-manager
@@ -39,8 +39,14 @@ below for the protection tiers.
 .PP
 Run with no command on a terminal,
 .B bond\-manager
-starts a menu-driven TUI covering the same workflows; each TUI action
-prints its CLI equivalent so it can be scripted afterwards.
+starts guided menus covering the same workflows (see
+.BR "INTERACTIVE MENUS" );
+each change shows its command-line equivalent so it can be scripted
+afterwards.
+Newcomers: start with
+.B bond\-manager help basics
+or the beginner's guide,
+.IR docs/GUIDE.md .
 .PP
 All mutating invocations are serialized through a single lock (exit code 4
 when another instance holds it), and all of them honor
@@ -86,7 +92,8 @@ Disable colored output (the
 environment variable is also honored).
 .TP
 .B \-\-plain
-Force plain text prompts (skip whiptail).
+Plain numbered menus and prompts instead of arrow-key menus (serial
+consoles, screen readers, basic terminals).
 .TP
 .BI \-\-rollback\-window " SECONDS"
 Auto-rollback window for unconfirmed changes, 10..86400 seconds
@@ -109,6 +116,9 @@ Print version and exit.
 .TP
 .BR \-h ", " \-\-help
 Print usage and exit.
+After a command
+.RB ( "bond\-manager swap\-member \-\-help" ),
+print that command's help instead.
 .TP
 .BR \-\-status ", " \-\-export\-json " \fIPATH\fP"
 Legacy v2.x compatibility flags:
@@ -165,6 +175,27 @@ Environment preflight: required and optional tools, NetworkManager
 state, bonding module, SELinux, config presence, the protection tier
 this host supports, and any pending (unconfirmed) change.
 Exit status 3 when the host is not ready.
+.TP
+.BR nics " [" \-\-all ]
+List the network ports with their link state, speed, bond membership and
+addresses, and a plain verdict per port: free and usable, no link (cable
+or switch port), has an IP (probably in use), or carries the current SSH
+connection.
+Ports hidden by the NIC policy are counted, and listed with
+.BR \-\-all .
+Never calls
+.BR nmcli .
+.TP
+.BR help " [" \fICOMMAND\fP | \fITOPIC\fP ]
+Plain-English help.
+With a command: what it does, usage, copy-paste examples (always starting
+with a
+.B \-n
+preview) and pitfalls.
+Topics:
+.BR basics ", " modes ", " lacp ", " safety ", " practice ", " moving ,
+.BR glossary ", " keys ", " exit\-codes .
+Exit status 2 for an unknown word, with a suggestion.
 .TP
 .BR "config show" " | " "config path"
 Print the effective configuration (defaults overlaid with
@@ -434,6 +465,56 @@ strips IP and MAC addresses for off-site tickets.
 .B init
 Install the default configuration file and logrotate policy, and create
 the backup and support directories.
+.SH INTERACTIVE MENUS
+With no command on a terminal (or with the
+.B tui
+command),
+.B bond\-manager
+shows a dashboard of every bond \(em health, ports, the port carrying the
+current SSH session, the protection tier, and any change waiting to be
+committed, with its countdown \(em and a menu of jobs:
+check bonds, move a bond to a new switch (swap members one at a time),
+build a bond, change a bond (ports, mode, preferred port, IP, MTU, VLANs,
+options, clone, delete), fix drifted profiles, undo and snapshots, tools,
+and help.
+The menus need no extra packages.
+.PP
+Every job goes through the same workflow code as the command line.
+Choices are picked from lists; typed values are validated as they are
+entered.
+Before anything runs, a review screen summarises the change, warns when it
+touches the SSH session's device, and shows the equivalent command line;
+the plan and the commit countdown then appear exactly as on the command
+line.
+.PP
+Practice mode (key
+.BR p )
+runs every job as a dry run.
+It is forced on when changes are impossible (not root, NetworkManager not
+running), and is on from the start with
+.BR \-n .
+.B \-y
+is ignored in the menus.
+.PP
+Keys: Up/Down or
+.BR j / k
+move, Enter chooses,
+.BR 1 \(en 9
+choose by number, Esc or
+.B q
+go back, Space ticks a check box,
+.BR a / n
+tick all/none;
+on the home screen
+.B p
+toggles practice mode,
+.B r
+refreshes,
+.B ?
+opens help and
+.B q
+quits (with a warning if a change is still waiting).
+In plain mode, type the number and press Enter.
 .SH SAFETY MODEL
 Every change is protected by up to three tiers; the strongest available
 tier is chosen automatically
@@ -497,9 +578,20 @@ If verification passes, the auto-rollback window is re-budgeted to a full
 window \(em the time the apply itself consumed does not come out of the
 decision time \(em and the change is committed automatically with
 .BR \-\-yes ;
-otherwise the operator is prompted, and an unconfirmed change is rolled
-back automatically when the rollback window expires (command exits 6
-while the change is pending).
+otherwise the operator is prompted with a countdown \(em
+.B K
+keeps the change,
+.B U
+undoes it,
+.B E
+adds five minutes on the checkpoint tier
+.RB ( c ", " r ", " e
+are accepted too) \(em and an unconfirmed change is rolled back
+automatically when the rollback window expires.
+On the deadman tier the prompt performs that rollback itself when the
+window runs out, since it still holds the lock the timer would need.
+With no terminal to ask on, or when the terminal goes away during the
+countdown, protection stays armed and the command exits 6.
 .PP
 Pending-change state is kept in
 .IR /run/bond\-manager/pending.state ,
@@ -582,6 +674,17 @@ is how the test suite and fixture-based inspection work:
 .PP
 .B NO_COLOR
 disables colored output.
+.B BM_ASCII=1
+draws the menus with ASCII instead of box-drawing characters (automatic
+without a UTF-8 locale or on the Linux console).
+.B BM_PLAIN=1
+is the same as
+.BR \-\-plain .
+Plain menus are also used automatically when
+.B TERM
+is
+.B dumb
+or unset, on serial consoles, and when input or output is not a terminal.
 .SH FILES
 .TP
 .I /etc/bond_manager.conf
@@ -638,6 +741,15 @@ at the top level of this directory; the legacy
 .IR ifup* / ifdown*
 scripts and helper files that also live there are never read or written.
 .SH EXAMPLES
+Find the free ports, and read the help for a command:
+.PP
+.nf
+.RS
+bond\-manager nics
+bond\-manager help swap\-member
+.RE
+.fi
+.PP
 Create an LACP bond with a static address and jumbo frames:
 .PP
 .nf
@@ -703,6 +815,10 @@ bond\-manager snapshot restore 20260825\-141530
 .RE
 .fi
 .SH SEE ALSO
+.B bond\-manager help basics
+and
+.I docs/GUIDE.md
+(the beginner's guide) in the source tree;
 .BR nmcli (1),
 .BR NetworkManager (8),
 .BR ip (8),
