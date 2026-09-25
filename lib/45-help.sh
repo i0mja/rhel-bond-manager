@@ -877,8 +877,8 @@ Usage:
   sudo $p rollback --snapshot ID      restore a specific backup copy
 
 Examples:
-  $p snapshot list
-  $p -n rollback --snapshot 20260101-120000   (what would change)
+  sudo $p snapshot list
+  sudo $p -n rollback --snapshot 20260101-120000  (what would change)
 EOF
       ;;
     snapshot) cat <<EOF
@@ -887,8 +887,8 @@ $p snapshot - backup copies of all saved network settings
 A snapshot is taken automatically before every change.
 
 Usage:
-  $p snapshot list              the copies there are
-  $p snapshot diff ID           what restoring ID would change
+  sudo $p snapshot list         the copies there are
+  sudo $p snapshot diff ID      what restoring ID would change
   sudo $p snapshot create       take one now
   sudo $p snapshot restore [ID] restore one (default: the newest)
   sudo $p snapshot prune        keep only the newest $(bm::config::get MAX_BACKUPS)

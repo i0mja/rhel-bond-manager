@@ -5,12 +5,45 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`commit` from a new session was refused while the old one sat at the
+  gate.** A change to the address you are logged in on freezes that
+  session rather than ending it, so its gate kept holding the lock, and the
+  documented way out (a new session, then `commit`) exited 4. The gate now
+  waits without the lock (the pending change still blocks any new one),
+  takes it back before acting on K, U or E, and when the change is kept or
+  undone elsewhere — or undone by the deadman timer — it says so and exits.
+- **`-n bundle` and a support bundle in practice mode wrote the bundle**
+  (and turned on file logging), although `-n` promises to write nothing.
+  They now say where the bundle would go and what it would contain.
+- **`snapshot list` without root said "No snapshots"** (and `snapshot
+  diff` / `-n rollback --snapshot` said "not found") because the backup
+  folder is readable by root only. They now say so and give the command
+  with `sudo`; the examples in `help` and the guide use `sudo`.
+- The menus and the guide said the SSH guard only refuses on servers with
+  no automatic undo; it refuses whenever NetworkManager cannot undo the
+  change itself, the timer tier included. The guide's dashboard picture
+  put the SSH mark on a port; the dashboard marks the bond (or VLAN).
+- **The commit gate on a narrow terminal** (a tmux split, a phone SSH
+  client) cut the two sentences explaining the safety net, and below about
+  60 columns the countdown itself; after a resize every redraw left a stale
+  copy of the status line. The safety text now wraps, the countdown comes
+  first on the status line, and the gate redraws itself after a resize.
+- **Help topics taller than the screen** scrolled their start away, which
+  consoles without scrollback (a Linux VT, iLO/iDRAC, serial) cannot bring
+  back. On a terminal they are now shown a page at a time.
+- **Ctrl-Z in the arrow-key menus** stopped them with the cursor hidden and
+  the terminal raw. Suspend is now off while the menus own the keyboard.
+
 ## [3.1.0] - 2026-09-25
 
 Anyone should be able to pick this tool up at 2am and not get hurt. This
 release rebuilds the menus in pure bash and makes every screen, prompt and
 error explain itself in plain words. The safety engine is unchanged except
-for the fixes below; exit codes (except one, see *Changed*) and the JSON
+for the fixes below; exit codes (except two, see *Changed*) and the JSON
 schema are unchanged.
 
 ### Added
@@ -88,6 +121,8 @@ schema are unchanged.
   It used to exit 1 with a raw shell message.
 - **An unknown command** prints a suggestion and a pointer to `help`
   instead of dumping the whole usage text. It still exits 2.
+- **`help` with a word it does not know** (`help foo`, `help --all`) now
+  exits 2 with a suggestion; it printed the usage and exited 0 before.
 - **The deadman timer is armed with `AccuracySec=1s`**, so it fires at the
   deadline instead of up to a minute late.
 - **whiptail is no longer used**, and `doctor` no longer lists it.

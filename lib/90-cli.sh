@@ -961,6 +961,7 @@ bm::cli::cmd_rollback() {
   done
 
   if (( BM_DRY_RUN )); then
+    bm::cli::_need_backup_access
     if [[ -z "$snapshot" ]] && bm::ckpt::load_pending; then
       bm::log::say "[dry-run] would roll back the pending change: ${BM_PENDING_SUMMARY:-?} (tier ${BM_PENDING_TIER:-?}, snapshot ${BM_PENDING_SNAPSHOT:-?})"
       return "$BM_EX_OK"
@@ -1031,7 +1032,9 @@ bm::cli::cmd_rollback() {
   # disarm it first so nothing fires later on top of the restored profiles.
   if (( had_pending )); then
     bm::log::warn "disarming pending change protection before an explicit snapshot restore"
+    BM_CKPT_SETTLE_AS=restored
     bm::ckpt::commit >/dev/null 2>&1 || true
+    BM_CKPT_SETTLE_AS=""
   fi
 
   bm::snap::restore "$snapshot"
@@ -1039,9 +1042,23 @@ bm::cli::cmd_rollback() {
   return "$BM_EX_OK"
 }
 
+# The backup folder is readable by root only (0750): to anyone else it looks
+# empty, which must not come out as "no snapshots" or "not found".
+bm::cli::_need_backup_access() {
+  if [[ -d "$BM_BACKUP_DIR" ]] && ! bm::core::is_root && [[ ! -r "$BM_BACKUP_DIR" || ! -x "$BM_BACKUP_DIR" ]]; then
+    local hint="run it with sudo: sudo $BM_PROG"
+    if [[ -n "$BM_CMDLINE" ]]; then hint="run it again with sudo: sudo $BM_PROG ${BM_CMDLINE% }"; fi
+    bm::core::die "the backup folder $BM_BACKUP_DIR can only be read by root" "$BM_EX_PRECONDITION" "$hint"
+  fi
+  return 0
+}
+
 bm::cli::cmd_snapshot() {
   local action="${1:-list}"
   shift || true
+  case "$action" in
+    list | diff | restore) bm::cli::_need_backup_access ;;
+  esac
   case "$action" in
     create)
       if (( BM_DRY_RUN )); then
@@ -1102,6 +1119,12 @@ bm::cli::cmd_bundle() {
       *) bm::core::die "usage: $BM_PROG bundle [--output PATH] [--redact]" "$BM_EX_USAGE" ;;
     esac
   done
+  if (( BM_DRY_RUN )); then # -n writes nothing, not even a bundle
+    bm::log::say "[dry-run] would write a support bundle to ${out:-$BM_SUPPORT_DIR/support_<time>.tar.gz}$( ((redact)) && printf ' (addresses redacted)')"
+    bm::log::say "  with: NetworkManager profiles and devices, ip link/addr/route, the NetworkManager journal, /proc/net/bonding, a diagnosis of every bond, bond-manager's log and config"
+    BM_PLAN_OUTCOME=dry-run
+    return "$BM_EX_OK"
+  fi
   bm::core::require_root
   bm::log::enable_file
   bm::diag::bundle "$out" "$redact" || bm::core::die "support bundle creation failed" "$BM_EX_ERR"

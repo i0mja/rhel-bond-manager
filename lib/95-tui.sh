@@ -1101,7 +1101,7 @@ bm::tui::review() { # review <subcommand> <summary-line>...
     if [[ "$BM_TUI_TIER" == checkpoint ]]; then
       bm::ui::warn "This touches $touched, which carries your SSH connection. If it cuts you off: wait - it is undone automatically, then you can reconnect."
     else
-      bm::ui::err "This touches $touched, which carries your SSH connection, and this server has no automatic undo. bond-manager will refuse it here - make this change from the server console instead."
+      bm::ui::err "This touches $touched, which carries your SSH connection, and NetworkManager cannot undo changes itself on this server (a timer is not guaranteed to run once you are cut off). bond-manager will refuse it here - make this change from the server console instead."
     fi
   fi
   bm::wf::cli_equivalent "$sub"
@@ -2219,10 +2219,10 @@ bm::tui::help_menu() {
       done
       bm::ui::menu -- "Which command?" "${citems[@]}" || continue
       printf '\n' >&2
-      bm::ui::block "$(bm::help::command "$BM_UI_REPLY")"
+      bm::ui::page "$(bm::help::command "$BM_UI_REPLY")"
     else
       printf '\n' >&2
-      bm::ui::block "$(bm::help::topic "$BM_UI_REPLY")"
+      bm::ui::page "$(bm::help::topic "$BM_UI_REPLY")"
     fi
     bm::ui::pause
   done

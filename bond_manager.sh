@@ -1832,6 +1832,22 @@ bm::ckpt::load_pending() {
 
 bm::ckpt::clear_pending() { rm -f "$(bm::ckpt::state_file)"; }
 
+# How the last waiting change ended, for a commit gate still waiting on it
+# in another process: "snapshot=<id> how=kept|undone|timer|restored".
+BM_CKPT_SETTLE_AS="" # overrides "kept" when a commit only disarms (a restore)
+bm::ckpt::settled_file() { printf '%s/settled' "$BM_RUN_DIR"; }
+bm::ckpt::_mark_settled() { # _mark_settled <how>
+  printf 'snapshot=%s how=%s\n' "${BM_PENDING_SNAPSHOT:-}" "$1" \
+    >"$(bm::ckpt::settled_file)" 2>/dev/null || true
+}
+bm::ckpt::settled_how() { # settled_how <snapshot-id> -> how, or nothing
+  local line=""
+  line="$(cat "$(bm::ckpt::settled_file)" 2>/dev/null || true)"
+  if [[ -n "$1" && "$line" == "snapshot=$1 how="* ]]; then
+    printf '%s' "${line##* how=}"
+  fi
+}
+
 # Reset the auto-rollback deadline to a full window. Applying a plan consumes
 # real time (each activation can take up to ACTIVATE_TIMEOUT), so without this
 # the operator would get whatever is left of the window to decide — sometimes
@@ -1894,6 +1910,8 @@ bm::ckpt::commit() {
       [[ -n "$BM_PENDING_UNIT" ]] && bm::ckpt::deadman_cancel "$BM_PENDING_UNIT"
       ;;
   esac
+  # the marker first: a gate watching for pending.state to go must find it
+  bm::ckpt::_mark_settled "${BM_CKPT_SETTLE_AS:-kept}"
   bm::ckpt::clear_pending
   if (( rc == 0 )); then
     bm::log::info "committed pending change (tier=$BM_PENDING_TIER)"
@@ -1906,7 +1924,8 @@ bm::ckpt::commit() {
 # rollback: revert the pending change through whichever tier is armed.
 bm::ckpt::rollback_pending() {
   bm::ckpt::load_pending || return 1
-  local ok=0
+  local ok=0 how=undone
+  if (( BM_CKPT_IN_DEADMAN )); then how=timer; fi
   case "$BM_PENDING_TIER" in
     checkpoint)
       if [[ -n "$BM_PENDING_PATH" ]] && bm::ckpt::dbus_rollback "$BM_PENDING_PATH"; then
@@ -1928,6 +1947,7 @@ bm::ckpt::rollback_pending() {
     fi
     bm::snap::restore "$BM_PENDING_SNAPSHOT"
     ok=1
+    bm::ckpt::_mark_settled "$how"
     bm::ckpt::clear_pending
     if (( ${#devs[@]} > 0 )); then
       bm::ckpt::reapply "$before" || ok=0
@@ -1935,6 +1955,7 @@ bm::ckpt::rollback_pending() {
       bm::ckpt::_problem "the saved settings are restored, but this change did not record which connections it touched (it was armed by an older version): running connections keep their settings until brought up again, e.g. nmcli connection up NAME"
     fi
   fi
+  bm::ckpt::_mark_settled "$how"
   bm::ckpt::clear_pending
   (( ok ))
 }
@@ -3196,8 +3217,8 @@ Usage:
   sudo $p rollback --snapshot ID      restore a specific backup copy
 
 Examples:
-  $p snapshot list
-  $p -n rollback --snapshot 20260101-120000   (what would change)
+  sudo $p snapshot list
+  sudo $p -n rollback --snapshot 20260101-120000  (what would change)
 EOF
       ;;
     snapshot) cat <<EOF
@@ -3206,8 +3227,8 @@ $p snapshot - backup copies of all saved network settings
 A snapshot is taken automatically before every change.
 
 Usage:
-  $p snapshot list              the copies there are
-  $p snapshot diff ID           what restoring ID would change
+  sudo $p snapshot list         the copies there are
+  sudo $p snapshot diff ID      what restoring ID would change
   sudo $p snapshot create       take one now
   sudo $p snapshot restore [ID] restore one (default: the newest)
   sudo $p snapshot prune        keep only the newest $(bm::config::get MAX_BACKUPS)
@@ -3540,6 +3561,37 @@ bm::ui::block() { # block <text>
   done <<<"$1"
 }
 
+# Long text one screenful at a time, so its start does not scroll away on
+# consoles with little or no scrollback (a Linux VT, iLO/iDRAC, serial).
+# Only on a terminal: a piped session gets it all at once, as before.
+bm::ui::page() { # page <text>
+  bm::ui::_ensure_init
+  local -a plines=()
+  mapfile -t plines <<<"$1"
+  bm::ui::_size
+  local per=$(( BM_UI_ROWS - 3 )) i=0 ans rc
+  if [[ ! -t 0 ]] || (( per < 5 || ${#plines[@]} <= per + 1 )); then
+    bm::ui::block "$1"
+    return 0
+  fi
+  while (( i < ${#plines[@]} )); do
+    printf '  %s\n' "${plines[@]:i:per}" >&2
+    i=$(( i + per ))
+    (( i < ${#plines[@]} )) || break
+    printf '%s-- more: Enter for the next page, q to stop (%d of %d lines) --%s' \
+      "$BM_S_DIM" "$i" "${#plines[@]}" "$BM_S_RST" >&2
+    rc=0
+    bm::ui::_read_line || rc=$?
+    ans="$BM_UI_LINE"
+    printf '\r\033[K' >&2
+    if (( rc != 0 )) || [[ "${ans,,}" == q* ]]; then
+      (( rc == 1 )) && BM_UI_EOF=1
+      break
+    fi
+  done
+  return 0
+}
+
 # A bordered box. Lines are fitted to the width (never wrap).
 bm::ui::box() { # box [--title T] [--badge B] [--style ok|warn|err|info] -- line...
   bm::ui::_ensure_init
@@ -3632,7 +3684,9 @@ bm::ui::_raw_on() {
   if [[ -z "$BM_TTY_SAVED" ]]; then
     BM_TTY_SAVED="$(stty -g 2>/dev/null || true)"
   fi
-  stty -echo -icanon min 1 time 0 2>/dev/null || true
+  # susp undef: Ctrl-Z would stop the menus with the cursor hidden and the
+  # terminal raw; the saved settings bring it back when the menus let go
+  stty -echo -icanon min 1 time 0 susp undef 2>/dev/null || true
   printf '\033[?25l' >&2
   BM_TTY_CURSOR_HIDDEN=1
 }
@@ -4614,21 +4668,27 @@ bm::ui::msg() { # msg <text> — show text, then wait for Enter
 
 bm::ui::gate_intro() { # gate_intro <tier>
   bm::ui::_ensure_init
-  local tier="$1"
-  local -a lines=("$BM_S_GREEN$BM_G_OK All checks passed - your change is live.$BM_S_RST" "")
+  local tier="$1" t
+  local -a lines=("$BM_S_GREEN$BM_G_OK All checks passed - your change is live.$BM_S_RST" "") text=()
   if [[ "$tier" == snapshot ]]; then
-    lines+=("Nothing will undo it automatically on this server."
-      "  K  keep it       U  undo it now (restore the backup copy)")
+    text=("Nothing will undo it automatically on this server.")
   else
-    lines+=("If you do nothing, it is UNDONE automatically when the time runs out."
+    text=("If you do nothing, it is UNDONE automatically when the time runs out."
       "That is the safety net: if this change cut your connection, just wait.")
-    lines+=("")
-    if [[ "$tier" == checkpoint ]]; then
-      lines+=("  K  keep it       U  undo it now       E  5 more minutes")
-    else
-      lines+=("  K  keep it       U  undo it now")
-    fi
   fi
+  # wrapped, not cut: on a narrow terminal (a tmux split, a phone) these
+  # sentences are the point of the box
+  bm::ui::width
+  for t in "${text[@]}"; do
+    bm::ui::wrap $(( BM_UI_W - 4 )) "$t"
+    lines+=("${BM_UI_WRAPPED[@]}")
+  done
+  lines+=("")
+  case "$tier" in
+    snapshot) lines+=("  K  keep it       U  undo it now (restore the backup copy)") ;;
+    checkpoint) lines+=("  K  keep it       U  undo it now       E  5 more minutes") ;;
+    *) lines+=("  K  keep it       U  undo it now") ;;
+  esac
   printf '\n' >&2
   bm::ui::box --title "Keep this change?" --style ok -- "${lines[@]}"
   BM_UI_DRAWN=0
@@ -4648,7 +4708,8 @@ bm::ui::gate_status() { # gate_status <seconds-left> <tier> [message]
   elif (( left <= 60 )); then
     col="$BM_S_YELLOW"
   fi
-  bm::ui::_frame "$BM_S_BOLD""Keep this change?$BM_S_RST  [K]eep  [U]ndo$ext   Auto-undo in $col$BM_S_BOLD$BM_UI_FMT$BM_S_RST" "$note"
+  # the countdown first: on a narrow terminal the end of the line is cut
+  bm::ui::_frame "Auto-undo in $col$BM_S_BOLD$BM_UI_FMT$BM_S_RST   ${BM_S_BOLD}[K]eep  [U]ndo$ext$BM_S_RST" "$note"
 }
 
 # ==== 60-plan.sh ====
@@ -4676,6 +4737,31 @@ bm::lock::acquire() {
     >"$BM_RUN_DIR/lockinfo" 2>/dev/null || true
 }
 
+# The commit gate lets go of the lock while it waits for the operator, so a
+# second session can commit or roll back (a change to the address you are
+# logged in on leaves the first session frozen, not gone) and the deadman
+# timer can do its job. pending.state still refuses any new change.
+bm::lock::release() {
+  [[ -n "$BM_LOCK_FD" ]] || return 0
+  rm -f "$BM_RUN_DIR/lockinfo"
+  flock -u "$BM_LOCK_FD" 2>/dev/null || true
+  exec {BM_LOCK_FD}>&-
+  BM_LOCK_FD=""
+}
+
+bm::lock::retake() { # retake [wait-seconds] -> 1 when another session keeps it
+  [[ -z "$BM_LOCK_FD" ]] || return 0
+  local fd
+  exec {fd}>"$BM_RUN_DIR/lock"
+  if ! flock -w "${1:-30}" "$fd"; then
+    exec {fd}>&-
+    return 1
+  fi
+  BM_LOCK_FD="$fd"
+  printf 'pid=%s cmd=%s started=%s\n' "$$" "${BM_LOG_OP:-?}" "$(bm::core::timestamp)" \
+    >"$BM_RUN_DIR/lockinfo" 2>/dev/null || true
+}
+
 # ---- plan model -----------------------------------------------------------
 
 BM_PLAN_DESCS=()
@@ -4683,6 +4769,7 @@ BM_PLAN_CMDS=()
 
 # How the last apply ended, in one word, for the menus to explain:
 # noop | dry-run | cancelled | committed | rolled-back | expired | pending | lost
+# | gone (settled by another session while the gate waited, how unknown)
 BM_PLAN_OUTCOME=""
 
 bm::plan::reset() {
@@ -5032,6 +5119,59 @@ bm::plan::_gate_extend() { # _gate_extend <seconds-left> -> 0 when extended
   return 1
 }
 
+# While the gate waits it holds no lock, so the change can be settled
+# elsewhere. 0 = settled (BM_GATE_SETTLED says how), 1 = still ours to decide.
+BM_GATE_SETTLED=""
+bm::plan::_gate_settled() { # _gate_settled <snapshot-id>
+  if bm::ckpt::load_pending && [[ "${BM_PENDING_SNAPSHOT:-}" == "$1" ]]; then
+    return 1
+  fi
+  BM_GATE_SETTLED="$(bm::ckpt::settled_how "$1")"
+  return 0
+}
+
+bm::plan::_gate_report_settled() { # -> rc of the gate
+  echo
+  case "$BM_GATE_SETTLED" in
+    kept)
+      BM_PLAN_OUTCOME=committed
+      bm::log::say "$(bm::core::c_ok "The change was kept from another session.")"
+      return "$BM_EX_OK" ;;
+    timer)
+      BM_PLAN_OUTCOME=expired
+      bm::log::say "$(bm::core::c_warn "The safety net undid the change: its time ran out.")"
+      return "$BM_EX_VERIFY" ;;
+    undone)
+      BM_PLAN_OUTCOME=rolled-back
+      bm::log::say "$(bm::core::c_warn "The change was undone from another session.")"
+      return "$BM_EX_VERIFY" ;;
+    restored)
+      BM_PLAN_OUTCOME=rolled-back
+      bm::log::say "$(bm::core::c_warn "A backup copy was restored from another session; this change is no longer waiting.")"
+      return "$BM_EX_VERIFY" ;;
+    *)
+      BM_PLAN_OUTCOME=gone
+      bm::log::say "$(bm::core::c_warn "The change is no longer waiting: it was settled from another session.")"
+      return "$BM_EX_OK" ;;
+  esac
+}
+
+# Take the lock back before acting on the operator's answer, then make sure
+# the change is still waiting. rc 0 = go ahead, 1 = settled meanwhile
+# (reported; the gate returns BM_GATE_RC), 2 = the lock is busy.
+BM_GATE_RC=0
+bm::plan::_gate_claim() { # _gate_claim <snapshot-id> [wait-seconds]
+  if ! bm::lock::retake "${2:-30}"; then
+    return 2
+  fi
+  if bm::plan::_gate_settled "$1"; then
+    BM_GATE_RC=0
+    bm::plan::_gate_report_settled || BM_GATE_RC=$?
+    return 1
+  fi
+  return 0
+}
+
 # Interactive commit gate: count down toward the auto-rollback deadline.
 # K (or c) keeps the change, U (or r) undoes it, E adds five minutes on the
 # checkpoint tier. End of input on the terminal behaves like having no
@@ -5048,17 +5188,26 @@ bm::plan::commit_gate() {
     return $?
   fi
 
-  local key remaining now rc
+  local key remaining now rc crc
   # Keys typed while the plan ran are not answers: the operator has not seen
   # the verification result yet.
   while IFS= read -rsn1 -t 0.01 key; do :; done
+  bm::lock::release
   while :; do
+    if bm::plan::_gate_settled "$snap"; then
+      bm::plan::_gate_report_settled
+      return $?
+    fi
     printf -v now '%(%s)T' -1
     remaining=$(( ${BM_CKPT_DEADLINE:-0} - now ))
     if [[ "$BM_CKPT_TIER" == snapshot ]]; then
       remaining=999999 # no timer armed; purely manual decision
     fi
     if (( remaining <= 0 )); then
+      # the deadman timer may be restoring right now: wait for it
+      crc=0
+      bm::plan::_gate_claim "$snap" 120 || crc=$?
+      if (( crc == 1 )); then return "$BM_GATE_RC"; fi
       bm::plan::_gate_expired "$snap"
       return $?
     fi
@@ -5081,6 +5230,17 @@ bm::plan::commit_gate() {
     fi
     echo
     case "$key" in
+      c | C | k | K | r | R | u | U | e | E)
+        crc=0
+        bm::plan::_gate_claim "$snap" || crc=$?
+        if (( crc == 1 )); then return "$BM_GATE_RC"; fi
+        if (( crc == 2 )); then
+          bm::log::say "Another bond-manager is busy right now; press the key again in a moment."
+          continue
+        fi
+        ;;
+    esac
+    case "$key" in
       c | C | k | K)
         bm::plan::_gate_keep
         return $?
@@ -5095,6 +5255,7 @@ bm::plan::commit_gate() {
         else
           bm::log::say "Only a NetworkManager checkpoint can be extended; this change is protected differently."
         fi
+        bm::lock::release
         ;;
       *)
         bm::log::say "Press c (or K) to keep the change, r (or U) to undo it."
@@ -5104,11 +5265,28 @@ bm::plan::commit_gate() {
 }
 
 bm::plan::_gate_fancy() { # _gate_fancy <snapshot-id>
-  local snap="$1" remaining now rc msg="" grc
+  local snap="$1" remaining now rc msg="" grc crc cols
+  bm::ui::_size
+  cols="$BM_UI_COLS"
   bm::ui::gate_intro "$BM_CKPT_TIER"
   bm::ui::_raw_on
   bm::ui::_drain
+  bm::lock::release
   while :; do
+    # nothing traps SIGWINCH here: look at the size every tick, and redraw
+    # everything after a resize (the old lines have reflowed)
+    bm::ui::_size
+    if [[ "$BM_UI_COLS" != "$cols" ]]; then
+      cols="$BM_UI_COLS"
+      printf '\033[H\033[2J' >&2
+      bm::ui::gate_intro "$BM_CKPT_TIER"
+    fi
+    if bm::plan::_gate_settled "$snap"; then
+      bm::ui::_raw_off
+      bm::ui::_commit_block
+      bm::plan::_gate_report_settled
+      return $?
+    fi
     printf -v now '%(%s)T' -1
     remaining=$(( ${BM_CKPT_DEADLINE:-0} - now ))
     if [[ "$BM_CKPT_TIER" == snapshot ]]; then
@@ -5117,6 +5295,9 @@ bm::plan::_gate_fancy() { # _gate_fancy <snapshot-id>
     if (( remaining <= 0 )); then
       bm::ui::_raw_off
       bm::ui::_commit_block
+      crc=0
+      bm::plan::_gate_claim "$snap" 120 || crc=$?
+      if (( crc == 1 )); then return "$BM_GATE_RC"; fi
       bm::plan::_gate_expired "$snap"
       return $?
     fi
@@ -5132,6 +5313,22 @@ bm::plan::_gate_fancy() { # _gate_fancy <snapshot-id>
     fi
     (( rc == 0 )) || continue
     msg=""
+    case "$BM_UI_KEY" in
+      k | K | c | C | u | U | r | R | e | E)
+        crc=0
+        bm::plan::_gate_claim "$snap" 5 >/dev/null 2>&1 || crc=$?
+        if (( crc == 2 )); then
+          msg="Another bond-manager is busy right now; press the key again in a moment."
+          continue
+        fi
+        if (( crc == 1 )); then
+          bm::ui::_raw_off
+          bm::ui::_commit_block
+          bm::plan::_gate_report_settled || true
+          return "$BM_GATE_RC"
+        fi
+        ;;
+    esac
     case "$BM_UI_KEY" in
       k | K | c | C)
         bm::ui::_raw_off
@@ -5155,6 +5352,7 @@ bm::plan::_gate_fancy() { # _gate_fancy <snapshot-id>
         else
           msg="Could not extend - decide before the time runs out."
         fi
+        bm::lock::release
         ;;
       RESIZE)
         BM_UI_RESIZED=0
@@ -7244,6 +7442,7 @@ bm::cli::cmd_rollback() {
   done
 
   if (( BM_DRY_RUN )); then
+    bm::cli::_need_backup_access
     if [[ -z "$snapshot" ]] && bm::ckpt::load_pending; then
       bm::log::say "[dry-run] would roll back the pending change: ${BM_PENDING_SUMMARY:-?} (tier ${BM_PENDING_TIER:-?}, snapshot ${BM_PENDING_SNAPSHOT:-?})"
       return "$BM_EX_OK"
@@ -7314,7 +7513,9 @@ bm::cli::cmd_rollback() {
   # disarm it first so nothing fires later on top of the restored profiles.
   if (( had_pending )); then
     bm::log::warn "disarming pending change protection before an explicit snapshot restore"
+    BM_CKPT_SETTLE_AS=restored
     bm::ckpt::commit >/dev/null 2>&1 || true
+    BM_CKPT_SETTLE_AS=""
   fi
 
   bm::snap::restore "$snapshot"
@@ -7322,9 +7523,23 @@ bm::cli::cmd_rollback() {
   return "$BM_EX_OK"
 }
 
+# The backup folder is readable by root only (0750): to anyone else it looks
+# empty, which must not come out as "no snapshots" or "not found".
+bm::cli::_need_backup_access() {
+  if [[ -d "$BM_BACKUP_DIR" ]] && ! bm::core::is_root && [[ ! -r "$BM_BACKUP_DIR" || ! -x "$BM_BACKUP_DIR" ]]; then
+    local hint="run it with sudo: sudo $BM_PROG"
+    if [[ -n "$BM_CMDLINE" ]]; then hint="run it again with sudo: sudo $BM_PROG ${BM_CMDLINE% }"; fi
+    bm::core::die "the backup folder $BM_BACKUP_DIR can only be read by root" "$BM_EX_PRECONDITION" "$hint"
+  fi
+  return 0
+}
+
 bm::cli::cmd_snapshot() {
   local action="${1:-list}"
   shift || true
+  case "$action" in
+    list | diff | restore) bm::cli::_need_backup_access ;;
+  esac
   case "$action" in
     create)
       if (( BM_DRY_RUN )); then
@@ -7385,6 +7600,12 @@ bm::cli::cmd_bundle() {
       *) bm::core::die "usage: $BM_PROG bundle [--output PATH] [--redact]" "$BM_EX_USAGE" ;;
     esac
   done
+  if (( BM_DRY_RUN )); then # -n writes nothing, not even a bundle
+    bm::log::say "[dry-run] would write a support bundle to ${out:-$BM_SUPPORT_DIR/support_<time>.tar.gz}$( ((redact)) && printf ' (addresses redacted)')"
+    bm::log::say "  with: NetworkManager profiles and devices, ip link/addr/route, the NetworkManager journal, /proc/net/bonding, a diagnosis of every bond, bond-manager's log and config"
+    BM_PLAN_OUTCOME=dry-run
+    return "$BM_EX_OK"
+  fi
   bm::core::require_root
   bm::log::enable_file
   bm::diag::bundle "$out" "$redact" || bm::core::die "support bundle creation failed" "$BM_EX_ERR"
@@ -8544,7 +8765,7 @@ bm::tui::review() { # review <subcommand> <summary-line>...
     if [[ "$BM_TUI_TIER" == checkpoint ]]; then
       bm::ui::warn "This touches $touched, which carries your SSH connection. If it cuts you off: wait - it is undone automatically, then you can reconnect."
     else
-      bm::ui::err "This touches $touched, which carries your SSH connection, and this server has no automatic undo. bond-manager will refuse it here - make this change from the server console instead."
+      bm::ui::err "This touches $touched, which carries your SSH connection, and NetworkManager cannot undo changes itself on this server (a timer is not guaranteed to run once you are cut off). bond-manager will refuse it here - make this change from the server console instead."
     fi
   fi
   bm::wf::cli_equivalent "$sub"
@@ -9662,10 +9883,10 @@ bm::tui::help_menu() {
       done
       bm::ui::menu -- "Which command?" "${citems[@]}" || continue
       printf '\n' >&2
-      bm::ui::block "$(bm::help::command "$BM_UI_REPLY")"
+      bm::ui::page "$(bm::help::command "$BM_UI_REPLY")"
     else
       printf '\n' >&2
-      bm::ui::block "$(bm::help::topic "$BM_UI_REPLY")"
+      bm::ui::page "$(bm::help::topic "$BM_UI_REPLY")"
     fi
     bm::ui::pause
   done

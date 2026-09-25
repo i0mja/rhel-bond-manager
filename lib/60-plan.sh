@@ -25,6 +25,31 @@ bm::lock::acquire() {
     >"$BM_RUN_DIR/lockinfo" 2>/dev/null || true
 }
 
+# The commit gate lets go of the lock while it waits for the operator, so a
+# second session can commit or roll back (a change to the address you are
+# logged in on leaves the first session frozen, not gone) and the deadman
+# timer can do its job. pending.state still refuses any new change.
+bm::lock::release() {
+  [[ -n "$BM_LOCK_FD" ]] || return 0
+  rm -f "$BM_RUN_DIR/lockinfo"
+  flock -u "$BM_LOCK_FD" 2>/dev/null || true
+  exec {BM_LOCK_FD}>&-
+  BM_LOCK_FD=""
+}
+
+bm::lock::retake() { # retake [wait-seconds] -> 1 when another session keeps it
+  [[ -z "$BM_LOCK_FD" ]] || return 0
+  local fd
+  exec {fd}>"$BM_RUN_DIR/lock"
+  if ! flock -w "${1:-30}" "$fd"; then
+    exec {fd}>&-
+    return 1
+  fi
+  BM_LOCK_FD="$fd"
+  printf 'pid=%s cmd=%s started=%s\n' "$$" "${BM_LOG_OP:-?}" "$(bm::core::timestamp)" \
+    >"$BM_RUN_DIR/lockinfo" 2>/dev/null || true
+}
+
 # ---- plan model -----------------------------------------------------------
 
 BM_PLAN_DESCS=()
@@ -32,6 +57,7 @@ BM_PLAN_CMDS=()
 
 # How the last apply ended, in one word, for the menus to explain:
 # noop | dry-run | cancelled | committed | rolled-back | expired | pending | lost
+# | gone (settled by another session while the gate waited, how unknown)
 BM_PLAN_OUTCOME=""
 
 bm::plan::reset() {
@@ -381,6 +407,59 @@ bm::plan::_gate_extend() { # _gate_extend <seconds-left> -> 0 when extended
   return 1
 }
 
+# While the gate waits it holds no lock, so the change can be settled
+# elsewhere. 0 = settled (BM_GATE_SETTLED says how), 1 = still ours to decide.
+BM_GATE_SETTLED=""
+bm::plan::_gate_settled() { # _gate_settled <snapshot-id>
+  if bm::ckpt::load_pending && [[ "${BM_PENDING_SNAPSHOT:-}" == "$1" ]]; then
+    return 1
+  fi
+  BM_GATE_SETTLED="$(bm::ckpt::settled_how "$1")"
+  return 0
+}
+
+bm::plan::_gate_report_settled() { # -> rc of the gate
+  echo
+  case "$BM_GATE_SETTLED" in
+    kept)
+      BM_PLAN_OUTCOME=committed
+      bm::log::say "$(bm::core::c_ok "The change was kept from another session.")"
+      return "$BM_EX_OK" ;;
+    timer)
+      BM_PLAN_OUTCOME=expired
+      bm::log::say "$(bm::core::c_warn "The safety net undid the change: its time ran out.")"
+      return "$BM_EX_VERIFY" ;;
+    undone)
+      BM_PLAN_OUTCOME=rolled-back
+      bm::log::say "$(bm::core::c_warn "The change was undone from another session.")"
+      return "$BM_EX_VERIFY" ;;
+    restored)
+      BM_PLAN_OUTCOME=rolled-back
+      bm::log::say "$(bm::core::c_warn "A backup copy was restored from another session; this change is no longer waiting.")"
+      return "$BM_EX_VERIFY" ;;
+    *)
+      BM_PLAN_OUTCOME=gone
+      bm::log::say "$(bm::core::c_warn "The change is no longer waiting: it was settled from another session.")"
+      return "$BM_EX_OK" ;;
+  esac
+}
+
+# Take the lock back before acting on the operator's answer, then make sure
+# the change is still waiting. rc 0 = go ahead, 1 = settled meanwhile
+# (reported; the gate returns BM_GATE_RC), 2 = the lock is busy.
+BM_GATE_RC=0
+bm::plan::_gate_claim() { # _gate_claim <snapshot-id> [wait-seconds]
+  if ! bm::lock::retake "${2:-30}"; then
+    return 2
+  fi
+  if bm::plan::_gate_settled "$1"; then
+    BM_GATE_RC=0
+    bm::plan::_gate_report_settled || BM_GATE_RC=$?
+    return 1
+  fi
+  return 0
+}
+
 # Interactive commit gate: count down toward the auto-rollback deadline.
 # K (or c) keeps the change, U (or r) undoes it, E adds five minutes on the
 # checkpoint tier. End of input on the terminal behaves like having no
@@ -397,17 +476,26 @@ bm::plan::commit_gate() {
     return $?
   fi
 
-  local key remaining now rc
+  local key remaining now rc crc
   # Keys typed while the plan ran are not answers: the operator has not seen
   # the verification result yet.
   while IFS= read -rsn1 -t 0.01 key; do :; done
+  bm::lock::release
   while :; do
+    if bm::plan::_gate_settled "$snap"; then
+      bm::plan::_gate_report_settled
+      return $?
+    fi
     printf -v now '%(%s)T' -1
     remaining=$(( ${BM_CKPT_DEADLINE:-0} - now ))
     if [[ "$BM_CKPT_TIER" == snapshot ]]; then
       remaining=999999 # no timer armed; purely manual decision
     fi
     if (( remaining <= 0 )); then
+      # the deadman timer may be restoring right now: wait for it
+      crc=0
+      bm::plan::_gate_claim "$snap" 120 || crc=$?
+      if (( crc == 1 )); then return "$BM_GATE_RC"; fi
       bm::plan::_gate_expired "$snap"
       return $?
     fi
@@ -430,6 +518,17 @@ bm::plan::commit_gate() {
     fi
     echo
     case "$key" in
+      c | C | k | K | r | R | u | U | e | E)
+        crc=0
+        bm::plan::_gate_claim "$snap" || crc=$?
+        if (( crc == 1 )); then return "$BM_GATE_RC"; fi
+        if (( crc == 2 )); then
+          bm::log::say "Another bond-manager is busy right now; press the key again in a moment."
+          continue
+        fi
+        ;;
+    esac
+    case "$key" in
       c | C | k | K)
         bm::plan::_gate_keep
         return $?
@@ -444,6 +543,7 @@ bm::plan::commit_gate() {
         else
           bm::log::say "Only a NetworkManager checkpoint can be extended; this change is protected differently."
         fi
+        bm::lock::release
         ;;
       *)
         bm::log::say "Press c (or K) to keep the change, r (or U) to undo it."
@@ -453,11 +553,28 @@ bm::plan::commit_gate() {
 }
 
 bm::plan::_gate_fancy() { # _gate_fancy <snapshot-id>
-  local snap="$1" remaining now rc msg="" grc
+  local snap="$1" remaining now rc msg="" grc crc cols
+  bm::ui::_size
+  cols="$BM_UI_COLS"
   bm::ui::gate_intro "$BM_CKPT_TIER"
   bm::ui::_raw_on
   bm::ui::_drain
+  bm::lock::release
   while :; do
+    # nothing traps SIGWINCH here: look at the size every tick, and redraw
+    # everything after a resize (the old lines have reflowed)
+    bm::ui::_size
+    if [[ "$BM_UI_COLS" != "$cols" ]]; then
+      cols="$BM_UI_COLS"
+      printf '\033[H\033[2J' >&2
+      bm::ui::gate_intro "$BM_CKPT_TIER"
+    fi
+    if bm::plan::_gate_settled "$snap"; then
+      bm::ui::_raw_off
+      bm::ui::_commit_block
+      bm::plan::_gate_report_settled
+      return $?
+    fi
     printf -v now '%(%s)T' -1
     remaining=$(( ${BM_CKPT_DEADLINE:-0} - now ))
     if [[ "$BM_CKPT_TIER" == snapshot ]]; then
@@ -466,6 +583,9 @@ bm::plan::_gate_fancy() { # _gate_fancy <snapshot-id>
     if (( remaining <= 0 )); then
       bm::ui::_raw_off
       bm::ui::_commit_block
+      crc=0
+      bm::plan::_gate_claim "$snap" 120 || crc=$?
+      if (( crc == 1 )); then return "$BM_GATE_RC"; fi
       bm::plan::_gate_expired "$snap"
       return $?
     fi
@@ -481,6 +601,22 @@ bm::plan::_gate_fancy() { # _gate_fancy <snapshot-id>
     fi
     (( rc == 0 )) || continue
     msg=""
+    case "$BM_UI_KEY" in
+      k | K | c | C | u | U | r | R | e | E)
+        crc=0
+        bm::plan::_gate_claim "$snap" 5 >/dev/null 2>&1 || crc=$?
+        if (( crc == 2 )); then
+          msg="Another bond-manager is busy right now; press the key again in a moment."
+          continue
+        fi
+        if (( crc == 1 )); then
+          bm::ui::_raw_off
+          bm::ui::_commit_block
+          bm::plan::_gate_report_settled || true
+          return "$BM_GATE_RC"
+        fi
+        ;;
+    esac
     case "$BM_UI_KEY" in
       k | K | c | C)
         bm::ui::_raw_off
@@ -504,6 +640,7 @@ bm::plan::_gate_fancy() { # _gate_fancy <snapshot-id>
         else
           msg="Could not extend - decide before the time runs out."
         fi
+        bm::lock::release
         ;;
       RESIZE)
         BM_UI_RESIZED=0

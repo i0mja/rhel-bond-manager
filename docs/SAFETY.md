@@ -59,6 +59,16 @@ Notes on ordering that matter:
   and `commit`, `rollback`, `snapshot create`, `snapshot restore`,
   `snapshot prune` alike. All of them also honor `--dry-run`, which reports
   what would happen and writes nothing.
+- **The commit gate lets go of the lock while it waits.** A change to the
+  address you are logged in on leaves that session frozen, not gone, and
+  its gate keeps waiting; the way out is a new session, which must be able
+  to run `commit` or `rollback`. Nothing else can slip in: the pending
+  state still refuses any new change. The gate takes the lock back before
+  it acts on K, U or E, and checks every second whether the change was
+  settled elsewhere. If it was — kept or undone from another session, or
+  undone by the deadman timer — it says which and exits (0 when kept, 5
+  when undone). `commit` and `rollback` leave that answer in
+  `/run/bond-manager/settled` for it.
 
 ## The three protection tiers
 
@@ -131,13 +141,13 @@ from `$0`, the entrypoint actually invoked.) A timer that fires after the
 operator already committed or rolled back finds no pending state and does
 nothing.
 
-That same rule means the timer cannot handle one case: the window running
-out **while the operator is still at the gate**. The gate process holds the
-lock the timer's rollback needs, and by the time the timer fires the gate
-has already cleared the pending state. So on this tier the gate performs
-the rollback itself when the countdown reaches zero, and only then reports
-the change as reverted. If the snapshot restore reports problems, it says
-so. (Up to 3.0 it announced a rollback here that never happened.)
+The window can also run out **while the operator is still at the gate**.
+Then the timer and the gate both act at the deadline, and whichever takes
+the lock first rolls the change back: the gate waits for a running timer
+(up to two minutes) and reports what it did, or restores the snapshot
+itself if the timer has not fired. If the snapshot restore reports
+problems, it says so. (Up to 3.0 the gate announced a rollback here that
+never happened.)
 
 ### Tier 3 — `snapshot` (manual)
 
@@ -456,7 +466,8 @@ prunable snapshots plus the pinned one, rather than nine.
 | Operator walks away without confirming | Auto-rollback deadline | Change reverted (tier 1/2); tier 3 waits for a manual decision |
 | Second admin starts a change concurrently | `flock` in `/run/bond-manager` | Second invocation exits 4, naming the holder |
 | Verification passes but the app is broken anyway | Commit gate window | Press `U`, or `bond-manager rollback` before/after commit (post-commit: snapshot restore) |
-| Operator sits at the gate until the window expires — tier 2 | The gate itself (it holds the lock the timer needs) | The gate restores the snapshot and reports it; exit 5 |
+| Operator sits at the gate until the window expires — tier 2 | The timer or the gate, whichever takes the lock first | The change is rolled back once and the gate reports it; exit 5 |
+| The change cut the session; the old gate is frozen, not gone | The gate waits without the lock | `commit` or `rollback` from a new session works; the old gate, if it ever wakes, reports what was decided |
 | The gate's terminal goes away (end of input) | Protection stays armed | The gate prints how to `commit`/`rollback` from another session and exits 6; the deadline still applies |
 | Ctrl-C during a change started from the menus | The action is stopped; protection stays armed | The menus show the pending change with its deadline and offer keep/undo |
 | Bad change committed days ago | Snapshots | `snapshot list` → `snapshot diff ID` → `snapshot restore ID` |
