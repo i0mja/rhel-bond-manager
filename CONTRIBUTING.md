@@ -8,8 +8,9 @@ follows from that.
 
 ## Development setup
 
-Requirements: bash ≥ 4.4 (the code targets 4.4; do not use 5.x-only
-features), [shellcheck](https://www.shellcheck.net/) ≥ 0.9, and
+Requirements: bash ≥ 4.4 (the code targets 4.4, what RHEL 8 ships; do not
+use 5.x-only features — CI runs the whole suite on bash 4.4.18 as well, in
+the `test-bash44` job), [shellcheck](https://www.shellcheck.net/) ≥ 0.9, and
 [bats](https://github.com/bats-core/bats-core) ≥ 1.10 for the test suite.
 
 ```bash

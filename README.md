@@ -823,7 +823,8 @@ and never touched by a restore.
 Fair question. A tool whose failure mode is "server unreachable until
 someone drives to the datacenter" should have to show its work.
 
-- **412 tests**, across 31 files, run on every change — unit tests for the
+- **Over 480 tests**, across 35 files, run on every change (unprivileged,
+  as root, and again on bash 4.4, the version RHEL 8 ships) — unit tests for the
   parsers and the safety logic, integration tests that drive the real
   compiled script end to end, including the guided menus driven by
   scripted keystrokes.
