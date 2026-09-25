@@ -109,7 +109,7 @@ setup() {
 
 @test "explain_rc: every exit code and outcome has its own words" {
   local c
-  for c in "0 committed" "0 dry-run" "0 cancelled" "0 noop" "2 x" "3 x" "4 x" \
+  for c in "0 committed" "0 dry-run" "0 cancelled" "0 noop" "0 gone" "0 undone" "2 x" "3 x" "4 x" \
     "5 x" "5 expired" "5 lost" "6 x" "130 x" "10 x" "11 x"; do
     bm::help::explain_rc ${c% *} "${c#* }" 0
     [[ "$BM_HELP_TITLE" != "Something went wrong"* ]] || { echo "generic text for $c"; return 1; }
@@ -118,6 +118,16 @@ setup() {
   assert_contains "$BM_HELP_TITLE" "nothing was changed"
   bm::help::explain_rc 42 "" 0
   assert_contains "$BM_HELP_TITLE" "code 42"
+}
+
+@test "explain_rc: a change left waiting promises an automatic undo only when one is armed" {
+  bm::help::explain_rc 6 "" 0 checkpoint
+  assert_contains "${BM_HELP_LINES[*]}" "undo itself automatically"
+  bm::help::explain_rc 6 "" 0 deadman
+  assert_contains "${BM_HELP_LINES[*]}" "undo itself automatically"
+  bm::help::explain_rc 6 "" 0 snapshot
+  assert_not_contains "${BM_HELP_LINES[*]}" "undo itself automatically"
+  assert_contains "${BM_HELP_LINES[*]}" "Nothing on this server undoes it automatically"
 }
 
 @test "speed_label: human units" {

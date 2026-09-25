@@ -1279,28 +1279,38 @@ bm::nm::ip_args() { # ip_args <4|6> <method> <addrs> <gw> <dns>
   local fam="$1" method="$2" addrs="$3" gw="$4" dns="$5"
   BM_NM_IP_ARGS=()
   local p="ipv$fam"
+  # Leaving a fixed address drops it (and its gateway): NetworkManager keeps
+  # ipv4.addresses next to DHCP, and refuses them with 'disabled'. A gateway
+  # or DNS list of "none" clears it.
   case "$method" in
     dhcp | auto)
-      BM_NM_IP_ARGS+=("$p.method" auto)
+      BM_NM_IP_ARGS+=("$p.method" auto "$p.addresses" "" "$p.gateway" "")
       ;;
     none | disabled)
       # ipv4 has had 'disabled' forever; ipv6 uses 'ignore' for NM < 1.20
       if [[ "$fam" == 6 ]]; then
-        BM_NM_IP_ARGS+=("$p.method" ignore)
+        BM_NM_IP_ARGS+=("$p.method" ignore "$p.addresses" "" "$p.gateway" "")
       else
-        BM_NM_IP_ARGS+=("$p.method" disabled)
+        BM_NM_IP_ARGS+=("$p.method" disabled "$p.addresses" "" "$p.gateway" "")
       fi
       ;;
     static)
       BM_NM_IP_ARGS+=("$p.method" manual "$p.addresses" "$addrs")
-      [[ -n "$gw" ]] && BM_NM_IP_ARGS+=("$p.gateway" "$gw")
+      if [[ "$gw" == none ]]; then
+        BM_NM_IP_ARGS+=("$p.gateway" "")
+      elif [[ -n "$gw" ]]; then
+        BM_NM_IP_ARGS+=("$p.gateway" "$gw")
+      fi
       ;;
     *)
       return 1
       ;;
   esac
-  if [[ -n "$dns" ]]; then
-    BM_NM_IP_ARGS+=("$p.dns" "${dns// /,}")
+  if [[ "$dns" == none ]]; then
+    BM_NM_IP_ARGS+=("$p.dns" "")
+  elif [[ -n "$dns" ]]; then
+    bm::core::split_list "$dns"
+    BM_NM_IP_ARGS+=("$p.dns" "$(bm::core::join , "${BM_LIST[@]}")")
   fi
   return 0
 }
@@ -2501,8 +2511,9 @@ bm::help::tier_short() { # for the dashboard
 BM_HELP_TITLE=""
 BM_HELP_STYLE=info
 BM_HELP_LINES=()
-bm::help::explain_rc() { # explain_rc <rc> [outcome] [practice 0|1]
-  local rc="$1" outcome="${2:-}" practice="${3:-0}"
+bm::help::explain_rc() { # explain_rc <rc> [outcome] [practice 0|1] [tier]
+  # practice mode shows in the outcome (dry-run); $3 no longer changes the words
+  local rc="$1" outcome="${2:-}" tier="${4:-}"
   BM_HELP_LINES=()
   case "$rc:$outcome" in
     0:committed)
@@ -2520,14 +2531,21 @@ bm::help::explain_rc() { # explain_rc <rc> [outcome] [practice 0|1]
     0:noop)
       BM_HELP_TITLE="Nothing to do - it is already set up that way."
       BM_HELP_STYLE=ok ;;
+    0:undone)
+      BM_HELP_TITLE="Undone - the settings from before the change are back."
+      BM_HELP_STYLE=ok
+      BM_HELP_LINES=("The messages above list what was brought back up.") ;;
+    0:gone)
+      BM_HELP_TITLE="Nothing was waiting any more."
+      BM_HELP_STYLE=warn
+      BM_HELP_LINES=("The safety net had already undone the change (its time ran out), or it was kept or undone from another session."
+        "The dashboard shows what runs now; 'Check my bonds' says whether all is well.") ;;
     0:*)
+      # not "nothing was changed" in practice mode: a support bundle, for
+      # one, is written either way
       BM_HELP_TITLE="Finished."
       BM_HELP_STYLE=ok
-      if (( practice )); then
-        BM_HELP_LINES=("Practice mode: nothing was changed.")
-      else
-        BM_HELP_LINES=("See the messages above for details.")
-      fi ;;
+      BM_HELP_LINES=("See the messages above for details.") ;;
     "$BM_EX_USAGE":*)
       BM_HELP_TITLE="Something you entered was not accepted - nothing was changed."
       BM_HELP_STYLE=err
@@ -2556,8 +2574,13 @@ bm::help::explain_rc() { # explain_rc <rc> [outcome] [practice 0|1]
     "$BM_EX_PARTIAL":*)
       BM_HELP_TITLE="The change is live but NOT kept yet."
       BM_HELP_STYLE=warn
-      BM_HELP_LINES=("It will undo itself automatically unless you keep it."
-        "Keep it: menu 'Undo & safety' (or: $BM_PROG commit).") ;;
+      if [[ "$tier" == snapshot ]]; then
+        BM_HELP_LINES=("Nothing on this server undoes it automatically (snapshot-only protection)."
+          "Keep it or undo it: menu 'Undo & safety' (or: $BM_PROG commit / $BM_PROG rollback).")
+      else
+        BM_HELP_LINES=("It will undo itself automatically unless you keep it."
+          "Keep it: menu 'Undo & safety' (or: $BM_PROG commit).")
+      fi ;;
     130:*)
       BM_HELP_TITLE="You stopped it."
       BM_HELP_STYLE=warn
@@ -3025,6 +3048,8 @@ Examples:
 Good to know:
   - Changing the mode drops options that only made sense in the old mode,
     and tells you which.
+  - A new address keeps the old gateway and DNS unless you say otherwise:
+    --gw4 none / --dns4 none remove them. --ip4 dhcp drops the old address.
   - Changing the IP of the address you are logged in on will cut your
     session: open a new session to the new address and run
     'sudo $p commit' before the countdown ends.
@@ -4644,7 +4669,7 @@ bm::plan::render() { # human-readable plan
 # name containing $(...), a semicolon, whitespace) must come out inert.
 bm::plan::_shq() {
   local v="$1"
-  if [[ "$v" =~ ^[A-Za-z0-9_@%+=:,./-]*$ ]]; then
+  if [[ -n "$v" && "$v" =~ ^[A-Za-z0-9_@%+=:,./-]*$ ]]; then # '' must show
     printf '%s' "$v"
   else
     printf "'%s'" "${v//\'/\'\\\'\'}"
@@ -5180,9 +5205,9 @@ bm::wf::_plan_ip_steps() { # _plan_ip_steps <con-ref> <label> <ip4> <gw4> <dns4>
         bm::val::ipv4_cidr "$a" || bm::core::die "invalid IPv4 CIDR '$a'" "$BM_EX_USAGE" \
           "write the address with its prefix, e.g. 10.0.0.10/24 (or use dhcp / none)"
       done
-      [[ -n "$gw4" ]] && { bm::val::ipv4_addr "$gw4" || bm::core::die "invalid IPv4 gateway '$gw4'" "$BM_EX_USAGE" \
+      [[ -n "$gw4" && "$gw4" != none ]] && { bm::val::ipv4_addr "$gw4" || bm::core::die "invalid IPv4 gateway '$gw4'" "$BM_EX_USAGE" \
         "the gateway is a plain address without a prefix, e.g. 10.0.0.1"; }
-      [[ -n "$dns4" ]] && { bm::val::ip_list v4 "${dns4// /,}" || bm::core::die "invalid IPv4 DNS list '$dns4'" "$BM_EX_USAGE" \
+      [[ -n "$dns4" && "$dns4" != none ]] && { bm::val::ip_list v4 "${dns4// /,}" || bm::core::die "invalid IPv4 DNS list '$dns4'" "$BM_EX_USAGE" \
         "DNS servers are plain addresses, comma-separated, e.g. 10.0.0.53,10.0.0.54"; }
     fi
     bm::nm::ip_args 4 "$m4" "$ip4" "$gw4" "$dns4" || bm::core::die "invalid IPv4 method '$ip4'" "$BM_EX_USAGE" \
@@ -5200,19 +5225,27 @@ bm::wf::_plan_ip_steps() { # _plan_ip_steps <con-ref> <label> <ip4> <gw4> <dns4>
         bm::val::ipv6_cidr "$a6" || bm::core::die "invalid IPv6 CIDR '$a6'" "$BM_EX_USAGE" \
           "write the address with its prefix, e.g. 2001:db8::10/64 (or use auto / dhcp / none)"
       done
-      [[ -n "$gw6" ]] && { bm::val::ipv6_addr "$gw6" || bm::core::die "invalid IPv6 gateway '$gw6'" "$BM_EX_USAGE" \
+      [[ -n "$gw6" && "$gw6" != none ]] && { bm::val::ipv6_addr "$gw6" || bm::core::die "invalid IPv6 gateway '$gw6'" "$BM_EX_USAGE" \
         "the gateway is a plain address without a prefix, e.g. 2001:db8::1"; }
-      [[ -n "$dns6" ]] && { bm::val::ip_list v6 "${dns6// /,}" || bm::core::die "invalid IPv6 DNS list '$dns6'" "$BM_EX_USAGE" \
+      [[ -n "$dns6" && "$dns6" != none ]] && { bm::val::ip_list v6 "${dns6// /,}" || bm::core::die "invalid IPv6 DNS list '$dns6'" "$BM_EX_USAGE" \
         "DNS servers are plain addresses, comma-separated, e.g. 2001:db8::53,2001:db8::54"; }
     fi
+    # leaving a fixed address drops it and its gateway (see bm::nm::ip_args)
+    local -a clear6=(ipv6.addresses "" ipv6.gateway "")
+    if [[ "$dns6" == none ]]; then
+      clear6+=(ipv6.dns "")
+    elif [[ -n "$dns6" ]]; then
+      bm::core::split_list "$dns6"
+      clear6+=(ipv6.dns "$(bm::core::join , "${BM_LIST[@]}")")
+    fi
     if [[ "$m6" == auto ]]; then
-      bm::plan::add "Configure IPv6 (SLAAC/auto) on $label" bm::nm::modify "$con" ipv6.method auto
+      bm::plan::add "Configure IPv6 (SLAAC/auto) on $label" bm::nm::modify "$con" ipv6.method auto "${clear6[@]}"
     elif [[ "$m6" == dhcp ]]; then
       # DHCPv6 without SLAAC is a distinct NetworkManager method; mapping it
       # to 'auto' would silently give the operator something else.
-      bm::plan::add "Configure IPv6 (DHCPv6) on $label" bm::nm::modify "$con" ipv6.method dhcp
+      bm::plan::add "Configure IPv6 (DHCPv6) on $label" bm::nm::modify "$con" ipv6.method dhcp "${clear6[@]}"
     elif [[ "$m6" == none ]]; then
-      bm::plan::add "Disable IPv6 on $label" bm::nm::modify "$con" ipv6.method ignore
+      bm::plan::add "Disable IPv6 on $label" bm::nm::modify "$con" ipv6.method ignore "${clear6[@]}"
     else
       bm::nm::ip_args 6 static "$ip6" "$gw6" "$dns6"
       bm::plan::add "Configure IPv6 ($ip6) on $label" bm::nm::modify "$con" "${BM_NM_IP_ARGS[@]}"
@@ -5328,6 +5361,17 @@ bm::wf::affected_devices() { # affected_devices <bond> [extra...]
 BM_WF_CLI=""
 BM_WF_ARGV=()
 bm::wf::_q() { BM_WF_ARGV+=("$(bm::plan::_shq "$1")"); }
+
+# A --vlan value without whitespace: BM_SPEC[vlans] is a space-separated
+# list of these, so a blank inside one would split it into a bogus second
+# VLAN. Blanks next to a separator go; other blanks separate list items
+# ("dns4=10.0.0.53, 10.0.0.54" -> "dns4=10.0.0.53,10.0.0.54").
+bm::wf::vlan_token_clean() { # vlan_token_clean <token> -> stdout
+  printf '%s' "$1" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g
+    s/[[:space:]]*([,;:=])[[:space:]]*/\1/g
+    s/[[:space:]]+/,/g
+    s/,+/,/g'
+}
 
 bm::wf::cli_equivalent() { # cli_equivalent <subcommand>
   local sub="$1" tok k
@@ -6215,8 +6259,8 @@ Change commands (root; guarded by plan → snapshot → checkpoint → verify):
   repair BOND                            Rebuild port profiles from kernel state
 
 Create/modify IP + tuning flags:
-  --ip4 dhcp|none|CIDR[,CIDR]  --gw4 A  --dns4 A,B
-  --ip6 auto|dhcp|none|CIDR[,CIDR]  --gw6 A  --dns6 A,B
+  --ip4 dhcp|none|CIDR[,CIDR]  --gw4 A|none  --dns4 A,B|none
+  --ip6 auto|dhcp|none|CIDR[,CIDR]  --gw6 A|none  --dns6 A,B|none
   --mtu N   --opt key=value (repeatable)   --vlan VID[:ip4=..;gw4=..] (repeatable)
   --miimon MS  --primary IF  --lacp-rate fast|slow  --xmit-hash POLICY
   --arp-interval MS --arp-targets IP[,IP]  --min-links N  --no-activate
@@ -6866,7 +6910,7 @@ bm::cli::_parse_change_flags() {
       --ip6) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[ip6]="$2"; shift 2 ;;
       --gw6) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[gw6]="$2"; shift 2 ;;
       --dns6) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[dns6]="$2"; shift 2 ;;
-      --vlan) bm::cli::_need_arg "$1" "${2-}"; vlan_tokens+=("$2"); shift 2 ;;
+      --vlan) bm::cli::_need_arg "$1" "${2-}"; vlan_tokens+=("$(bm::wf::vlan_token_clean "$2")"); shift 2 ;;
       --miimon) bm::cli::_need_arg "$1" "${2-}"; opt_pairs+=("miimon=$2"); shift 2 ;;
       --primary) bm::cli::_need_arg "$1" "${2-}"; opt_pairs+=("primary=$2"); shift 2 ;;
       --lacp-rate) bm::cli::_need_arg "$1" "${2-}"; opt_pairs+=("lacp_rate=$2"); shift 2 ;;
@@ -6974,7 +7018,7 @@ bm::cli::cmd_vlan() {
       bm::cli::preflight_mutate
       bm::wf::spec_reset
       BM_SPEC[bond]="$bond"
-      BM_SPEC[vlans]="$tok"
+      BM_SPEC[vlans]="$(bm::wf::vlan_token_clean "$tok")"
       bm::wf::vlan_add
       ;;
     modify)
@@ -7081,6 +7125,35 @@ bm::cli::cmd_commit() {
   esac
 }
 
+# The menus' "Undo it now": undo the waiting change and nothing else. Plain
+# `rollback` falls back to the newest snapshot when nothing waits, and once
+# the safety net has undone the change, the newest snapshot is the copy the
+# restore took of the change itself.
+bm::cli::undo_pending() {
+  if (( BM_DRY_RUN )); then
+    if bm::ckpt::load_pending; then
+      bm::log::say "[dry-run] would roll back the pending change: ${BM_PENDING_SUMMARY:-?} (tier ${BM_PENDING_TIER:-?}, snapshot ${BM_PENDING_SNAPSHOT:-?})"
+    else
+      BM_PLAN_OUTCOME=gone
+    fi
+    return "$BM_EX_OK"
+  fi
+  bm::core::require_root
+  bm::log::enable_file
+  bm::log::set_op rollback
+  bm::lock::acquire
+  if ! bm::ckpt::load_pending; then
+    bm::log::info "undo: nothing is waiting any more"
+    BM_PLAN_OUTCOME=gone
+    return "$BM_EX_OK"
+  fi
+  if bm::ckpt::rollback_pending; then
+    bm::log::say "$(bm::core::c_ok "pending change rolled back")"
+    return "$BM_EX_OK"
+  fi
+  bm::core::die "the rollback of the pending change reported problems (see above) — inspect manually" "$BM_EX_ERR"
+}
+
 bm::cli::cmd_rollback() {
   local snapshot="" deadman=0
   while (( $# )); do
@@ -7151,6 +7224,7 @@ bm::cli::cmd_rollback() {
   echo
   if ! (( BM_ASSUME_YES )); then
     bm::ui::yesno "Restore snapshot $snapshot (see change summary above)?" || {
+      BM_PLAN_OUTCOME=cancelled
       bm::log::say "cancelled"
       return "$BM_EX_OK"
     }
@@ -7741,7 +7815,12 @@ bm::tui::result() { # result [kind]
     bm::ui::pause
     return 0
   fi
-  bm::help::explain_rc "$rc" "$BM_TUI_LAST_OUTCOME" "$BM_DRY_RUN"
+  local waiting=0 tier=""
+  if bm::tui::_pending; then
+    waiting=1
+    tier="${BM_PENDING_TIER:-}"
+  fi
+  bm::help::explain_rc "$rc" "$BM_TUI_LAST_OUTCOME" "$BM_DRY_RUN" "$tier"
   case "$BM_HELP_STYLE" in
     ok) glyph="$BM_G_OK" ;;
     err) glyph="$BM_G_BAD" ;;
@@ -7755,7 +7834,7 @@ bm::tui::result() { # result [kind]
     bm::ui::wrap $(( BM_UI_W - 6 )) "$l"
     lines+=("${BM_UI_WRAPPED[@]}")
   done
-  if bm::tui::_pending && (( rc == BM_EX_PARTIAL || rc == 130 )); then
+  if (( waiting )) && (( rc == BM_EX_PARTIAL || rc == 130 )); then
     local at=""
     if [[ "${BM_PENDING_TIER:-}" != snapshot && "${BM_PENDING_DEADLINE:-}" =~ ^[0-9]+$ ]]; then
       printf -v at '%(%H:%M:%S)T' "$BM_PENDING_DEADLINE"
@@ -7822,6 +7901,7 @@ bm::tui::_v_ipv4_cidr() {
 }
 
 bm::tui::_v_ipv4_addr() {
+  [[ "$1" == none ]] && return 0 # removes the current value
   if bm::val::ipv4_addr "$1"; then return 0; fi
   if [[ "$1" == */* ]]; then
     BM_UI_VERR="The gateway is a plain address - leave out the /prefix."
@@ -7832,6 +7912,7 @@ bm::tui::_v_ipv4_addr() {
 }
 
 bm::tui::_v_dns4() {
+  [[ "$1" == none ]] && return 0 # removes the current value
   if bm::val::ip_list v4 "${1// /,}"; then return 0; fi
   BM_UI_VERR="Type plain addresses separated by commas, e.g. 10.0.0.53,10.0.0.54."
   return 1
@@ -7854,6 +7935,7 @@ bm::tui::_v_ipv6_cidr() {
 }
 
 bm::tui::_v_ipv6_addr() {
+  [[ "$1" == none ]] && return 0 # removes the current value
   if bm::val::ipv6_addr "$1"; then return 0; fi
   if [[ "$1" == */* ]]; then
     BM_UI_VERR="The gateway is a plain address - leave out the /prefix."
@@ -7864,6 +7946,7 @@ bm::tui::_v_ipv6_addr() {
 }
 
 bm::tui::_v_dns6() {
+  [[ "$1" == none ]] && return 0 # removes the current value
   if bm::val::ip_list v6 "${1// /,}"; then return 0; fi
   BM_UI_VERR="Type plain IPv6 addresses separated by commas, e.g. 2001:db8::53."
   return 1
@@ -8160,17 +8243,48 @@ bm::tui::pick_mode() { # pick_mode [--current MODE]
 }
 
 # Ask for IPv4 settings -> BM_TUI_IP4/GW4/DNS4 (IP4 dhcp|none|CIDR|"" = keep)
-bm::tui::ask_ip4() { # ask_ip4 [--keep] [--vlan-option] <what>
-  local keep=0 vlan=0
+# A typed list ("10.0.0.53, 10.0.0.54" or with spaces) as one comma list, so
+# it survives being put into a command line or a --vlan value.
+bm::tui::_csv() { # _csv <text> -> BM_TUI_CSV
+  bm::core::split_list "$1"
+  BM_TUI_CSV="$(bm::core::join , "${BM_LIST[@]}")"
+}
+
+# Gateway or DNS for an existing profile: Enter keeps what it has, "none"
+# removes it. -> BM_TUI_KEPT ("" = unchanged, "none", or the new value)
+bm::tui::_ask_kept() { # _ask_kept <validator> <example> <label> [current]
+  local v="$1" ex="$2" label="$3" cur="${4:-}"
+  if [[ -n "$cur" ]]; then
+    bm::ui::input --default "$cur" --validate "$v" --example "$ex" \
+      -- "$label - Enter keeps $cur, none removes it" || return 1
+  else
+    bm::ui::input --optional --validate "$v" --example "$ex" -- "$label - Enter for none" || return 1
+  fi
+  BM_TUI_KEPT="$BM_UI_REPLY"
+  if [[ -n "$BM_TUI_KEPT" && "$BM_TUI_KEPT" != none ]]; then
+    bm::tui::_csv "$BM_TUI_KEPT"
+    BM_TUI_KEPT="$BM_TUI_CSV"
+  fi
+  if [[ -n "$cur" && "$BM_TUI_KEPT" == "$cur" ]]; then BM_TUI_KEPT=""; fi
+  return 0
+}
+
+bm::tui::ask_ip4() { # ask_ip4 [--keep] [--vlan-option] [--profile UUID] <what>
+  local keep=0 vlan=0 profile=""
   while (( $# )); do
     case "$1" in
       --keep) keep=1; shift ;;
       --vlan-option) vlan=1; shift ;;
+      --profile) profile="$2"; shift 2 ;;
       *) break ;;
     esac
   done
-  local what="$1"
+  local what="$1" cur_gw="" cur_dns=""
   BM_TUI_IP4="" BM_TUI_GW4="" BM_TUI_DNS4=""
+  if [[ -n "$profile" ]]; then
+    cur_gw="$(bm::nm::con_get "$profile" ipv4.gateway)"
+    cur_dns="$(bm::nm::con_get "$profile" ipv4.dns)"
+  fi
   local -a items=(
     dhcp "Automatic (DHCP)"$'\t'"a DHCP server hands out the address"
     static "Fixed address"$'\t'"you type it, e.g. 10.0.0.10/24"
@@ -8191,27 +8305,33 @@ bm::tui::ask_ip4() { # ask_ip4 [--keep] [--vlan-option] <what>
     static)
       bm::ui::input --validate bm::tui::_v_ipv4_cidr --example "10.0.0.10/24" \
         -- "Address with prefix" || return 1
-      BM_TUI_IP4="$BM_UI_REPLY"
-      bm::ui::input --optional --validate bm::tui::_v_ipv4_addr --example "10.0.0.1" \
-        -- "Gateway (router) - Enter for none" || return 1
-      BM_TUI_GW4="$BM_UI_REPLY"
-      bm::ui::input --optional --validate bm::tui::_v_dns4 --example "10.0.0.53,10.0.0.54" \
-        -- "DNS servers - Enter for none" || return 1
-      BM_TUI_DNS4="$BM_UI_REPLY"
+      bm::tui::_csv "$BM_UI_REPLY"
+      BM_TUI_IP4="$BM_TUI_CSV"
+      bm::tui::_ask_kept bm::tui::_v_ipv4_addr "10.0.0.1" "Gateway (router)" "$cur_gw" || return 1
+      BM_TUI_GW4="$BM_TUI_KEPT"
+      bm::tui::_ask_kept bm::tui::_v_dns4 "10.0.0.53,10.0.0.54" "DNS servers" "$cur_dns" || return 1
+      BM_TUI_DNS4="$BM_TUI_KEPT"
       ;;
   esac
   return 0
 }
 
 # Ask for IPv6 settings -> BM_TUI_IP6/GW6/DNS6 (IP6 auto|dhcp|none|CIDR|"" = keep)
-bm::tui::ask_ip6() { # ask_ip6 [--keep] <what>
-  local keep=0
-  if [[ "${1:-}" == --keep ]]; then
-    keep=1
-    shift
-  fi
-  local what="$1"
+bm::tui::ask_ip6() { # ask_ip6 [--keep] [--profile UUID] <what>
+  local keep=0 profile=""
+  while (( $# )); do
+    case "$1" in
+      --keep) keep=1; shift ;;
+      --profile) profile="$2"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  local what="$1" cur_gw="" cur_dns=""
   BM_TUI_IP6="" BM_TUI_GW6="" BM_TUI_DNS6=""
+  if [[ -n "$profile" ]]; then
+    cur_gw="$(bm::nm::con_get "$profile" ipv6.gateway)"
+    cur_dns="$(bm::nm::con_get "$profile" ipv6.dns)"
+  fi
   local -a items=(
     auto "Automatic (SLAAC)"$'\t'"the router announces the network - the usual choice"
     dhcp "DHCPv6"$'\t'"a DHCPv6 server hands out the address"
@@ -8230,13 +8350,12 @@ bm::tui::ask_ip6() { # ask_ip6 [--keep] <what>
     static)
       bm::ui::input --validate bm::tui::_v_ipv6_cidr --example "2001:db8::10/64" \
         -- "Address with prefix" || return 1
-      BM_TUI_IP6="$BM_UI_REPLY"
-      bm::ui::input --optional --validate bm::tui::_v_ipv6_addr --example "2001:db8::1" \
-        -- "Gateway (router) - Enter for none" || return 1
-      BM_TUI_GW6="$BM_UI_REPLY"
-      bm::ui::input --optional --validate bm::tui::_v_dns6 --example "2001:db8::53" \
-        -- "DNS servers - Enter for none" || return 1
-      BM_TUI_DNS6="$BM_UI_REPLY"
+      bm::tui::_csv "$BM_UI_REPLY"
+      BM_TUI_IP6="$BM_TUI_CSV"
+      bm::tui::_ask_kept bm::tui::_v_ipv6_addr "2001:db8::1" "Gateway (router)" "$cur_gw" || return 1
+      BM_TUI_GW6="$BM_TUI_KEPT"
+      bm::tui::_ask_kept bm::tui::_v_dns6 "2001:db8::53" "DNS servers" "$cur_dns" || return 1
+      BM_TUI_DNS6="$BM_TUI_KEPT"
       ;;
   esac
   return 0
@@ -8248,7 +8367,7 @@ bm::tui::_ip6_words() { # describe BM_TUI_IP6/GW6/DNS6 -> BM_TUI_WORDS
     dhcp) BM_TUI_WORDS="DHCPv6" ;;
     none) BM_TUI_WORDS="none (IPv6 off)" ;;
     "") BM_TUI_WORDS="unchanged" ;;
-    *) BM_TUI_WORDS="$BM_TUI_IP6${BM_TUI_GW6:+, gateway $BM_TUI_GW6}${BM_TUI_DNS6:+, DNS $BM_TUI_DNS6}" ;;
+    *) BM_TUI_WORDS="$BM_TUI_IP6$(bm::tui::_extra_words "$BM_TUI_GW6" "$BM_TUI_DNS6")" ;;
   esac
 }
 
@@ -8267,8 +8386,15 @@ bm::tui::_ip4_words() { # describe BM_TUI_IP4/GW4/DNS4 -> BM_TUI_WORDS
     dhcp) BM_TUI_WORDS="automatic (DHCP)" ;;
     none) BM_TUI_WORDS="none" ;;
     "") BM_TUI_WORDS="unchanged" ;;
-    *) BM_TUI_WORDS="$BM_TUI_IP4${BM_TUI_GW4:+, gateway $BM_TUI_GW4}${BM_TUI_DNS4:+, DNS $BM_TUI_DNS4}" ;;
+    *) BM_TUI_WORDS="$BM_TUI_IP4$(bm::tui::_extra_words "$BM_TUI_GW4" "$BM_TUI_DNS4")" ;;
   esac
+}
+
+bm::tui::_extra_words() { # _extra_words <gw> <dns> -> ", gateway X, DNS Y" ("none" = removed)
+  local out=""
+  case "$1" in "") ;; none) out+=", no gateway" ;; *) out+=", gateway $1" ;; esac
+  case "$2" in "") ;; none) out+=", no DNS servers" ;; *) out+=", DNS $2" ;; esac
+  printf '%s' "$out"
 }
 
 # ---- review ---------------------------------------------------------------------
@@ -8854,8 +8980,10 @@ bm::tui::_change_ip() {
   bm::tui::_pick_family "$bond" || return 0
   bm::wf::spec_reset
   BM_SPEC[bond]="$bond"
+  local profile
+  profile="$(bm::nm::bond_con_uuid "$bond" || true)"
   if [[ "$BM_TUI_FAMILY" == 6 ]]; then
-    bm::tui::ask_ip6 --keep "$bond" || return 0
+    bm::tui::ask_ip6 --keep --profile "$profile" "$bond" || return 0
     [[ -n "$BM_TUI_IP6" ]] || return 0
     BM_SPEC[ip6]="$BM_TUI_IP6"
     [[ -n "$BM_TUI_GW6" ]] && BM_SPEC[gw6]="$BM_TUI_GW6"
@@ -8864,7 +8992,7 @@ bm::tui::_change_ip() {
     bm::tui::_apply_modify "$bond" "Set the IPv6 address of $bond: $BM_TUI_WORDS."
     return 0
   fi
-  bm::tui::ask_ip4 --keep "$bond" || return 0
+  bm::tui::ask_ip4 --keep --profile "$profile" "$bond" || return 0
   if [[ -z "$BM_TUI_IP4" ]]; then
     return 0
   fi
@@ -8955,20 +9083,25 @@ bm::tui::_change_vlan() {
       bm::ui::menu -- "Which VLAN?" "${vitems[@]}" || return 0
       vid="$BM_UI_REPLY"
       bm::tui::_pick_family "VLAN $vid" || return 0
+      local vprof="" vrec vu vv
+      while IFS= read -r vrec; do
+        IFS=$'\x1f' read -r vu _ _ vv <<<"$vrec"
+        if [[ "$vv" == "$vid" ]]; then vprof="$vu"; fi
+      done < <(bm::nm::vlan_cons "$bond")
       bm::wf::spec_reset
       BM_SPEC[bond]="$bond"
       BM_SPEC[vlan_id]="$vid"
       local fam="IPv4"
       if [[ "$BM_TUI_FAMILY" == 6 ]]; then
         fam="IPv6"
-        bm::tui::ask_ip6 --keep "VLAN $vid" || return 0
+        bm::tui::ask_ip6 --keep --profile "$vprof" "VLAN $vid" || return 0
         [[ -n "$BM_TUI_IP6" ]] || return 0
         BM_SPEC[ip6]="$BM_TUI_IP6"
         [[ -n "$BM_TUI_GW6" ]] && BM_SPEC[gw6]="$BM_TUI_GW6"
         [[ -n "$BM_TUI_DNS6" ]] && BM_SPEC[dns6]="$BM_TUI_DNS6"
         bm::tui::_ip6_words
       else
-        bm::tui::ask_ip4 --keep "VLAN $vid" || return 0
+        bm::tui::ask_ip4 --keep --profile "$vprof" "VLAN $vid" || return 0
         [[ -n "$BM_TUI_IP4" ]] || return 0
         BM_SPEC[ip4]="$BM_TUI_IP4"
         [[ -n "$BM_TUI_GW4" ]] && BM_SPEC[gw4]="$BM_TUI_GW4"
@@ -9170,18 +9303,29 @@ bm::tui::pending_screen() {
     keep "Keep it"$'\t'"the change stays" \
     undo "Undo it now"$'\t'"put everything back as it was" \
     back "Decide later" || return 0
+  # The menus hold no lock while this screen waits: meanwhile the safety net
+  # may have undone the change, or another session kept or undid it.
+  if [[ "$BM_UI_REPLY" == keep || "$BM_UI_REPLY" == undo ]] && ! bm::tui::_pending; then
+    BM_TUI_LAST_RC=0 BM_TUI_LAST_OUTCOME=gone
+    bm::tui::result safety
+    return 0
+  fi
   case "$BM_UI_REPLY" in
     keep)
       bm::tui::run safety bm::cli::cmd_commit
-      BM_TUI_LAST_OUTCOME=committed
-      if (( BM_TUI_LAST_RC == BM_EX_VERIFY )); then BM_TUI_LAST_OUTCOME=lost; fi
-      if (( BM_DRY_RUN )); then BM_TUI_LAST_OUTCOME=dry-run; fi
+      if (( BM_TUI_LAST_RC == BM_EX_PRECONDITION )) && ! bm::tui::_pending; then
+        BM_TUI_LAST_RC=0 BM_TUI_LAST_OUTCOME=gone # settled in between
+      else
+        BM_TUI_LAST_OUTCOME=committed
+        if (( BM_TUI_LAST_RC == BM_EX_VERIFY )); then BM_TUI_LAST_OUTCOME=lost; fi
+        if (( BM_DRY_RUN )); then BM_TUI_LAST_OUTCOME=dry-run; fi
+      fi
       bm::tui::result safety
       ;;
     undo)
-      bm::tui::run safety bm::cli::cmd_rollback
-      if (( BM_TUI_LAST_RC == 0 )); then
-        BM_TUI_LAST_OUTCOME=""
+      bm::tui::run safety bm::cli::undo_pending
+      if (( BM_TUI_LAST_RC == 0 )) && [[ "$BM_TUI_LAST_OUTCOME" != gone ]]; then
+        BM_TUI_LAST_OUTCOME=undone
         if (( BM_DRY_RUN )); then BM_TUI_LAST_OUTCOME=dry-run; fi
       fi
       bm::tui::result safety

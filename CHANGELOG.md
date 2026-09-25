@@ -139,6 +139,32 @@ schema are unchanged.
   directory.** The scratch directory was created inside `$(...)`, so the
   exit cleanup never knew about it. It is now created in the running shell
   (and in a menu action's own subshell, which cleans up after itself).
+- **"Keep or undo?" after the safety net had already acted.** The screen
+  checked once and then waited. If the timer undid the change meanwhile,
+  "Undo it now" restored the newest snapshot, which by then was the copy
+  of the change itself, and reported "Finished"; "Keep it" reported
+  "nothing was changed". Both now check again and say the change is no
+  longer waiting, and the menus' undo only ever undoes the waiting change.
+- **The result panel** promised an automatic undo on the snapshot-only
+  tier, where nothing is armed; it now says nothing will undo the change.
+  A support bundle made in practice mode was reported as "nothing was
+  changed", and declining a snapshot restore showed "Finished" instead of
+  "Cancelled".
+- **Changing an IP address kept the old gateway and DNS** although the
+  prompt said "Enter for none". The menus now show the current values
+  ("Enter keeps 10.0.0.1, none removes it"), and `--gw4`, `--gw6`,
+  `--dns4` and `--dns6` accept `none` to clear them. Switching to DHCP (or
+  no address) now drops the old fixed address and gateway, which
+  NetworkManager would otherwise keep next to DHCP (and refuses with
+  `ipv4.method disabled`).
+- **A VLAN whose address or DNS list contained a space**
+  (`10.0.0.53, 10.0.0.54`) was split into a bogus second VLAN, in the
+  build wizard and with `--vlan`; the build then failed with "invalid VLAN
+  id". Lists are now joined with commas.
+- **Plans and the "same thing as a command" line showed an empty argument
+  as nothing**, so a pasted command lost it; it is now shown as `''`.
+- After a failed step or verification, "Your network is back the way it
+  was" was printed even when the rollback reported problems.
 - **Plain numbered prompts:** `010` picked item 8 (bash read it as octal)
   and `08`/`09` printed a raw bash error; numbers are now always decimal.
   The home menu listed Quit twice, and its `?) help` hint disappeared when

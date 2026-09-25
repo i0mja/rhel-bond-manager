@@ -451,7 +451,12 @@ bm::tui::result() { # result [kind]
     bm::ui::pause
     return 0
   fi
-  bm::help::explain_rc "$rc" "$BM_TUI_LAST_OUTCOME" "$BM_DRY_RUN"
+  local waiting=0 tier=""
+  if bm::tui::_pending; then
+    waiting=1
+    tier="${BM_PENDING_TIER:-}"
+  fi
+  bm::help::explain_rc "$rc" "$BM_TUI_LAST_OUTCOME" "$BM_DRY_RUN" "$tier"
   case "$BM_HELP_STYLE" in
     ok) glyph="$BM_G_OK" ;;
     err) glyph="$BM_G_BAD" ;;
@@ -465,7 +470,7 @@ bm::tui::result() { # result [kind]
     bm::ui::wrap $(( BM_UI_W - 6 )) "$l"
     lines+=("${BM_UI_WRAPPED[@]}")
   done
-  if bm::tui::_pending && (( rc == BM_EX_PARTIAL || rc == 130 )); then
+  if (( waiting )) && (( rc == BM_EX_PARTIAL || rc == 130 )); then
     local at=""
     if [[ "${BM_PENDING_TIER:-}" != snapshot && "${BM_PENDING_DEADLINE:-}" =~ ^[0-9]+$ ]]; then
       printf -v at '%(%H:%M:%S)T' "$BM_PENDING_DEADLINE"
@@ -532,6 +537,7 @@ bm::tui::_v_ipv4_cidr() {
 }
 
 bm::tui::_v_ipv4_addr() {
+  [[ "$1" == none ]] && return 0 # removes the current value
   if bm::val::ipv4_addr "$1"; then return 0; fi
   if [[ "$1" == */* ]]; then
     BM_UI_VERR="The gateway is a plain address - leave out the /prefix."
@@ -542,6 +548,7 @@ bm::tui::_v_ipv4_addr() {
 }
 
 bm::tui::_v_dns4() {
+  [[ "$1" == none ]] && return 0 # removes the current value
   if bm::val::ip_list v4 "${1// /,}"; then return 0; fi
   BM_UI_VERR="Type plain addresses separated by commas, e.g. 10.0.0.53,10.0.0.54."
   return 1
@@ -564,6 +571,7 @@ bm::tui::_v_ipv6_cidr() {
 }
 
 bm::tui::_v_ipv6_addr() {
+  [[ "$1" == none ]] && return 0 # removes the current value
   if bm::val::ipv6_addr "$1"; then return 0; fi
   if [[ "$1" == */* ]]; then
     BM_UI_VERR="The gateway is a plain address - leave out the /prefix."
@@ -574,6 +582,7 @@ bm::tui::_v_ipv6_addr() {
 }
 
 bm::tui::_v_dns6() {
+  [[ "$1" == none ]] && return 0 # removes the current value
   if bm::val::ip_list v6 "${1// /,}"; then return 0; fi
   BM_UI_VERR="Type plain IPv6 addresses separated by commas, e.g. 2001:db8::53."
   return 1
@@ -870,17 +879,48 @@ bm::tui::pick_mode() { # pick_mode [--current MODE]
 }
 
 # Ask for IPv4 settings -> BM_TUI_IP4/GW4/DNS4 (IP4 dhcp|none|CIDR|"" = keep)
-bm::tui::ask_ip4() { # ask_ip4 [--keep] [--vlan-option] <what>
-  local keep=0 vlan=0
+# A typed list ("10.0.0.53, 10.0.0.54" or with spaces) as one comma list, so
+# it survives being put into a command line or a --vlan value.
+bm::tui::_csv() { # _csv <text> -> BM_TUI_CSV
+  bm::core::split_list "$1"
+  BM_TUI_CSV="$(bm::core::join , "${BM_LIST[@]}")"
+}
+
+# Gateway or DNS for an existing profile: Enter keeps what it has, "none"
+# removes it. -> BM_TUI_KEPT ("" = unchanged, "none", or the new value)
+bm::tui::_ask_kept() { # _ask_kept <validator> <example> <label> [current]
+  local v="$1" ex="$2" label="$3" cur="${4:-}"
+  if [[ -n "$cur" ]]; then
+    bm::ui::input --default "$cur" --validate "$v" --example "$ex" \
+      -- "$label - Enter keeps $cur, none removes it" || return 1
+  else
+    bm::ui::input --optional --validate "$v" --example "$ex" -- "$label - Enter for none" || return 1
+  fi
+  BM_TUI_KEPT="$BM_UI_REPLY"
+  if [[ -n "$BM_TUI_KEPT" && "$BM_TUI_KEPT" != none ]]; then
+    bm::tui::_csv "$BM_TUI_KEPT"
+    BM_TUI_KEPT="$BM_TUI_CSV"
+  fi
+  if [[ -n "$cur" && "$BM_TUI_KEPT" == "$cur" ]]; then BM_TUI_KEPT=""; fi
+  return 0
+}
+
+bm::tui::ask_ip4() { # ask_ip4 [--keep] [--vlan-option] [--profile UUID] <what>
+  local keep=0 vlan=0 profile=""
   while (( $# )); do
     case "$1" in
       --keep) keep=1; shift ;;
       --vlan-option) vlan=1; shift ;;
+      --profile) profile="$2"; shift 2 ;;
       *) break ;;
     esac
   done
-  local what="$1"
+  local what="$1" cur_gw="" cur_dns=""
   BM_TUI_IP4="" BM_TUI_GW4="" BM_TUI_DNS4=""
+  if [[ -n "$profile" ]]; then
+    cur_gw="$(bm::nm::con_get "$profile" ipv4.gateway)"
+    cur_dns="$(bm::nm::con_get "$profile" ipv4.dns)"
+  fi
   local -a items=(
     dhcp "Automatic (DHCP)"$'\t'"a DHCP server hands out the address"
     static "Fixed address"$'\t'"you type it, e.g. 10.0.0.10/24"
@@ -901,27 +941,33 @@ bm::tui::ask_ip4() { # ask_ip4 [--keep] [--vlan-option] <what>
     static)
       bm::ui::input --validate bm::tui::_v_ipv4_cidr --example "10.0.0.10/24" \
         -- "Address with prefix" || return 1
-      BM_TUI_IP4="$BM_UI_REPLY"
-      bm::ui::input --optional --validate bm::tui::_v_ipv4_addr --example "10.0.0.1" \
-        -- "Gateway (router) - Enter for none" || return 1
-      BM_TUI_GW4="$BM_UI_REPLY"
-      bm::ui::input --optional --validate bm::tui::_v_dns4 --example "10.0.0.53,10.0.0.54" \
-        -- "DNS servers - Enter for none" || return 1
-      BM_TUI_DNS4="$BM_UI_REPLY"
+      bm::tui::_csv "$BM_UI_REPLY"
+      BM_TUI_IP4="$BM_TUI_CSV"
+      bm::tui::_ask_kept bm::tui::_v_ipv4_addr "10.0.0.1" "Gateway (router)" "$cur_gw" || return 1
+      BM_TUI_GW4="$BM_TUI_KEPT"
+      bm::tui::_ask_kept bm::tui::_v_dns4 "10.0.0.53,10.0.0.54" "DNS servers" "$cur_dns" || return 1
+      BM_TUI_DNS4="$BM_TUI_KEPT"
       ;;
   esac
   return 0
 }
 
 # Ask for IPv6 settings -> BM_TUI_IP6/GW6/DNS6 (IP6 auto|dhcp|none|CIDR|"" = keep)
-bm::tui::ask_ip6() { # ask_ip6 [--keep] <what>
-  local keep=0
-  if [[ "${1:-}" == --keep ]]; then
-    keep=1
-    shift
-  fi
-  local what="$1"
+bm::tui::ask_ip6() { # ask_ip6 [--keep] [--profile UUID] <what>
+  local keep=0 profile=""
+  while (( $# )); do
+    case "$1" in
+      --keep) keep=1; shift ;;
+      --profile) profile="$2"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  local what="$1" cur_gw="" cur_dns=""
   BM_TUI_IP6="" BM_TUI_GW6="" BM_TUI_DNS6=""
+  if [[ -n "$profile" ]]; then
+    cur_gw="$(bm::nm::con_get "$profile" ipv6.gateway)"
+    cur_dns="$(bm::nm::con_get "$profile" ipv6.dns)"
+  fi
   local -a items=(
     auto "Automatic (SLAAC)"$'\t'"the router announces the network - the usual choice"
     dhcp "DHCPv6"$'\t'"a DHCPv6 server hands out the address"
@@ -940,13 +986,12 @@ bm::tui::ask_ip6() { # ask_ip6 [--keep] <what>
     static)
       bm::ui::input --validate bm::tui::_v_ipv6_cidr --example "2001:db8::10/64" \
         -- "Address with prefix" || return 1
-      BM_TUI_IP6="$BM_UI_REPLY"
-      bm::ui::input --optional --validate bm::tui::_v_ipv6_addr --example "2001:db8::1" \
-        -- "Gateway (router) - Enter for none" || return 1
-      BM_TUI_GW6="$BM_UI_REPLY"
-      bm::ui::input --optional --validate bm::tui::_v_dns6 --example "2001:db8::53" \
-        -- "DNS servers - Enter for none" || return 1
-      BM_TUI_DNS6="$BM_UI_REPLY"
+      bm::tui::_csv "$BM_UI_REPLY"
+      BM_TUI_IP6="$BM_TUI_CSV"
+      bm::tui::_ask_kept bm::tui::_v_ipv6_addr "2001:db8::1" "Gateway (router)" "$cur_gw" || return 1
+      BM_TUI_GW6="$BM_TUI_KEPT"
+      bm::tui::_ask_kept bm::tui::_v_dns6 "2001:db8::53" "DNS servers" "$cur_dns" || return 1
+      BM_TUI_DNS6="$BM_TUI_KEPT"
       ;;
   esac
   return 0
@@ -958,7 +1003,7 @@ bm::tui::_ip6_words() { # describe BM_TUI_IP6/GW6/DNS6 -> BM_TUI_WORDS
     dhcp) BM_TUI_WORDS="DHCPv6" ;;
     none) BM_TUI_WORDS="none (IPv6 off)" ;;
     "") BM_TUI_WORDS="unchanged" ;;
-    *) BM_TUI_WORDS="$BM_TUI_IP6${BM_TUI_GW6:+, gateway $BM_TUI_GW6}${BM_TUI_DNS6:+, DNS $BM_TUI_DNS6}" ;;
+    *) BM_TUI_WORDS="$BM_TUI_IP6$(bm::tui::_extra_words "$BM_TUI_GW6" "$BM_TUI_DNS6")" ;;
   esac
 }
 
@@ -977,8 +1022,15 @@ bm::tui::_ip4_words() { # describe BM_TUI_IP4/GW4/DNS4 -> BM_TUI_WORDS
     dhcp) BM_TUI_WORDS="automatic (DHCP)" ;;
     none) BM_TUI_WORDS="none" ;;
     "") BM_TUI_WORDS="unchanged" ;;
-    *) BM_TUI_WORDS="$BM_TUI_IP4${BM_TUI_GW4:+, gateway $BM_TUI_GW4}${BM_TUI_DNS4:+, DNS $BM_TUI_DNS4}" ;;
+    *) BM_TUI_WORDS="$BM_TUI_IP4$(bm::tui::_extra_words "$BM_TUI_GW4" "$BM_TUI_DNS4")" ;;
   esac
+}
+
+bm::tui::_extra_words() { # _extra_words <gw> <dns> -> ", gateway X, DNS Y" ("none" = removed)
+  local out=""
+  case "$1" in "") ;; none) out+=", no gateway" ;; *) out+=", gateway $1" ;; esac
+  case "$2" in "") ;; none) out+=", no DNS servers" ;; *) out+=", DNS $2" ;; esac
+  printf '%s' "$out"
 }
 
 # ---- review ---------------------------------------------------------------------
@@ -1564,8 +1616,10 @@ bm::tui::_change_ip() {
   bm::tui::_pick_family "$bond" || return 0
   bm::wf::spec_reset
   BM_SPEC[bond]="$bond"
+  local profile
+  profile="$(bm::nm::bond_con_uuid "$bond" || true)"
   if [[ "$BM_TUI_FAMILY" == 6 ]]; then
-    bm::tui::ask_ip6 --keep "$bond" || return 0
+    bm::tui::ask_ip6 --keep --profile "$profile" "$bond" || return 0
     [[ -n "$BM_TUI_IP6" ]] || return 0
     BM_SPEC[ip6]="$BM_TUI_IP6"
     [[ -n "$BM_TUI_GW6" ]] && BM_SPEC[gw6]="$BM_TUI_GW6"
@@ -1574,7 +1628,7 @@ bm::tui::_change_ip() {
     bm::tui::_apply_modify "$bond" "Set the IPv6 address of $bond: $BM_TUI_WORDS."
     return 0
   fi
-  bm::tui::ask_ip4 --keep "$bond" || return 0
+  bm::tui::ask_ip4 --keep --profile "$profile" "$bond" || return 0
   if [[ -z "$BM_TUI_IP4" ]]; then
     return 0
   fi
@@ -1665,20 +1719,25 @@ bm::tui::_change_vlan() {
       bm::ui::menu -- "Which VLAN?" "${vitems[@]}" || return 0
       vid="$BM_UI_REPLY"
       bm::tui::_pick_family "VLAN $vid" || return 0
+      local vprof="" vrec vu vv
+      while IFS= read -r vrec; do
+        IFS=$'\x1f' read -r vu _ _ vv <<<"$vrec"
+        if [[ "$vv" == "$vid" ]]; then vprof="$vu"; fi
+      done < <(bm::nm::vlan_cons "$bond")
       bm::wf::spec_reset
       BM_SPEC[bond]="$bond"
       BM_SPEC[vlan_id]="$vid"
       local fam="IPv4"
       if [[ "$BM_TUI_FAMILY" == 6 ]]; then
         fam="IPv6"
-        bm::tui::ask_ip6 --keep "VLAN $vid" || return 0
+        bm::tui::ask_ip6 --keep --profile "$vprof" "VLAN $vid" || return 0
         [[ -n "$BM_TUI_IP6" ]] || return 0
         BM_SPEC[ip6]="$BM_TUI_IP6"
         [[ -n "$BM_TUI_GW6" ]] && BM_SPEC[gw6]="$BM_TUI_GW6"
         [[ -n "$BM_TUI_DNS6" ]] && BM_SPEC[dns6]="$BM_TUI_DNS6"
         bm::tui::_ip6_words
       else
-        bm::tui::ask_ip4 --keep "VLAN $vid" || return 0
+        bm::tui::ask_ip4 --keep --profile "$vprof" "VLAN $vid" || return 0
         [[ -n "$BM_TUI_IP4" ]] || return 0
         BM_SPEC[ip4]="$BM_TUI_IP4"
         [[ -n "$BM_TUI_GW4" ]] && BM_SPEC[gw4]="$BM_TUI_GW4"
@@ -1880,18 +1939,29 @@ bm::tui::pending_screen() {
     keep "Keep it"$'\t'"the change stays" \
     undo "Undo it now"$'\t'"put everything back as it was" \
     back "Decide later" || return 0
+  # The menus hold no lock while this screen waits: meanwhile the safety net
+  # may have undone the change, or another session kept or undid it.
+  if [[ "$BM_UI_REPLY" == keep || "$BM_UI_REPLY" == undo ]] && ! bm::tui::_pending; then
+    BM_TUI_LAST_RC=0 BM_TUI_LAST_OUTCOME=gone
+    bm::tui::result safety
+    return 0
+  fi
   case "$BM_UI_REPLY" in
     keep)
       bm::tui::run safety bm::cli::cmd_commit
-      BM_TUI_LAST_OUTCOME=committed
-      if (( BM_TUI_LAST_RC == BM_EX_VERIFY )); then BM_TUI_LAST_OUTCOME=lost; fi
-      if (( BM_DRY_RUN )); then BM_TUI_LAST_OUTCOME=dry-run; fi
+      if (( BM_TUI_LAST_RC == BM_EX_PRECONDITION )) && ! bm::tui::_pending; then
+        BM_TUI_LAST_RC=0 BM_TUI_LAST_OUTCOME=gone # settled in between
+      else
+        BM_TUI_LAST_OUTCOME=committed
+        if (( BM_TUI_LAST_RC == BM_EX_VERIFY )); then BM_TUI_LAST_OUTCOME=lost; fi
+        if (( BM_DRY_RUN )); then BM_TUI_LAST_OUTCOME=dry-run; fi
+      fi
       bm::tui::result safety
       ;;
     undo)
-      bm::tui::run safety bm::cli::cmd_rollback
-      if (( BM_TUI_LAST_RC == 0 )); then
-        BM_TUI_LAST_OUTCOME=""
+      bm::tui::run safety bm::cli::undo_pending
+      if (( BM_TUI_LAST_RC == 0 )) && [[ "$BM_TUI_LAST_OUTCOME" != gone ]]; then
+        BM_TUI_LAST_OUTCOME=undone
         if (( BM_DRY_RUN )); then BM_TUI_LAST_OUTCOME=dry-run; fi
       fi
       bm::tui::result safety

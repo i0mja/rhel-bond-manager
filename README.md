@@ -599,9 +599,10 @@ IP method flags map to NetworkManager as follows:
 
 | Flag | NetworkManager property |
 |---|---|
-| `--ip4 dhcp` | `ipv4.method auto` |
-| `--ip4 none` | `ipv4.method disabled` |
+| `--ip4 dhcp` | `ipv4.method auto`, and a previous fixed `ipv4.addresses`/`ipv4.gateway` cleared (NetworkManager would keep them next to DHCP) |
+| `--ip4 none` | `ipv4.method disabled`, fixed addresses and gateway cleared |
 | `--ip4 CIDR[,CIDR]` | `ipv4.method manual` + `ipv4.addresses` (`--gw4`/`--dns4` when given) |
+| `--gw4 none`, `--dns4 none` | `ipv4.gateway ""`, `ipv4.dns ""` — without them, `modify` keeps the current gateway and DNS |
 | `--ip6 auto` | `ipv6.method auto` (SLAAC) |
 | `--ip6 dhcp` | `ipv6.method dhcp` — DHCPv6 without SLAAC, a distinct method |
 | `--ip6 none` | `ipv6.method ignore` — `disabled` only exists from NetworkManager 1.20, `ignore` means the same thing and works on every supported release |

@@ -258,3 +258,113 @@ tui() { # tui <answers (printf %b)> [global flags...]
   assert_contains "$output" "bond-manager -n vlan modify bond0 120 --ip6 dhcp"
   assert_contains "$output" "Configure IPv6 (DHCPv6) on bond0.120"
 }
+
+# ---- keep or undo, racing the safety net ------------------------------------
+
+# Opens "Keep or undo?" while a deadman-tier change waits, lets the timer undo
+# the change underneath the open screen, then answers <choice>.
+race_the_timer() { # race_the_timer keep|undo
+  export BM_STUB_NM_DIR="$BM_CONN_DIR"   # profiles live where snapshots look
+  mkdir -p "$BM_STUB_NM_DIR"
+  stub_nm_bond0_profile
+  export BM_STUB_BUSCTL_PING_RC=1        # deadman tier
+  install_nmcli_hook <<'HOOK'
+if [[ "$*" == *"connection modify 11111111-1111-1111-1111-111111111111"* ]]; then
+  sed -i 's/miimon=100/miimon=250/' "$BM_STUB_NM_DIR/11111111-1111-1111-1111-111111111111.conn"
+fi
+HOOK
+  run bash -c "printf 'y\n' | '$BM_ARTIFACT' modify bond0 --opt miimon=250"
+  [ "$status" -eq 6 ]
+  local snap
+  snap="$(sed -n 's/^snapshot=//p' "$BM_RUN_DIR/pending.state")"
+
+  mkfifo "$BATS_TEST_TMPDIR/keys"
+  timeout 60 "$BM_ARTIFACT" --plain tui <"$BATS_TEST_TMPDIR/keys" >"$BATS_TEST_TMPDIR/screen" 2>&1 &
+  local tui=$!
+  exec 7>"$BATS_TEST_TMPDIR/keys"
+  printf 'pending\n' >&7
+  local i
+  for i in $(seq 100); do
+    grep -q "Decide later" "$BATS_TEST_TMPDIR/screen" && break
+    sleep 0.1
+  done
+  # the timer fires while the screen is open
+  "$BM_ARTIFACT" rollback --snapshot "$snap" --deadman --yes >/dev/null 2>&1
+  [ ! -f "$BM_RUN_DIR/pending.state" ]
+  printf '%s\ny\n\n' "$1" >&7
+  exec 7>&-
+  wait "$tui" || true
+  output="$(cat "$BATS_TEST_TMPDIR/screen")"
+}
+
+@test "keep or undo: Undo after the safety net already undid the change does not bring it back" {
+  require_root
+  race_the_timer undo
+  assert_contains "$output" "Nothing was waiting any more"
+  assert_not_contains "$output" "Restoring snapshot"
+  grep -q 'miimon=100' "$BM_CONN_DIR/11111111-1111-1111-1111-111111111111.conn"
+}
+
+@test "keep or undo: Keep after the safety net already undid the change says so" {
+  require_root
+  race_the_timer keep
+  assert_contains "$output" "Nothing was waiting any more"
+  assert_not_contains "$output" "Could not start"
+}
+
+@test "result: a change left waiting on the snapshot tier is not promised an automatic undo" {
+  require_root
+  export BM_STUB_BUSCTL_PING_RC=1 BM_STUB_SYSTEMD_RUN_RC=1   # snapshot-only protection
+  tui 'change\nopt\nset\nmiimon\n250\ngo\ny\n\nq\nq\ny\n'
+  assert_contains "$output" "Snapshot-only protection"
+  assert_contains "$output" "The change is live but NOT kept yet."
+  assert_not_contains "$output" "It will undo itself automatically"
+  assert_contains "$output" "Nothing on this server undoes it automatically"
+}
+
+# ---- IP answers ----------------------------------------------------------------
+
+stub_bond0_with_gateway() {
+  stub_nm_conn 11111111-1111-1111-1111-111111111111 \
+    connection.id=bond0 connection.type=bond connection.interface-name=bond0 \
+    'bond.options=mode=active-backup,miimon=100' ipv4.method=manual \
+    ipv4.addresses=10.0.0.5/24 ipv4.gateway=10.0.0.1 ipv4.dns=10.0.0.53
+}
+
+@test "change > IP address: Enter keeps the current gateway and DNS, and says so" {
+  stub_bond0_with_gateway
+  tui 'change\nip\nv4\nstatic\n10.0.0.6/24\n\n\ngo\n\nq\nq\n' --dry-run
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "Enter keeps 10.0.0.1"
+  assert_contains "$output" "bond-manager -n modify bond0 --ip4 10.0.0.6/24"
+  assert_not_contains "$output" "--gw4"
+}
+
+@test "change > IP address: none removes the old gateway and DNS" {
+  stub_bond0_with_gateway
+  tui 'change\nip\nv4\nstatic\n192.168.5.10/24\nnone\nnone\ngo\n\nq\nq\n' --dry-run
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "--gw4 none --dns4 none"
+  assert_contains "$output" "ipv4.gateway '' ipv4.dns ''"
+}
+
+@test "build: a VLAN DNS list typed with spaces becomes one comma list" {
+  tui 'build\nbond9\neth2 eth3\nactive-backup\nvlan\n120\nstatic\n10.0.0.5/24\n10.0.0.1\n10.0.0.53, 10.0.0.54\nfinish\ngo\n\nq\n' --dry-run
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "--vlan '120:ip4=10.0.0.5/24;gw4=10.0.0.1;dns4=10.0.0.53,10.0.0.54'"
+  assert_not_contains "$output" "invalid VLAN id"
+  assert_not_contains "$output" "was not accepted"
+}
+
+@test "result: a support bundle made in practice mode is not called 'nothing was changed'" {
+  tui 'tools\nbundle\nn\n\nq\nq\n' --dry-run
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "support bundle:"
+  assert_not_contains "$output" "nothing was changed"
+}
+
+@test "result: saying no to a snapshot restore is shown as cancelled, not finished" {
+  require_root
+  tui 'safety\nsave\n\nsnapshots\n1\nrestore\nn\n\nq\nq\n'
+  assert_contains "$output" "Cancelled - nothing was changed."
+}

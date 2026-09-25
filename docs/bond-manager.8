@@ -293,12 +293,24 @@ and an address list sets
 .B ipv4.method manual
 with
 .BR ipv4.addresses .
+.B dhcp
+and
+.B none
+also clear a previous fixed address and gateway, which NetworkManager would
+otherwise keep.
 .TP
-.BI \-\-gw4 " ADDR"
-IPv4 gateway.
+.BI \-\-gw4 " ADDR\fR|\fPnone"
+IPv4 gateway;
+.B none
+removes it.
+Without this flag,
+.B modify
+keeps the current gateway.
 .TP
-.BI \-\-dns4 " A,B"
-IPv4 DNS servers.
+.BI \-\-dns4 " A,B\fR|\fPnone"
+IPv4 DNS servers;
+.B none
+removes them.
 .TP
 .BI \-\-ip6 " auto\fR|\fPdhcp\fR|\fPnone\fR|\fPCIDR" [ ,CIDR ]
 IPv6 method or static address list.
@@ -321,11 +333,15 @@ value exists only from NetworkManager 1.20, and
 .B ignore
 means the same thing on every release this tool supports.
 .TP
-.BI \-\-gw6 " ADDR"
-IPv6 gateway.
+.BI \-\-gw6 " ADDR\fR|\fPnone"
+IPv6 gateway;
+.B none
+removes it.
 .TP
-.BI \-\-dns6 " A,B"
-IPv6 DNS servers.
+.BI \-\-dns6 " A,B\fR|\fPnone"
+IPv6 DNS servers;
+.B none
+removes them.
 .TP
 .BI \-\-mtu " N"
 MTU for the bond (and its members).

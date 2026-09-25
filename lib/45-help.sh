@@ -192,8 +192,9 @@ bm::help::tier_short() { # for the dashboard
 BM_HELP_TITLE=""
 BM_HELP_STYLE=info
 BM_HELP_LINES=()
-bm::help::explain_rc() { # explain_rc <rc> [outcome] [practice 0|1]
-  local rc="$1" outcome="${2:-}" practice="${3:-0}"
+bm::help::explain_rc() { # explain_rc <rc> [outcome] [practice 0|1] [tier]
+  # practice mode shows in the outcome (dry-run); $3 no longer changes the words
+  local rc="$1" outcome="${2:-}" tier="${4:-}"
   BM_HELP_LINES=()
   case "$rc:$outcome" in
     0:committed)
@@ -211,14 +212,21 @@ bm::help::explain_rc() { # explain_rc <rc> [outcome] [practice 0|1]
     0:noop)
       BM_HELP_TITLE="Nothing to do - it is already set up that way."
       BM_HELP_STYLE=ok ;;
+    0:undone)
+      BM_HELP_TITLE="Undone - the settings from before the change are back."
+      BM_HELP_STYLE=ok
+      BM_HELP_LINES=("The messages above list what was brought back up.") ;;
+    0:gone)
+      BM_HELP_TITLE="Nothing was waiting any more."
+      BM_HELP_STYLE=warn
+      BM_HELP_LINES=("The safety net had already undone the change (its time ran out), or it was kept or undone from another session."
+        "The dashboard shows what runs now; 'Check my bonds' says whether all is well.") ;;
     0:*)
+      # not "nothing was changed" in practice mode: a support bundle, for
+      # one, is written either way
       BM_HELP_TITLE="Finished."
       BM_HELP_STYLE=ok
-      if (( practice )); then
-        BM_HELP_LINES=("Practice mode: nothing was changed.")
-      else
-        BM_HELP_LINES=("See the messages above for details.")
-      fi ;;
+      BM_HELP_LINES=("See the messages above for details.") ;;
     "$BM_EX_USAGE":*)
       BM_HELP_TITLE="Something you entered was not accepted - nothing was changed."
       BM_HELP_STYLE=err
@@ -247,8 +255,13 @@ bm::help::explain_rc() { # explain_rc <rc> [outcome] [practice 0|1]
     "$BM_EX_PARTIAL":*)
       BM_HELP_TITLE="The change is live but NOT kept yet."
       BM_HELP_STYLE=warn
-      BM_HELP_LINES=("It will undo itself automatically unless you keep it."
-        "Keep it: menu 'Undo & safety' (or: $BM_PROG commit).") ;;
+      if [[ "$tier" == snapshot ]]; then
+        BM_HELP_LINES=("Nothing on this server undoes it automatically (snapshot-only protection)."
+          "Keep it or undo it: menu 'Undo & safety' (or: $BM_PROG commit / $BM_PROG rollback).")
+      else
+        BM_HELP_LINES=("It will undo itself automatically unless you keep it."
+          "Keep it: menu 'Undo & safety' (or: $BM_PROG commit).")
+      fi ;;
     130:*)
       BM_HELP_TITLE="You stopped it."
       BM_HELP_STYLE=warn
@@ -716,6 +729,8 @@ Examples:
 Good to know:
   - Changing the mode drops options that only made sense in the old mode,
     and tells you which.
+  - A new address keeps the old gateway and DNS unless you say otherwise:
+    --gw4 none / --dns4 none remove them. --ip4 dhcp drops the old address.
   - Changing the IP of the address you are logged in on will cut your
     session: open a new session to the new address and run
     'sudo $p commit' before the countdown ends.

@@ -69,7 +69,7 @@ bm::plan::render() { # human-readable plan
 # name containing $(...), a semicolon, whitespace) must come out inert.
 bm::plan::_shq() {
   local v="$1"
-  if [[ "$v" =~ ^[A-Za-z0-9_@%+=:,./-]*$ ]]; then
+  if [[ -n "$v" && "$v" =~ ^[A-Za-z0-9_@%+=:,./-]*$ ]]; then # '' must show
     printf '%s' "$v"
   else
     printf "'%s'" "${v//\'/\'\\\'\'}"

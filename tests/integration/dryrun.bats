@@ -168,6 +168,31 @@ assert_nothing_touched() {
   assert_nothing_touched
 }
 
+@test "dry-run modify: --ip4 dhcp drops the old fixed address and gateway" {
+  stub_nm_bond0_profile
+  run_cli --dry-run modify bond0 --ip4 dhcp
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "ipv4.method auto ipv4.addresses '' ipv4.gateway ''"
+}
+
+@test "dry-run modify: --gw4 none and --dns4 none clear them (shown quoted, so it can be pasted)" {
+  stub_nm_bond0_profile
+  run_cli --dry-run modify bond0 --ip4 10.0.5.10/24 --gw4 none --dns4 none
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "ipv4.method manual ipv4.addresses 10.0.5.10/24 ipv4.gateway '' ipv4.dns ''"
+  run_cli --dry-run modify bond0 --ip6 2001:db8::10/64 --gw6 none --dns6 none
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "ipv6.gateway '' ipv6.dns ''"
+}
+
+@test "dry-run create: spaces inside a --vlan value do not split it into two VLANs" {
+  run_cli --dry-run create bond9 --mode active-backup --members eth2,eth3 \
+    --vlan "120: ip4=10.0.0.5/24; dns4=10.0.0.53, 10.0.0.54"
+  [ "$status" -eq 0 ]
+  assert_not_contains "$output" "invalid VLAN id"
+  assert_contains "$output" "ipv4.dns 10.0.0.53,10.0.0.54"
+}
+
 @test "dry-run modify: --del-opt removes a key from the rendered options" {
   stub_nm_conn 55555555-5555-5555-5555-555555555555 \
     connection.id=bond0 connection.type=bond connection.interface-name=bond0 \

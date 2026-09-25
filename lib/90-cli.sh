@@ -55,8 +55,8 @@ Change commands (root; guarded by plan → snapshot → checkpoint → verify):
   repair BOND                            Rebuild port profiles from kernel state
 
 Create/modify IP + tuning flags:
-  --ip4 dhcp|none|CIDR[,CIDR]  --gw4 A  --dns4 A,B
-  --ip6 auto|dhcp|none|CIDR[,CIDR]  --gw6 A  --dns6 A,B
+  --ip4 dhcp|none|CIDR[,CIDR]  --gw4 A|none  --dns4 A,B|none
+  --ip6 auto|dhcp|none|CIDR[,CIDR]  --gw6 A|none  --dns6 A,B|none
   --mtu N   --opt key=value (repeatable)   --vlan VID[:ip4=..;gw4=..] (repeatable)
   --miimon MS  --primary IF  --lacp-rate fast|slow  --xmit-hash POLICY
   --arp-interval MS --arp-targets IP[,IP]  --min-links N  --no-activate
@@ -706,7 +706,7 @@ bm::cli::_parse_change_flags() {
       --ip6) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[ip6]="$2"; shift 2 ;;
       --gw6) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[gw6]="$2"; shift 2 ;;
       --dns6) bm::cli::_need_arg "$1" "${2-}"; BM_SPEC[dns6]="$2"; shift 2 ;;
-      --vlan) bm::cli::_need_arg "$1" "${2-}"; vlan_tokens+=("$2"); shift 2 ;;
+      --vlan) bm::cli::_need_arg "$1" "${2-}"; vlan_tokens+=("$(bm::wf::vlan_token_clean "$2")"); shift 2 ;;
       --miimon) bm::cli::_need_arg "$1" "${2-}"; opt_pairs+=("miimon=$2"); shift 2 ;;
       --primary) bm::cli::_need_arg "$1" "${2-}"; opt_pairs+=("primary=$2"); shift 2 ;;
       --lacp-rate) bm::cli::_need_arg "$1" "${2-}"; opt_pairs+=("lacp_rate=$2"); shift 2 ;;
@@ -814,7 +814,7 @@ bm::cli::cmd_vlan() {
       bm::cli::preflight_mutate
       bm::wf::spec_reset
       BM_SPEC[bond]="$bond"
-      BM_SPEC[vlans]="$tok"
+      BM_SPEC[vlans]="$(bm::wf::vlan_token_clean "$tok")"
       bm::wf::vlan_add
       ;;
     modify)
@@ -921,6 +921,35 @@ bm::cli::cmd_commit() {
   esac
 }
 
+# The menus' "Undo it now": undo the waiting change and nothing else. Plain
+# `rollback` falls back to the newest snapshot when nothing waits, and once
+# the safety net has undone the change, the newest snapshot is the copy the
+# restore took of the change itself.
+bm::cli::undo_pending() {
+  if (( BM_DRY_RUN )); then
+    if bm::ckpt::load_pending; then
+      bm::log::say "[dry-run] would roll back the pending change: ${BM_PENDING_SUMMARY:-?} (tier ${BM_PENDING_TIER:-?}, snapshot ${BM_PENDING_SNAPSHOT:-?})"
+    else
+      BM_PLAN_OUTCOME=gone
+    fi
+    return "$BM_EX_OK"
+  fi
+  bm::core::require_root
+  bm::log::enable_file
+  bm::log::set_op rollback
+  bm::lock::acquire
+  if ! bm::ckpt::load_pending; then
+    bm::log::info "undo: nothing is waiting any more"
+    BM_PLAN_OUTCOME=gone
+    return "$BM_EX_OK"
+  fi
+  if bm::ckpt::rollback_pending; then
+    bm::log::say "$(bm::core::c_ok "pending change rolled back")"
+    return "$BM_EX_OK"
+  fi
+  bm::core::die "the rollback of the pending change reported problems (see above) — inspect manually" "$BM_EX_ERR"
+}
+
 bm::cli::cmd_rollback() {
   local snapshot="" deadman=0
   while (( $# )); do
@@ -991,6 +1020,7 @@ bm::cli::cmd_rollback() {
   echo
   if ! (( BM_ASSUME_YES )); then
     bm::ui::yesno "Restore snapshot $snapshot (see change summary above)?" || {
+      BM_PLAN_OUTCOME=cancelled
       bm::log::say "cancelled"
       return "$BM_EX_OK"
     }

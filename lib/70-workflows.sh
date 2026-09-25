@@ -96,9 +96,9 @@ bm::wf::_plan_ip_steps() { # _plan_ip_steps <con-ref> <label> <ip4> <gw4> <dns4>
         bm::val::ipv4_cidr "$a" || bm::core::die "invalid IPv4 CIDR '$a'" "$BM_EX_USAGE" \
           "write the address with its prefix, e.g. 10.0.0.10/24 (or use dhcp / none)"
       done
-      [[ -n "$gw4" ]] && { bm::val::ipv4_addr "$gw4" || bm::core::die "invalid IPv4 gateway '$gw4'" "$BM_EX_USAGE" \
+      [[ -n "$gw4" && "$gw4" != none ]] && { bm::val::ipv4_addr "$gw4" || bm::core::die "invalid IPv4 gateway '$gw4'" "$BM_EX_USAGE" \
         "the gateway is a plain address without a prefix, e.g. 10.0.0.1"; }
-      [[ -n "$dns4" ]] && { bm::val::ip_list v4 "${dns4// /,}" || bm::core::die "invalid IPv4 DNS list '$dns4'" "$BM_EX_USAGE" \
+      [[ -n "$dns4" && "$dns4" != none ]] && { bm::val::ip_list v4 "${dns4// /,}" || bm::core::die "invalid IPv4 DNS list '$dns4'" "$BM_EX_USAGE" \
         "DNS servers are plain addresses, comma-separated, e.g. 10.0.0.53,10.0.0.54"; }
     fi
     bm::nm::ip_args 4 "$m4" "$ip4" "$gw4" "$dns4" || bm::core::die "invalid IPv4 method '$ip4'" "$BM_EX_USAGE" \
@@ -116,19 +116,27 @@ bm::wf::_plan_ip_steps() { # _plan_ip_steps <con-ref> <label> <ip4> <gw4> <dns4>
         bm::val::ipv6_cidr "$a6" || bm::core::die "invalid IPv6 CIDR '$a6'" "$BM_EX_USAGE" \
           "write the address with its prefix, e.g. 2001:db8::10/64 (or use auto / dhcp / none)"
       done
-      [[ -n "$gw6" ]] && { bm::val::ipv6_addr "$gw6" || bm::core::die "invalid IPv6 gateway '$gw6'" "$BM_EX_USAGE" \
+      [[ -n "$gw6" && "$gw6" != none ]] && { bm::val::ipv6_addr "$gw6" || bm::core::die "invalid IPv6 gateway '$gw6'" "$BM_EX_USAGE" \
         "the gateway is a plain address without a prefix, e.g. 2001:db8::1"; }
-      [[ -n "$dns6" ]] && { bm::val::ip_list v6 "${dns6// /,}" || bm::core::die "invalid IPv6 DNS list '$dns6'" "$BM_EX_USAGE" \
+      [[ -n "$dns6" && "$dns6" != none ]] && { bm::val::ip_list v6 "${dns6// /,}" || bm::core::die "invalid IPv6 DNS list '$dns6'" "$BM_EX_USAGE" \
         "DNS servers are plain addresses, comma-separated, e.g. 2001:db8::53,2001:db8::54"; }
     fi
+    # leaving a fixed address drops it and its gateway (see bm::nm::ip_args)
+    local -a clear6=(ipv6.addresses "" ipv6.gateway "")
+    if [[ "$dns6" == none ]]; then
+      clear6+=(ipv6.dns "")
+    elif [[ -n "$dns6" ]]; then
+      bm::core::split_list "$dns6"
+      clear6+=(ipv6.dns "$(bm::core::join , "${BM_LIST[@]}")")
+    fi
     if [[ "$m6" == auto ]]; then
-      bm::plan::add "Configure IPv6 (SLAAC/auto) on $label" bm::nm::modify "$con" ipv6.method auto
+      bm::plan::add "Configure IPv6 (SLAAC/auto) on $label" bm::nm::modify "$con" ipv6.method auto "${clear6[@]}"
     elif [[ "$m6" == dhcp ]]; then
       # DHCPv6 without SLAAC is a distinct NetworkManager method; mapping it
       # to 'auto' would silently give the operator something else.
-      bm::plan::add "Configure IPv6 (DHCPv6) on $label" bm::nm::modify "$con" ipv6.method dhcp
+      bm::plan::add "Configure IPv6 (DHCPv6) on $label" bm::nm::modify "$con" ipv6.method dhcp "${clear6[@]}"
     elif [[ "$m6" == none ]]; then
-      bm::plan::add "Disable IPv6 on $label" bm::nm::modify "$con" ipv6.method ignore
+      bm::plan::add "Disable IPv6 on $label" bm::nm::modify "$con" ipv6.method ignore "${clear6[@]}"
     else
       bm::nm::ip_args 6 static "$ip6" "$gw6" "$dns6"
       bm::plan::add "Configure IPv6 ($ip6) on $label" bm::nm::modify "$con" "${BM_NM_IP_ARGS[@]}"
@@ -244,6 +252,17 @@ bm::wf::affected_devices() { # affected_devices <bond> [extra...]
 BM_WF_CLI=""
 BM_WF_ARGV=()
 bm::wf::_q() { BM_WF_ARGV+=("$(bm::plan::_shq "$1")"); }
+
+# A --vlan value without whitespace: BM_SPEC[vlans] is a space-separated
+# list of these, so a blank inside one would split it into a bogus second
+# VLAN. Blanks next to a separator go; other blanks separate list items
+# ("dns4=10.0.0.53, 10.0.0.54" -> "dns4=10.0.0.53,10.0.0.54").
+bm::wf::vlan_token_clean() { # vlan_token_clean <token> -> stdout
+  printf '%s' "$1" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g
+    s/[[:space:]]*([,;:=])[[:space:]]*/\1/g
+    s/[[:space:]]+/,/g
+    s/,+/,/g'
+}
 
 bm::wf::cli_equivalent() { # cli_equivalent <subcommand>
   local sub="$1" tok k

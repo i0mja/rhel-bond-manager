@@ -256,28 +256,38 @@ bm::nm::ip_args() { # ip_args <4|6> <method> <addrs> <gw> <dns>
   local fam="$1" method="$2" addrs="$3" gw="$4" dns="$5"
   BM_NM_IP_ARGS=()
   local p="ipv$fam"
+  # Leaving a fixed address drops it (and its gateway): NetworkManager keeps
+  # ipv4.addresses next to DHCP, and refuses them with 'disabled'. A gateway
+  # or DNS list of "none" clears it.
   case "$method" in
     dhcp | auto)
-      BM_NM_IP_ARGS+=("$p.method" auto)
+      BM_NM_IP_ARGS+=("$p.method" auto "$p.addresses" "" "$p.gateway" "")
       ;;
     none | disabled)
       # ipv4 has had 'disabled' forever; ipv6 uses 'ignore' for NM < 1.20
       if [[ "$fam" == 6 ]]; then
-        BM_NM_IP_ARGS+=("$p.method" ignore)
+        BM_NM_IP_ARGS+=("$p.method" ignore "$p.addresses" "" "$p.gateway" "")
       else
-        BM_NM_IP_ARGS+=("$p.method" disabled)
+        BM_NM_IP_ARGS+=("$p.method" disabled "$p.addresses" "" "$p.gateway" "")
       fi
       ;;
     static)
       BM_NM_IP_ARGS+=("$p.method" manual "$p.addresses" "$addrs")
-      [[ -n "$gw" ]] && BM_NM_IP_ARGS+=("$p.gateway" "$gw")
+      if [[ "$gw" == none ]]; then
+        BM_NM_IP_ARGS+=("$p.gateway" "")
+      elif [[ -n "$gw" ]]; then
+        BM_NM_IP_ARGS+=("$p.gateway" "$gw")
+      fi
       ;;
     *)
       return 1
       ;;
   esac
-  if [[ -n "$dns" ]]; then
-    BM_NM_IP_ARGS+=("$p.dns" "${dns// /,}")
+  if [[ "$dns" == none ]]; then
+    BM_NM_IP_ARGS+=("$p.dns" "")
+  elif [[ -n "$dns" ]]; then
+    bm::core::split_list "$dns"
+    BM_NM_IP_ARGS+=("$p.dns" "$(bm::core::join , "${BM_LIST[@]}")")
   fi
   return 0
 }
