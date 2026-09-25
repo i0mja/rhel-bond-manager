@@ -37,6 +37,11 @@ CI runs the whole suite twice: first as a normal user, then as root
   root-only `snapshot create`) returns an error instead of an empty id, so a
   test that forgets `require_root` fails rather than passing vacuously.
 
+CI also runs both passes on **bash 4.4** (the `test-bash44` job builds
+4.4.18, the version family RHEL 8 ships) because the runner's own bash is
+5.x. Do the same locally by putting a bash 4.4 first on `PATH`: the tool,
+the stubs and bats all run `bash` from `PATH`.
+
 To reproduce the unprivileged pass locally from a root shell:
 
 ```sh
@@ -57,6 +62,8 @@ setpriv --reuid=65534 --regid=65534 --clear-groups \
   `systemd-run`, `ping`, `modprobe`, `ethtool`, `journalctl`, `logger`,
   `restorecon`, `who`, `ps`). The sandbox prepends this dir to `PATH`, so the
   tool's PATH-resolved external commands hit the shims.
+- `tools/pty-drive` — runs a command in a pseudo-terminal and types keys
+  into it, for the fancy-mode menu tests (see "Driving the guided menus").
 - `tools/mk-proc-bond` — test-only generator (not a shim, not on `PATH`) that
   writes a realistic active-backup `/proc/net/bonding/<bond>` for an arbitrary
   member list. `write_proc_bond` calls it, and so do the nmcli hooks that model
@@ -158,8 +165,14 @@ into `bond_manager.sh --dry-run tui`.
 - Pass `--dry-run` so the run is identical as root and as a normal user
   (without it, a non-root run first shows the "practice mode is on" screen).
 
-The fancy (arrow-key) mode needs a real terminal and is not part of the
-suite. Its logic lives in pure helpers that are unit-tested instead:
+The fancy (arrow-key) mode only appears on a real terminal.
+`tests/integration/tui_pty.bats` gives it one: `tools/pty-drive` (python3
+standard library) runs the program in a pseudo-terminal, types keys
+(`'\x1b[B'` is Down, `'\r'` Enter, `'\x03'` Ctrl-C), waits for text with
+`@expect:TEXT`, and prints what was drawn plus a final `PTY-EXIT <status>`.
+Assert on the output with the escape codes stripped (`strip_escapes` there).
+The logic behind the fancy mode also lives in pure helpers that are
+unit-tested directly:
 `bm::ui::read_key` (key decoding from piped escape sequences),
 `bm::ui::_nav` / `bm::ui::_view` (cursor and viewport maths), and
 `bm::ui::fit` / `bm::ui::vlen` / `bm::ui::box_lines` (layout). To check
