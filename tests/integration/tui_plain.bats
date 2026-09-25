@@ -131,6 +131,29 @@ tui() { # tui <answers (printf %b)> [global flags...]
   assert_contains "$output" "Remove member profile for 'eth1'"
 }
 
+@test "change > remove port: a port with no link is removed without a link warning" {
+  scenario_bond0_degraded
+  printf 'down\n' >"$BM_SYS_ROOT/class/net/eth1/operstate"
+  tui 'change\nremove\neth1\ngo\n\nq\nq\n' --dry-run
+  [ "$status" -eq 0 ]
+  assert_not_contains "$output" "has no link right now"
+  assert_not_contains "$output" "anyway?"
+  assert_contains "$output" "Remove member profile for 'eth1'"
+}
+
+@test "change > add port: a port whose VLAN carries the SSH session is flagged first" {
+  mkdir -p "$BM_PROC_ROOT/net/vlan"
+  printf 'VLAN Dev name | VLAN ID\nName-Type: VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD\neth2.100 | 100 | eth2\n' \
+    >"$BM_PROC_ROOT/net/vlan/config"
+  mk_sys_nic eth2.100 up 1000 52:54:00:12:34:03
+  stub_ssh_session 10.9.9.9 eth2.100
+  tui 'change\nadd\neth2\n\nq\nq\nq\n' --dry-run
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "YOUR SSH CONNECTION"
+  assert_contains "$output" "eth2 carries your SSH connection"
+  assert_not_contains "$output" "Add member 'eth2'"   # Enter (no) went back to the list
+}
+
 @test "change > mode: switching to 802.3ad asks about the switch and adds LACP defaults" {
   tui 'change\nmode\n802.3ad\ny\ngo\n\nq\nq\n' --dry-run
   [ "$status" -eq 0 ]

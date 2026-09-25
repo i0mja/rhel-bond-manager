@@ -732,12 +732,18 @@ bm::tui::pick_nics() {
       continue
     fi
     local label="" notes="" link spd
+    # no link only matters for a port being added; removing or replacing
+    # a dead port is exactly what it needs
     case "$BM_NIC_LINK" in
       up) link=up ;;
-      no-link) link="NO LINK"; risky_link+=("$n") ;;
-      off) link="switched off"; risky_link+=("$n") ;;
+      no-link) link="NO LINK"; [[ "$src" == free ]] && risky_link+=("$n") ;;
+      off) link="switched off"; [[ "$src" == free ]] && risky_link+=("$n") ;;
       *) link="link ?" ;;
     esac
+    local ssh_here=0
+    if [[ "$n" == "$BM_TUI_SSH_DEV" || ( -n "$BM_TUI_SSH_PARENT" && "$n" == "$BM_TUI_SSH_PARENT" ) ]]; then
+      ssh_here=1 # the session runs on this port, or on a VLAN on it
+    fi
     spd="$(bm::help::speed_label "$BM_NIC_SPEED")"
     notes="$link $BM_G_SEP $spd"
     if [[ "$src" == members && "$n" == "$active" ]]; then notes+=" $BM_G_SEP active now"; fi
@@ -747,13 +753,13 @@ bm::tui::pick_nics() {
         notes+=" $BM_G_SEP has IP $BM_TUI_ADDR (in use?)"
         risky_ip+=("$n")
       fi
-      if [[ "$n" == "$BM_TUI_SSH_DEV" ]]; then
+      if (( ssh_here )); then
         notes+=" $BM_G_SEP YOUR SSH CONNECTION"
         risky_ssh+=("$n")
       elif [[ -z "$BM_TUI_ADDR" && "$BM_NIC_LINK" == up ]]; then
         notes+=" $BM_G_SEP free"
       fi
-    elif [[ "$n" == "$BM_TUI_SSH_DEV" ]]; then
+    elif (( ssh_here )); then
       notes+=" $BM_G_SEP your SSH connection"
     fi
     label="$n"$'\t'"$notes"

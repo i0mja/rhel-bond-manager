@@ -610,13 +610,21 @@ bm::ui::_menu_plain() {
     if [[ "${_labels[$i]}" == *$'\t'* ]]; then note="${_labels[$i]#*$'\t'}"; fi
     printf '  %2d) %s%s\n' "$n" "$main" "${note:+  ($note)}" >&2
   done
-  local extra="" qword=back
+  local extra="" qword=back own_quit=0
   if [[ " $keys " == *" q "* ]]; then
     qword=quit
   fi
-  printf '   q) %s\n' "${qword^}" >&2
+  for i in "${_sel_idx[@]}"; do
+    if [[ "${_tags[$i]}" == quit ]]; then own_quit=1; fi
+  done
+  # q always works; list it only when the menu has no Quit item of its own
+  if (( ! own_quit )); then
+    printf '   q) %s\n' "${qword^}" >&2
+  fi
   local k
-  for k in $keys; do
+  local -a keylist=()
+  read -r -a keylist <<<"$keys" || true # an array, so '?' is never a glob
+  for k in "${keylist[@]}"; do
     case "$k" in
       p) extra+="   p) practice on/off" ;;
       r) extra+="   r) refresh" ;;
@@ -651,8 +659,8 @@ bm::ui::_menu_plain() {
     case "${ans,,}" in
       q | back | 0 | quit | exit) return 1 ;;
     esac
-    if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= count )); then
-      BM_UI_SEL=$(( ans - 1 ))
+    if [[ "$ans" =~ ^[0-9]{1,6}$ ]] && (( 10#$ans >= 1 && 10#$ans <= count )); then
+      BM_UI_SEL=$(( 10#$ans - 1 )) # 10#: "010" is ten, not octal eight
       BM_UI_REPLY="${_tags[${_sel_idx[$BM_UI_SEL]}]}"
       return 0
     fi
@@ -915,8 +923,8 @@ bm::ui::_check_plain() {
       read -r -a toks <<<"${ans//,/ }" || true
       for tok in "${toks[@]}"; do
         local found=0
-        if [[ "$tok" =~ ^[0-9]+$ ]] && (( tok >= 1 && tok <= count )); then
-          newchk[${_sel_idx[$((tok - 1))]}]=1
+        if [[ "$tok" =~ ^[0-9]{1,6}$ ]] && (( 10#$tok >= 1 && 10#$tok <= count )); then
+          newchk[${_sel_idx[$((10#$tok - 1))]}]=1
           found=1
         else
           for p in "${_sel_idx[@]}"; do

@@ -145,26 +145,29 @@ bm::plan::execute() {
 bm::plan::ssh_guard() { # ssh_guard <tier> <affected-devs...>
   local tier="$1"
   shift
-  local egress
+  local egress parent
   egress="$(bm::facts::ssh_egress_dev || true)"
   [[ -n "$egress" ]] || return 0
-  local dev
+  # A session on eth2.100 dies just as surely when eth2 goes into a bond.
+  parent="$(bm::facts::vlan_parent "$egress")"
+  local dev hit="" via=""
   for dev in "$@"; do
-    [[ "$dev" == "$egress" ]] || continue
-    if [[ "$tier" == checkpoint ]]; then
-      bm::log::say "$(bm::core::c_warn "NOTE: this change touches '$egress', which carries your SSH session.")"
-      bm::log::say "$(bm::core::c_warn "NetworkManager will auto-rollback in $(bm::plan::_window)s unless you commit.")"
-      return 0
-    fi
-    if (( BM_FORCE_UNSAFE )); then
-      bm::log::say "$(bm::core::c_warn "WARNING: proceeding without checkpoint protection on your SSH egress device ($egress).")"
-      return 0
-    fi
-    printf '%s: %s this change touches %s, which carries your SSH session, and NetworkManager checkpoints are unavailable (tier: %s).\nUse a console, or re-run with --force-unsafe to accept the risk of losing access.\n' \
-      "$BM_PROG" "$(bm::core::c_err ERROR:)" "'$egress'" "$tier" >&2
-    return 1
+    if [[ "$dev" == "$egress" ]]; then hit="$egress" via=""; break; fi
+    if [[ -n "$parent" && "$dev" == "$parent" && -z "$hit" ]]; then hit="$parent" via=" (through $egress)"; fi
   done
-  return 0
+  [[ -n "$hit" ]] || return 0
+  if [[ "$tier" == checkpoint ]]; then
+    bm::log::say "$(bm::core::c_warn "NOTE: this change touches '$hit', which carries your SSH session$via.")"
+    bm::log::say "$(bm::core::c_warn "NetworkManager will auto-rollback in $(bm::plan::_window)s unless you commit.")"
+    return 0
+  fi
+  if (( BM_FORCE_UNSAFE )); then
+    bm::log::say "$(bm::core::c_warn "WARNING: proceeding without checkpoint protection on your SSH egress device ($egress).")"
+    return 0
+  fi
+  printf '%s: %s this change touches %s, which carries your SSH session%s, and NetworkManager checkpoints are unavailable (tier: %s).\nUse a console, or re-run with --force-unsafe to accept the risk of losing access.\n' \
+    "$BM_PROG" "$(bm::core::c_err ERROR:)" "'$hit'" "$via" "$tier" >&2
+  return 1
 }
 
 bm::plan::_window() {
@@ -361,6 +364,7 @@ bm::plan::_gate_extend() { # _gate_extend <seconds-left> -> 0 when extended
   if [[ "$BM_CKPT_TIER" == checkpoint && -n "$BM_CKPT_PATH" ]]; then
     if bm::ckpt::dbus_extend "$BM_CKPT_PATH" $(( remaining + add )); then
       BM_CKPT_DEADLINE=$(( $(bm::core::epoch) + remaining + add ))
+      bm::ckpt::_write_state # other sessions and the menus count down from it
       return 0
     fi
   fi
@@ -384,6 +388,9 @@ bm::plan::commit_gate() {
   fi
 
   local key remaining now rc
+  # Keys typed while the plan ran are not answers: the operator has not seen
+  # the verification result yet.
+  while IFS= read -rsn1 -t 0.01 key; do :; done
   while :; do
     printf -v now '%(%s)T' -1
     remaining=$(( ${BM_CKPT_DEADLINE:-0} - now ))

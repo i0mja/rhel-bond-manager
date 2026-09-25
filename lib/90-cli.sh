@@ -484,13 +484,64 @@ bm::cli::cmd_config() {
 # ---- nics ---------------------------------------------------------------------
 
 # Does <nic> carry this session's SSH traffic? True for the egress device
-# itself, and for the members of a bond (or of a bond under a VLAN) that is.
+# itself, the port under a VLAN that is, and the members of a bond (or of a
+# bond under a VLAN) that is.
 bm::cli::_carries_ssh() { # _carries_ssh <nic> <master> <ssh-dev> <ssh-parent>
   local n="$1" master="$2" dev="$3" parent="$4"
   [[ -n "$dev" ]] || return 1
   [[ "$n" == "$dev" ]] && return 0
+  [[ -n "$parent" && "$n" == "$parent" ]] && return 0 # eth2 under SSH on eth2.100
   [[ -n "$master" && ( "$master" == "$dev" || "$master" == "$parent" ) ]] && return 0
   return 1
+}
+
+# Print the collected nics rows (c_* arrays of the caller): columns as wide
+# as their content, and on a terminal the NOTE column wraps under itself
+# instead of spilling into the next line's NIC column.
+bm::cli::_nics_table() {
+  local -a heads=(NIC LINK SPEED IN-BOND ADDRESSES)
+  local -a w=(${#heads[0]} ${#heads[1]} ${#heads[2]} ${#heads[3]} ${#heads[4]})
+  local i
+  for i in "${!c_nic[@]}"; do
+    (( ${#c_nic[i]} > w[0] )) && w[0]=${#c_nic[i]}
+    (( ${#c_link[i]} > w[1] )) && w[1]=${#c_link[i]}
+    (( ${#c_speed[i]} > w[2] )) && w[2]=${#c_speed[i]}
+    (( ${#c_bond[i]} > w[3] )) && w[3]=${#c_bond[i]}
+    (( ${#c_addr[i]} > w[4] )) && w[4]=${#c_addr[i]}
+  done
+  local fmt="%-${w[0]}s  %-${w[1]}s  %-${w[2]}s  %-${w[3]}s  %-${w[4]}s  "
+  local notecol=$(( w[0] + w[1] + w[2] + w[3] + w[4] + 10 )) room=0 cols
+  if [[ -t 1 ]]; then
+    cols="${COLUMNS:-}"
+    if ! [[ "$cols" =~ ^[0-9]+$ ]]; then cols="$(tput cols 2>/dev/null || true)"; fi
+    if [[ "$cols" =~ ^[0-9]+$ ]]; then room=$(( cols - 1 - notecol )); fi
+    (( room >= 20 )) || room=0 # too narrow to be worth wrapping: let it spill
+  fi
+  # shellcheck disable=SC2059 # fmt is built from numbers only
+  printf "$fmt%s\n" "${heads[@]}" NOTE
+  local line pad
+  printf -v pad '%*s' "$notecol" ''
+  for i in "${!c_nic[@]}"; do
+    # shellcheck disable=SC2059
+    printf "$fmt" "${c_nic[i]}" "${c_link[i]}" "${c_speed[i]}" "${c_bond[i]}" "${c_addr[i]}"
+    if (( room > 0 && ${#c_note[i]} > room )); then
+      bm::ui::wrap "$room" "${c_note[i]}"
+    else
+      BM_UI_WRAPPED=("${c_note[i]}")
+    fi
+    local first=1
+    for line in "${BM_UI_WRAPPED[@]}"; do
+      (( first )) || printf '%s' "$pad"
+      first=0
+      case "${c_tone[i]}" in
+        warn) bm::core::c_warn "$line" ;;
+        ok) bm::core::c_ok "$line" ;;
+        dim) bm::core::c_dim "$line" ;;
+        *) printf '%s' "$line" ;;
+      esac
+      printf '\n'
+    done
+  done
 }
 
 bm::cli::cmd_nics() {
@@ -532,9 +583,9 @@ bm::cli::cmd_nics() {
     return "$BM_EX_OK"
   fi
 
-  printf '%-15s %-8s %-6s %-10s %-20s %s\n' NIC LINK SPEED IN-BOND ADDRESSES NOTE
-  local link speed inbond addrs first extra note active
+  local link speed inbond addrs first extra note tone active vpar
   local -a free_up=() addr_list=()
+  local -a c_nic=() c_link=() c_speed=() c_bond=() c_addr=() c_note=() c_tone=()
   for n in "${names[@]}"; do
     bm::facts::nic_info "$n" || true
     case "$BM_NIC_LINK" in
@@ -552,35 +603,41 @@ bm::cli::cmd_nics() {
     addrs="${first:--}$extra"
     allowed=1
     bm::facts::nic_allowed "$n" || allowed=0
-    local vpar
     vpar="$(bm::facts::vlan_parent "$n")"
+    tone=plain
     if (( ! allowed )); then
-      note="$(bm::core::c_dim "hidden by the NIC policy")"
+      note="hidden by the NIC policy"; tone=dim
     elif [[ -n "$vpar" ]]; then
       note="VLAN interface on $vpar"
-      if [[ "$n" == "$ssh_dev" ]]; then note+=" - $(bm::core::c_warn "carries your SSH connection")"; fi
+      if [[ "$n" == "$ssh_dev" ]]; then note+=" - carries your SSH connection"; tone=warn; fi
     elif bm::cli::_carries_ssh "$n" "$BM_NIC_MASTER" "$ssh_dev" "$ssh_parent"; then
-      note="$(bm::core::c_warn "carries your SSH connection")"
-      [[ -n "$BM_NIC_MASTER" ]] && note="$(bm::core::c_warn "in $BM_NIC_MASTER - carries your SSH connection")"
+      tone=warn
+      note="carries your SSH connection"
+      if [[ -n "$BM_NIC_MASTER" ]]; then
+        note="in $BM_NIC_MASTER - carries your SSH connection"
+      elif [[ "$n" != "$ssh_dev" ]]; then
+        note="carries your SSH connection (through $ssh_dev)"
+      fi
     elif [[ -n "$BM_NIC_MASTER" ]]; then
       active="$(bm::facts::bond_proc_value "$BM_NIC_MASTER" "Currently Active Slave")"
       note="in $BM_NIC_MASTER"
       [[ "$active" == "$n" ]] && note+=" (active)"
     elif [[ -n "$first" ]]; then
-      note="$(bm::core::c_warn "has an IP - probably in use")"
+      note="has an IP - probably in use"; tone=warn
     elif [[ "$BM_NIC_LINK" == up ]]; then
-      note="$(bm::core::c_ok "free - good to use")"
+      note="free - good to use"; tone=ok
       free_up+=("$n")
     elif [[ "$BM_NIC_LINK" == no-link ]]; then
-      note="$(bm::core::c_warn "free, but no link - cable or switch port?")"
+      note="free, but no link - cable or switch port?"; tone=warn
     elif [[ "$BM_NIC_LINK" == off ]]; then
-      note="$(bm::core::c_warn "free, but switched off (ip link set $n up)")"
+      note="free, but switched off (ip link set $n up)"; tone=warn
     else
       note="free"
     fi
-    printf '%-15s %-8s %-6s %-10s %-20s %s\n' "$n" "$link" "$speed" "$inbond" "$addrs" "$note"
+    c_nic+=("$n") c_link+=("$link") c_speed+=("$speed") c_bond+=("$inbond")
+    c_addr+=("$addrs") c_note+=("$note") c_tone+=("$tone")
   done
-
+  bm::cli::_nics_table
   echo
   if (( ${#free_up[@]} >= 2 )); then
     local b=0
@@ -590,7 +647,8 @@ bm::cli::cmd_nics() {
     echo "Tip: build a bond from two free ports (preview first, -n changes nothing):"
     echo "  $BM_PROG -n create bond$b --mode active-backup --members ${free_up[0]},${free_up[1]}"
   elif (( ${#free_up[@]} == 1 )); then
-    echo "Tip: '${free_up[0]}' is free - add it to a bond, or use it to move one: $BM_PROG help swap-member"
+    echo "Tip: '${free_up[0]}' is free - add it to a bond, or move a bond onto it:"
+    echo "  $BM_PROG help swap-member"
   fi
   if (( hidden > 0 )); then
     echo "($hidden more hidden by the NIC policy - see them with: $BM_PROG nics --all)"

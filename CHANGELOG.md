@@ -121,6 +121,28 @@ schema are unchanged.
   directory.** The scratch directory was created inside `$(...)`, so the
   exit cleanup never knew about it. It is now created in the running shell
   (and in a menu action's own subshell, which cleans up after itself).
+- **Plain numbered prompts:** `010` picked item 8 (bash read it as octal)
+  and `08`/`09` printed a raw bash error; numbers are now always decimal.
+  The home menu listed Quit twice, and its `?) help` hint disappeared when
+  the current directory held one-character file names.
+- **`nics`:** on an 80-column terminal the NOTE column spilled into the
+  next row. Columns are now as wide as their content and a long note wraps
+  under its own column.
+- **SSH over a VLAN on a plain port was not protected.** With the session
+  on `eth2.100`, `eth2` was offered as "free" by `nics` and the menus, and
+  the SSH guard let a change put it into a bond, cutting the session. The
+  guard now treats the port under the session's VLAN as carrying it
+  (refused below the checkpoint tier, warned about on it), and `nics` and
+  the menus say so.
+- **The commit gate's `E` (+5 minutes)** extended NetworkManager's timer
+  but not the saved deadline, so the menus, `doctor` and other sessions
+  counted down to an undo 5 minutes too early.
+- **The plain commit gate** (`--plain`, serial consoles) took a key typed
+  while the change was running as its answer, before the verification
+  result was shown. Type-ahead is now discarded there too.
+- **Removing or replacing a port with no link** in the menus warned that
+  it "will not carry traffic" and asked to confirm; that warning is now
+  only given when adding a port.
 - **`--dns6` was never validated** (`--dns4` was). A bad IPv6 DNS server
   now fails up front with the expected format, instead of reaching nmcli.
 - **The CLI equivalent shown for `add-member` / `remove-member`** used

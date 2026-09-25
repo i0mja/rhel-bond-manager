@@ -74,3 +74,17 @@ setup() {
   [ "$ROLLED_BACK" -eq 1 ]
   [ "$BM_PLAN_OUTCOME" = "rolled-back" ]
 }
+
+@test "E on the checkpoint tier saves the new deadline for other sessions and the menus" {
+  seed_pending checkpoint 20240101-000000 "modify bond0"
+  BM_CKPT_TIER=checkpoint BM_CKPT_PATH=/org/freedesktop/NetworkManager/Checkpoint/1
+  BM_CKPT_SNAPSHOT=20240101-000000 BM_CKPT_SUMMARY="modify bond0"
+  bm::ckpt::dbus_extend() { return 0; }
+  local before
+  before="$(bm::core::epoch)"
+  bm::plan::_gate_extend 60
+  bm::ckpt::load_pending
+  (( BM_PENDING_DEADLINE >= before + 360 ))
+  [ "$BM_PENDING_SNAPSHOT" = "20240101-000000" ]
+  [ "$BM_PENDING_SUMMARY" = "modify bond0" ]
+}

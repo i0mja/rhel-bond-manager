@@ -64,6 +64,22 @@ stub_vlan_120() {
   assert_no_nmcli_mutations
 }
 
+@test "guard: sees the port under a VLAN - a session on eth2.100 protects eth2" {
+  require_root
+  export BM_STUB_BUSCTL_PING_RC=1
+  mk_sys_nic eth3 up 1000 52:54:00:12:34:04
+  mkdir -p "$BM_PROC_ROOT/net/vlan"
+  printf 'VLAN Dev name | VLAN ID\nName-Type: VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD\neth2.100 | 100 | eth2\n' \
+    >"$BM_PROC_ROOT/net/vlan/config"
+  mk_sys_nic eth2.100 up 1000 52:54:00:12:34:03
+  stub_ssh_session 10.1.2.3 eth2.100
+
+  run_cli -y create bond9 --mode active-backup --members eth2,eth3
+  [ "$status" -eq 3 ]
+  assert_contains "$output" "this change touches 'eth2', which carries your SSH session (through eth2.100)"
+  assert_no_nmcli_mutations
+}
+
 @test "guard: --no-checkpoint on the egress device is refused as well" {
   require_root
   stub_ssh_session 10.1.2.3 bond0

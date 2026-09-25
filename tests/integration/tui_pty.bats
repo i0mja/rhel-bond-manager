@@ -143,3 +143,14 @@ pty_run() { # pty_run <steps...> -- <command...>
   assert_contains "$screen" "PTY-EXIT 5"
   [ ! -e "$BM_RUN_DIR/pending.state" ]
 }
+
+@test "pty: a key typed while the change runs never answers the plain gate" {
+  require_root
+  # "k" arrives with the "y" that starts the change; the gate must not take it
+  pty_run @expect:"Apply this plan?" 'y\rk' @expect:"Verification passed" @wait:2.5 u -- \
+    env TERM=xterm LANG=C LC_ALL=C "$BM_ARTIFACT" --plain modify bond0 --opt miimon=50
+  [ "$status" -eq 0 ]
+  assert_not_contains "$screen" "change committed"
+  assert_contains "$screen" "rolled back to snapshot"
+  assert_contains "$screen" "PTY-EXIT 5"
+}

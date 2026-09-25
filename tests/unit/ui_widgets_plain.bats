@@ -63,6 +63,33 @@ setup() {
   [ "$BM_UI_REPLY" = "key:q" ]
 }
 
+@test "menu: numbers are decimal even with a leading zero" {
+  local err="$BATS_TEST_TMPDIR/err"
+  local -a items=()
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do items+=("t$i" "Item $i"); done
+  bm::ui::menu -- "Many" "${items[@]}" < <(printf '010\n') 2>"$err"
+  [ "$BM_UI_REPLY" = "t10" ]
+  bm::ui::menu -- "Many" "${items[@]}" < <(printf '09\n') 2>"$err"
+  [ "$BM_UI_REPLY" = "t9" ]
+  refute grep -q "value too great" "$err"
+}
+
+@test "menu: the key hints are not glob-expanded" {
+  local err="$BATS_TEST_TMPDIR/err"
+  mkdir -p "$BATS_TEST_TMPDIR/glob" && touch "$BATS_TEST_TMPDIR/glob/w" "$BATS_TEST_TMPDIR/glob/["
+  (cd "$BATS_TEST_TMPDIR/glob" && bm::ui::menu --keys "q p r ?" -- "Home" a "Apple" <<<"1" 2>"$err")
+  grep -q "?) help" "$err"
+}
+
+@test "menu: a menu with its own Quit item does not list q) Quit as well" {
+  local err="$BATS_TEST_TMPDIR/err"
+  bm::ui::menu --keys "q p" -- "Home" a "Apple" quit "Quit" <<<"1" 2>"$err"
+  [ "$(grep -c "Quit" "$err")" -eq 1 ]
+  bm::ui::menu --keys "q p" -- "Home" a "Apple" <<<"1" 2>"$err"
+  grep -q "q) Quit" "$err"
+}
+
 @test "menu: notes after a TAB are shown in brackets" {
   local err="$BATS_TEST_TMPDIR/err"
   bm::ui::menu -- "Fruit" a "Apple"$'\t'"red or green" <<<"1" 2>"$err"
@@ -75,6 +102,14 @@ setup() {
   [ "$BM_UI_REPLY" = "a,b" ]
   [ "${#BM_UI_REPLY_LIST[@]}" -eq 2 ]
   grep -q "Please pick at least 2" "$err"
+}
+
+@test "checklist: numbers are decimal even with a leading zero" {
+  local -a items=()
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do items+=("t$i" "Item $i"); done
+  bm::ui::checklist -- "Ports" "${items[@]}" < <(printf '010 09\n') 2>/dev/null
+  [ "$BM_UI_REPLY" = "t9,t10" ]
 }
 
 @test "checklist: enforces the maximum" {
