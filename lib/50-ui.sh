@@ -672,7 +672,11 @@ bm::ui::_menu_lines() {
   BM_UI_LINES=()
   local -a hdr=()
   if [[ -n "$header" ]]; then
-    BM_UI_HDR_MAX=$(( BM_UI_ROWS - 4 - (total < 6 ? total : 6) ))
+    # the choices come first: the header gets what the items leave over
+    local want=$total half=$(( BM_UI_ROWS / 2 ))
+    if (( half < 6 )); then half=6; fi
+    if (( want > half )); then want=$half; fi
+    BM_UI_HDR_MAX=$(( BM_UI_ROWS - 3 - want ))
     BM_UI_HDR=()
     "$header"
     hdr=("${BM_UI_HDR[@]}")

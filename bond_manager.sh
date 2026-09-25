@@ -3693,7 +3693,11 @@ bm::ui::_menu_lines() {
   BM_UI_LINES=()
   local -a hdr=()
   if [[ -n "$header" ]]; then
-    BM_UI_HDR_MAX=$(( BM_UI_ROWS - 4 - (total < 6 ? total : 6) ))
+    # the choices come first: the header gets what the items leave over
+    local want=$total half=$(( BM_UI_ROWS / 2 ))
+    if (( half < 6 )); then half=6; fi
+    if (( want > half )); then want=$half; fi
+    BM_UI_HDR_MAX=$(( BM_UI_ROWS - 3 - want ))
     BM_UI_HDR=()
     "$header"
     hdr=("${BM_UI_HDR[@]}")
@@ -7247,8 +7251,13 @@ bm::tui::_home_header() {
     body+=("")
     banner=3
   fi
-  if (( max < 7 )); then
-    BM_UI_HDR=("$BM_S_BOLD$BM_PROG$BM_S_RST $BM_G_SEP $BM_TUI_HOST $BM_G_SEP ${#BM_TUI_BONDS[@]} bond(s) $BM_TUI_BADGE")
+  if (( max < 5 + banner )); then
+    # no room for the box: one line that still says the essentials
+    local line="$BM_S_BOLD$BM_PROG$BM_S_RST $BM_G_SEP $BM_TUI_HOST $BM_G_SEP ${#BM_TUI_BONDS[@]} bond(s) $BM_TUI_BADGE"
+    if (( banner )); then
+      line+="  $BM_S_YELLOW$BM_G_WARN change waiting$BM_S_RST"
+    fi
+    BM_UI_HDR=("$line")
     return 0
   fi
   local room=$(( max - 4 - banner ))

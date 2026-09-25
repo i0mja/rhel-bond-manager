@@ -274,8 +274,13 @@ bm::tui::_home_header() {
     body+=("")
     banner=3
   fi
-  if (( max < 7 )); then
-    BM_UI_HDR=("$BM_S_BOLD$BM_PROG$BM_S_RST $BM_G_SEP $BM_TUI_HOST $BM_G_SEP ${#BM_TUI_BONDS[@]} bond(s) $BM_TUI_BADGE")
+  if (( max < 5 + banner )); then
+    # no room for the box: one line that still says the essentials
+    local line="$BM_S_BOLD$BM_PROG$BM_S_RST $BM_G_SEP $BM_TUI_HOST $BM_G_SEP ${#BM_TUI_BONDS[@]} bond(s) $BM_TUI_BADGE"
+    if (( banner )); then
+      line+="  $BM_S_YELLOW$BM_G_WARN change waiting$BM_S_RST"
+    fi
+    BM_UI_HDR=("$line")
     return 0
   fi
   local room=$(( max - 4 - banner ))
