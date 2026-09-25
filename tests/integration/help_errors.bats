@@ -182,3 +182,14 @@ assert_only_listings() {
   run_cli doctor
   assert_contains "$output" "Next step:"
 }
+
+@test "bad IPv6 DNS servers are rejected with the expected format" {
+  run_cli -n create bond9 --mode active-backup --members eth2 \
+    --ip6 2001:db8::5/64 --dns6 not-an-address
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "invalid IPv6 DNS list 'not-an-address'"
+  assert_contains "$output" "e.g. 2001:db8::53"
+  run_cli -n create bond9 --mode active-backup --members eth2 \
+    --ip6 2001:db8::5/64 --dns6 2001:db8::53,2001:db8::54
+  [ "$status" -eq 0 ]
+}

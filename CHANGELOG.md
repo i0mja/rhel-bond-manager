@@ -41,6 +41,10 @@ schema are unchanged.
     boxes. Numbered prompts are used on serial consoles, dumb terminals,
     pipes and with `--plain`. Output falls back to ASCII without UTF-8 (or
     with `BM_ASCII=1`), and `NO_COLOR` is honored.
+- **IPv6 in the menus**: *Change a bond → IP address* and a VLAN's
+  address offer IPv4 or IPv6. For IPv6 the options are SLAAC, DHCPv6, a
+  fixed address with gateway and DNS (validated as you type), or off. A new
+  VLAN can get both.
 - **`bond-manager nics [--all]`**: every network port with its link state,
   speed, bond, addresses and a plain verdict ("free - good to use", "no
   link - cable or switch port?", "has an IP - probably in use", "carries
@@ -117,6 +121,8 @@ schema are unchanged.
   directory.** The scratch directory was created inside `$(...)`, so the
   exit cleanup never knew about it. It is now created in the running shell
   (and in a menu action's own subshell, which cleans up after itself).
+- **`--dns6` was never validated** (`--dns4` was). A bad IPv6 DNS server
+  now fails up front with the expected format, instead of reaching nmcli.
 - **The CLI equivalent shown for `add-member` / `remove-member`** used
   `--members`, which those commands reject. One function now builds the
   equivalent for every subcommand, quoting values that need it.

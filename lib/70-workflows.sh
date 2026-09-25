@@ -118,6 +118,8 @@ bm::wf::_plan_ip_steps() { # _plan_ip_steps <con-ref> <label> <ip4> <gw4> <dns4>
       done
       [[ -n "$gw6" ]] && { bm::val::ipv6_addr "$gw6" || bm::core::die "invalid IPv6 gateway '$gw6'" "$BM_EX_USAGE" \
         "the gateway is a plain address without a prefix, e.g. 2001:db8::1"; }
+      [[ -n "$dns6" ]] && { bm::val::ip_list v6 "${dns6// /,}" || bm::core::die "invalid IPv6 DNS list '$dns6'" "$BM_EX_USAGE" \
+        "DNS servers are plain addresses, comma-separated, e.g. 2001:db8::53,2001:db8::54"; }
     fi
     if [[ "$m6" == auto ]]; then
       bm::plan::add "Configure IPv6 (SLAAC/auto) on $label" bm::nm::modify "$con" ipv6.method auto

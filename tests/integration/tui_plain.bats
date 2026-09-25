@@ -185,3 +185,53 @@ tui() { # tui <answers (printf %b)> [global flags...]
   tui '\np\n\nq\n'
   assert_contains "$output" "Practice mode has to stay on"
 }
+
+@test "change > IP address > IPv6: a fixed address, with a missing prefix explained" {
+  tui 'change\nip\nv6\nstatic\n2001:db8::10\n2001:db8::10/64\n2001:db8::1\n\ngo\n\nq\nq\n' --dry-run
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "Add the prefix length after a slash, e.g. 2001:db8::10/64."
+  assert_contains "$output" "Set the IPv6 address of bond0: 2001:db8::10/64, gateway 2001:db8::1."
+  assert_contains "$output" "bond-manager -n modify bond0 --ip6 2001:db8::10/64 --gw6 2001:db8::1"
+  assert_contains "$output" "Configure IPv6 (2001:db8::10/64) on bond0"
+  assert_contains "$output" "ipv6.method manual"
+  assert_no_nmcli_mutations
+}
+
+@test "change > IP address > IPv6: SLAAC and DHCPv6 map to auto and dhcp" {
+  tui 'change\nip\nv6\nauto\ngo\n\nq\nq\n' --dry-run
+  assert_contains "$output" "bond-manager -n modify bond0 --ip6 auto"
+  assert_contains "$output" "Configure IPv6 (SLAAC/auto) on bond0"
+  tui 'change\nip\nv6\ndhcp\ngo\n\nq\nq\n' --dry-run
+  assert_contains "$output" "bond-manager -n modify bond0 --ip6 dhcp"
+  assert_contains "$output" "Configure IPv6 (DHCPv6) on bond0"
+}
+
+@test "change > IP address > IPv4 still works after the family question" {
+  tui 'change\nip\nv4\ndhcp\ngo\n\nq\nq\n' --dry-run
+  assert_contains "$output" "bond-manager -n modify bond0 --ip4 dhcp"
+}
+
+@test "change > VLANs > add: IPv4 and IPv6 together in one VLAN token" {
+  tui 'change\nvlan\nadd\n120\nstatic\n10.20.30.40/24\n\n\ny\nauto\ngo\n\nq\nq\n' --dry-run
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "bond-manager -n vlan add bond0 '120:ip4=10.20.30.40/24;ip6=auto'"
+  assert_contains "$output" "Create VLAN 120 on bond0 (bond0.120)"
+  assert_contains "$output" "Configure IPv6 (SLAAC/auto) on bond0.120"
+}
+
+@test "build: the review says where IPv6 is set" {
+  tui 'build\nbond9\neth2 eth3\nactive-backup\nnone\nfinish\ncancel\nq\n' --dry-run
+  assert_contains "$output" "IPv6: not set here - add it afterwards with Change a bond > IP"
+}
+
+@test "change > VLANs > change IP: IPv6 on an existing VLAN" {
+  stub_nm_conn 44444444-4444-4444-4444-444444444444 \
+    connection.id=bond0.120 connection.type=vlan connection.interface-name=bond0.120 \
+    vlan.parent=bond0 vlan.id=120
+  tui 'change\nvlan\nmodify\n120\nv6\ndhcp\ngo\n\nq\nq\n' --dry-run
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "VLANs now: 120"
+  assert_contains "$output" "Set the IPv6 address of VLAN 120 on bond0: DHCPv6."
+  assert_contains "$output" "bond-manager -n vlan modify bond0 120 --ip6 dhcp"
+  assert_contains "$output" "Configure IPv6 (DHCPv6) on bond0.120"
+}

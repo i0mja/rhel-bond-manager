@@ -4985,6 +4985,8 @@ bm::wf::_plan_ip_steps() { # _plan_ip_steps <con-ref> <label> <ip4> <gw4> <dns4>
       done
       [[ -n "$gw6" ]] && { bm::val::ipv6_addr "$gw6" || bm::core::die "invalid IPv6 gateway '$gw6'" "$BM_EX_USAGE" \
         "the gateway is a plain address without a prefix, e.g. 2001:db8::1"; }
+      [[ -n "$dns6" ]] && { bm::val::ip_list v6 "${dns6// /,}" || bm::core::die "invalid IPv6 DNS list '$dns6'" "$BM_EX_USAGE" \
+        "DNS servers are plain addresses, comma-separated, e.g. 2001:db8::53,2001:db8::54"; }
     fi
     if [[ "$m6" == auto ]]; then
       bm::plan::add "Configure IPv6 (SLAAC/auto) on $label" bm::nm::modify "$con" ipv6.method auto
@@ -7031,6 +7033,8 @@ BM_TUI_LEFT=0
 BM_TUI_LAST_RC=0
 BM_TUI_LAST_OUTCOME=""
 BM_TUI_IP4="" BM_TUI_GW4="" BM_TUI_DNS4=""
+BM_TUI_IP6="" BM_TUI_GW6="" BM_TUI_DNS6=""
+BM_TUI_FAMILY=4
 BM_TUI_CTX_BOND=""
 BM_TUI_CTX_OPT=""
 BM_TUI_AFFECTED=()
@@ -7546,6 +7550,38 @@ bm::tui::_v_dns4() {
   return 1
 }
 
+bm::tui::_v_ipv6_cidr() {
+  local v="$1" a
+  bm::core::split_list "$v"
+  for a in "${BM_LIST[@]}"; do
+    if ! bm::val::ipv6_cidr "$a"; then
+      if bm::val::ipv6_addr "$a"; then
+        BM_UI_VERR="Add the prefix length after a slash, e.g. $a/64."
+      else
+        BM_UI_VERR="'$a' is not an IPv6 address with a prefix like 2001:db8::10/64."
+      fi
+      return 1
+    fi
+  done
+  return 0
+}
+
+bm::tui::_v_ipv6_addr() {
+  if bm::val::ipv6_addr "$1"; then return 0; fi
+  if [[ "$1" == */* ]]; then
+    BM_UI_VERR="The gateway is a plain address - leave out the /prefix."
+  else
+    BM_UI_VERR="'$1' is not an IPv6 address like 2001:db8::1."
+  fi
+  return 1
+}
+
+bm::tui::_v_dns6() {
+  if bm::val::ip_list v6 "${1// /,}"; then return 0; fi
+  BM_UI_VERR="Type plain IPv6 addresses separated by commas, e.g. 2001:db8::53."
+  return 1
+}
+
 bm::tui::_v_bond_name() {
   local v="$1"
   if ! bm::val::ifname "$v"; then
@@ -7871,6 +7907,65 @@ bm::tui::ask_ip4() { # ask_ip4 [--keep] [--vlan-option] <what>
       BM_TUI_DNS4="$BM_UI_REPLY"
       ;;
   esac
+  return 0
+}
+
+# Ask for IPv6 settings -> BM_TUI_IP6/GW6/DNS6 (IP6 auto|dhcp|none|CIDR|"" = keep)
+bm::tui::ask_ip6() { # ask_ip6 [--keep] <what>
+  local keep=0
+  if [[ "${1:-}" == --keep ]]; then
+    keep=1
+    shift
+  fi
+  local what="$1"
+  BM_TUI_IP6="" BM_TUI_GW6="" BM_TUI_DNS6=""
+  local -a items=(
+    auto "Automatic (SLAAC)"$'\t'"the router announces the network - the usual choice"
+    dhcp "DHCPv6"$'\t'"a DHCPv6 server hands out the address"
+    static "Fixed address"$'\t'"you type it, e.g. 2001:db8::10/64"
+    none "No IPv6"$'\t'"IPv6 switched off here"
+  )
+  if (( keep )); then
+    items+=(keep "Leave it as it is")
+  fi
+  bm::ui::menu -- "IPv6 address for $what" "${items[@]}" || return 1
+  case "$BM_UI_REPLY" in
+    auto) BM_TUI_IP6=auto ;;
+    dhcp) BM_TUI_IP6=dhcp ;;
+    none) BM_TUI_IP6=none ;;
+    keep) BM_TUI_IP6="" ;;
+    static)
+      bm::ui::input --validate bm::tui::_v_ipv6_cidr --example "2001:db8::10/64" \
+        -- "Address with prefix" || return 1
+      BM_TUI_IP6="$BM_UI_REPLY"
+      bm::ui::input --optional --validate bm::tui::_v_ipv6_addr --example "2001:db8::1" \
+        -- "Gateway (router) - Enter for none" || return 1
+      BM_TUI_GW6="$BM_UI_REPLY"
+      bm::ui::input --optional --validate bm::tui::_v_dns6 --example "2001:db8::53" \
+        -- "DNS servers - Enter for none" || return 1
+      BM_TUI_DNS6="$BM_UI_REPLY"
+      ;;
+  esac
+  return 0
+}
+
+bm::tui::_ip6_words() { # describe BM_TUI_IP6/GW6/DNS6 -> BM_TUI_WORDS
+  case "$BM_TUI_IP6" in
+    auto) BM_TUI_WORDS="automatic (SLAAC)" ;;
+    dhcp) BM_TUI_WORDS="DHCPv6" ;;
+    none) BM_TUI_WORDS="none (IPv6 off)" ;;
+    "") BM_TUI_WORDS="unchanged" ;;
+    *) BM_TUI_WORDS="$BM_TUI_IP6${BM_TUI_GW6:+, gateway $BM_TUI_GW6}${BM_TUI_DNS6:+, DNS $BM_TUI_DNS6}" ;;
+  esac
+}
+
+# IPv4 or IPv6? -> BM_TUI_FAMILY (4|6)
+bm::tui::_pick_family() { # _pick_family <what>
+  bm::ui::menu -- "Which address of $1?" \
+    v4 "IPv4 address"$'\t'"e.g. 10.0.0.10/24" \
+    v6 "IPv6 address"$'\t'"e.g. 2001:db8::10/64" || return 1
+  BM_TUI_FAMILY=4
+  if [[ "$BM_UI_REPLY" == v6 ]]; then BM_TUI_FAMILY=6; fi
   return 0
 }
 
@@ -8267,7 +8362,8 @@ bm::tui::build_wizard() {
         [[ -n "$vid" && -n "$vtok" ]] && BM_TUI_AFFECTED+=("$name.$vid")
         local -a sum=("Build bond $name from: ${ports//,/, }"
           "How it works: $mode - $(bm::help::mode_label "$mode")"
-          "IPv4: $ipwords")
+          "IPv4: $ipwords"
+          "IPv6: not set here - add it afterwards with Change a bond > IP address.")
         [[ -n "$mtu" ]] && sum+=("MTU: $mtu")
         rc=0
         bm::tui::review create "${sum[@]}" || rc=$?
@@ -8462,12 +8558,23 @@ bm::tui::_change_ip() {
   if (( carries )); then
     bm::ui::warn "You are connected through $bond. Changing its address ends this session. Afterwards: open a NEW session to the new address and run 'sudo $BM_PROG commit' before the countdown runs out - otherwise the change is undone (which is the safety net working)."
   fi
+  bm::tui::_pick_family "$bond" || return 0
+  bm::wf::spec_reset
+  BM_SPEC[bond]="$bond"
+  if [[ "$BM_TUI_FAMILY" == 6 ]]; then
+    bm::tui::ask_ip6 --keep "$bond" || return 0
+    [[ -n "$BM_TUI_IP6" ]] || return 0
+    BM_SPEC[ip6]="$BM_TUI_IP6"
+    [[ -n "$BM_TUI_GW6" ]] && BM_SPEC[gw6]="$BM_TUI_GW6"
+    [[ -n "$BM_TUI_DNS6" ]] && BM_SPEC[dns6]="$BM_TUI_DNS6"
+    bm::tui::_ip6_words
+    bm::tui::_apply_modify "$bond" "Set the IPv6 address of $bond: $BM_TUI_WORDS."
+    return 0
+  fi
   bm::tui::ask_ip4 --keep "$bond" || return 0
   if [[ -z "$BM_TUI_IP4" ]]; then
     return 0
   fi
-  bm::wf::spec_reset
-  BM_SPEC[bond]="$bond"
   BM_SPEC[ip4]="$BM_TUI_IP4"
   [[ -n "$BM_TUI_GW4" ]] && BM_SPEC[gw4]="$BM_TUI_GW4"
   [[ -n "$BM_TUI_DNS4" ]] && BM_SPEC[dns4]="$BM_TUI_DNS4"
@@ -8517,17 +8624,36 @@ bm::tui::_change_vlan() {
       bm::ui::input --validate bm::tui::_v_vlan_new --example 120 -- "VLAN id" || return 0
       vid="$BM_UI_REPLY"
       bm::tui::ask_ip4 "VLAN $vid ($bond.$vid)" || return 0
-      local tok="$vid"
+      local -a settings=()
       if [[ "$BM_TUI_IP4" != none ]]; then
-        tok+=":ip4=$BM_TUI_IP4${BM_TUI_GW4:+;gw4=$BM_TUI_GW4}${BM_TUI_DNS4:+;dns4=$BM_TUI_DNS4}"
+        settings+=("ip4=$BM_TUI_IP4")
+        [[ -n "$BM_TUI_GW4" ]] && settings+=("gw4=$BM_TUI_GW4")
+        [[ -n "$BM_TUI_DNS4" ]] && settings+=("dns4=$BM_TUI_DNS4")
+      fi
+      bm::tui::_ip4_words
+      local v4words="$BM_TUI_WORDS" v6words="none"
+      BM_TUI_IP6=""
+      if bm::ui::yesno "Give VLAN $vid an IPv6 address too?"; then
+        bm::tui::ask_ip6 "VLAN $vid ($bond.$vid)" || return 0
+        if [[ "$BM_TUI_IP6" != none ]]; then
+          settings+=("ip6=$BM_TUI_IP6")
+          [[ -n "$BM_TUI_GW6" ]] && settings+=("gw6=$BM_TUI_GW6")
+          [[ -n "$BM_TUI_DNS6" ]] && settings+=("dns6=$BM_TUI_DNS6")
+        fi
+        bm::tui::_ip6_words
+        v6words="$BM_TUI_WORDS"
+      fi
+      (( BM_UI_EOF )) && return 0
+      local tok="$vid"
+      if (( ${#settings[@]} > 0 )); then
+        tok+=":$(bm::core::join ';' "${settings[@]}")"
       fi
       bm::wf::spec_reset
       BM_SPEC[bond]="$bond"
       BM_SPEC[vlans]="$tok"
       BM_TUI_AFFECTED=("$bond.$vid")
-      bm::tui::_ip4_words
       rc=0
-      bm::tui::review vlan-add "Add VLAN $vid to $bond (device $bond.$vid)." "IPv4: $BM_TUI_WORDS" || rc=$?
+      bm::tui::review vlan-add "Add VLAN $vid to $bond (device $bond.$vid)." "IPv4: $v4words" "IPv6: $v6words" || rc=$?
       (( rc == 0 )) || return 0
       bm::tui::run change bm::wf::vlan_add
       bm::tui::result change
@@ -8535,18 +8661,30 @@ bm::tui::_change_vlan() {
     modify)
       bm::ui::menu -- "Which VLAN?" "${vitems[@]}" || return 0
       vid="$BM_UI_REPLY"
-      bm::tui::ask_ip4 --keep "VLAN $vid" || return 0
-      [[ -n "$BM_TUI_IP4" ]] || return 0
+      bm::tui::_pick_family "VLAN $vid" || return 0
       bm::wf::spec_reset
       BM_SPEC[bond]="$bond"
       BM_SPEC[vlan_id]="$vid"
-      BM_SPEC[ip4]="$BM_TUI_IP4"
-      [[ -n "$BM_TUI_GW4" ]] && BM_SPEC[gw4]="$BM_TUI_GW4"
-      [[ -n "$BM_TUI_DNS4" ]] && BM_SPEC[dns4]="$BM_TUI_DNS4"
+      local fam="IPv4"
+      if [[ "$BM_TUI_FAMILY" == 6 ]]; then
+        fam="IPv6"
+        bm::tui::ask_ip6 --keep "VLAN $vid" || return 0
+        [[ -n "$BM_TUI_IP6" ]] || return 0
+        BM_SPEC[ip6]="$BM_TUI_IP6"
+        [[ -n "$BM_TUI_GW6" ]] && BM_SPEC[gw6]="$BM_TUI_GW6"
+        [[ -n "$BM_TUI_DNS6" ]] && BM_SPEC[dns6]="$BM_TUI_DNS6"
+        bm::tui::_ip6_words
+      else
+        bm::tui::ask_ip4 --keep "VLAN $vid" || return 0
+        [[ -n "$BM_TUI_IP4" ]] || return 0
+        BM_SPEC[ip4]="$BM_TUI_IP4"
+        [[ -n "$BM_TUI_GW4" ]] && BM_SPEC[gw4]="$BM_TUI_GW4"
+        [[ -n "$BM_TUI_DNS4" ]] && BM_SPEC[dns4]="$BM_TUI_DNS4"
+        bm::tui::_ip4_words
+      fi
       BM_TUI_AFFECTED=("$bond.$vid")
-      bm::tui::_ip4_words
       rc=0
-      bm::tui::review vlan-modify "Set the IPv4 address of VLAN $vid on $bond: $BM_TUI_WORDS." || rc=$?
+      bm::tui::review vlan-modify "Set the $fam address of VLAN $vid on $bond: $BM_TUI_WORDS." || rc=$?
       (( rc == 0 )) || return 0
       bm::tui::run change bm::wf::vlan_modify "$vid"
       bm::tui::result change

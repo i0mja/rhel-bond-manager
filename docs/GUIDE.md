@@ -260,10 +260,14 @@ the new one before removing the old one.
 
 ### Change the IP address
 
-**Menu:** *Change a bond → IP address*
+**Menu:** *Change a bond → IP address*. You pick IPv4 or IPv6 first. For
+IPv6 the choices are automatic (SLAAC, the usual one), DHCPv6, a fixed
+address, or off.
 
 ```bash
 sudo bond-manager modify bond0 --ip4 10.0.0.20/24 --gw4 10.0.0.1
+sudo bond-manager modify bond0 --ip6 2001:db8::20/64 --gw6 2001:db8::1
+sudo bond-manager modify bond0 --ip6 auto      # SLAAC
 ```
 
 **If you are logged in through that address**, the change ends your
