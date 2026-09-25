@@ -2219,10 +2219,10 @@ bm::tui::help_menu() {
       done
       bm::ui::menu -- "Which command?" "${citems[@]}" || continue
       printf '\n' >&2
-      bm::ui::block "$(bm::help::command "$BM_UI_REPLY")"
+      bm::ui::page "$(bm::help::command "$BM_UI_REPLY")"
     else
       printf '\n' >&2
-      bm::ui::block "$(bm::help::topic "$BM_UI_REPLY")"
+      bm::ui::page "$(bm::help::topic "$BM_UI_REPLY")"
     fi
     bm::ui::pause
   done

@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no automatic undo; it refuses whenever NetworkManager cannot undo the
   change itself, the timer tier included. The guide's dashboard picture
   put the SSH mark on a port; the dashboard marks the bond (or VLAN).
+- **The commit gate on a narrow terminal** (a tmux split, a phone SSH
+  client) cut the two sentences explaining the safety net, and below about
+  60 columns the countdown itself; after a resize every redraw left a stale
+  copy of the status line. The safety text now wraps, the countdown comes
+  first on the status line, and the gate redraws itself after a resize.
+- **Help topics taller than the screen** scrolled their start away, which
+  consoles without scrollback (a Linux VT, iLO/iDRAC, serial) cannot bring
+  back. On a terminal they are now shown a page at a time.
+- **Ctrl-Z in the arrow-key menus** stopped them with the cursor hidden and
+  the terminal raw. Suspend is now off while the menus own the keyboard.
 
 ## [3.1.0] - 2026-09-25
 

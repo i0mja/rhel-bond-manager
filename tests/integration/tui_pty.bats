@@ -194,3 +194,32 @@ pty_run() { # pty_run <steps...> -- <command...>
   [ "$status" -eq 0 ]
   assert_contains "$screen" "PTY-EXIT 5"
 }
+
+@test "pty: on a 50-column terminal the gate wraps its safety text and keeps the countdown" {
+  require_root
+  pty_run --size 50x30 @expect:"Apply this plan?" 'y\r' @expect:"Auto-undo in" @wait:1 k -- \
+    env TERM=xterm LANG=C LC_ALL=C "$BM_ARTIFACT" modify bond0 --opt miimon=50
+  [ "$status" -eq 0 ]
+  assert_contains "$screen" "when the time runs out"
+  assert_contains "$screen" "your connection, just wait."
+  assert_contains "$screen" "Auto-undo in"
+  assert_contains "$screen" "PTY-EXIT 0"
+}
+
+@test "pty: a help topic taller than the screen is shown a page at a time" {
+  pty_run --size 80x20 @expect:"What do you want to do?" 8 @expect:"What would you like to know?" 1 \
+    @expect:"-- more" '\r' @expect:"Press Enter to go back" '\r' @wait:0.5 '\x1b' \
+    @expect:"What do you want to do?" q -- env TERM=xterm LANG=C LC_ALL=C "$BM_ARTIFACT" --dry-run
+  [ "$status" -eq 0 ]
+  assert_contains "$screen" "-- more: Enter for the next page, q to stop"
+  assert_contains "$screen" "PTY-EXIT 0"
+}
+
+@test "pty: Ctrl-Z in the arrow-key menus does not stop them with the cursor hidden" {
+  pty_run @expect:"What do you want to do?" '\x1a' @wait:1.5 q -- \
+    env TERM=xterm LANG=C LC_ALL=C "$BM_ARTIFACT" --dry-run
+  [ "$status" -eq 0 ]
+  assert_contains "$screen" "Bye."
+  assert_contains "$screen" "PTY-EXIT 0"
+  [[ "$output" == *$'\e[?25h'* ]]
+}

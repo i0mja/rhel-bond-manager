@@ -553,12 +553,22 @@ bm::plan::commit_gate() {
 }
 
 bm::plan::_gate_fancy() { # _gate_fancy <snapshot-id>
-  local snap="$1" remaining now rc msg="" grc crc
+  local snap="$1" remaining now rc msg="" grc crc cols
+  bm::ui::_size
+  cols="$BM_UI_COLS"
   bm::ui::gate_intro "$BM_CKPT_TIER"
   bm::ui::_raw_on
   bm::ui::_drain
   bm::lock::release
   while :; do
+    # nothing traps SIGWINCH here: look at the size every tick, and redraw
+    # everything after a resize (the old lines have reflowed)
+    bm::ui::_size
+    if [[ "$BM_UI_COLS" != "$cols" ]]; then
+      cols="$BM_UI_COLS"
+      printf '\033[H\033[2J' >&2
+      bm::ui::gate_intro "$BM_CKPT_TIER"
+    fi
     if bm::plan::_gate_settled "$snap"; then
       bm::ui::_raw_off
       bm::ui::_commit_block
