@@ -113,6 +113,10 @@ schema are unchanged.
     root. Changes are now checked up front, with practice mode offered.
   - The plan could be hidden behind the whiptail "Apply this plan?"
     dialog; it now stays on screen above the question.
+- **Every `init` and `bundle` leaked a `/tmp/bond-manager.XXXXXX`
+  directory.** The scratch directory was created inside `$(...)`, so the
+  exit cleanup never knew about it. It is now created in the running shell
+  (and in a menu action's own subshell, which cleans up after itself).
 - **The CLI equivalent shown for `add-member` / `remove-member`** used
   `--members`, which those commands reject. One function now builds the
   equivalent for every subcommand, quoting values that need it.

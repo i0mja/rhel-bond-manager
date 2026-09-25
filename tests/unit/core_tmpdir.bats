@@ -74,6 +74,16 @@ ours() { # the scratch directories currently in $TMPDIR
   [ "$(ours)" -eq 0 ] # ...and it is gone anyway
 }
 
+@test "a menu action never removes the scratch directory it inherited" {
+  exec {BM_TUI_OUT}>&1
+  bm::core::ensure_tmpdir
+  local mine="$BM_TMPDIR"
+  bm::tui::run look true 2>/dev/null
+  [ "$BM_TMPDIR" = "$mine" ]
+  [ -d "$mine" ]
+  [ "$(ours)" -eq 1 ]
+}
+
 @test "no caller captures the scratch directory in a command substitution" {
   run grep -nE '\$\(\s*bm::core::(ensure_)?tmpdir' "$BM_ROOT"/lib/*.sh
   [ "$status" -eq 1 ]

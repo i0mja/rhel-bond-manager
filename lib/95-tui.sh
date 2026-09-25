@@ -402,9 +402,14 @@ bm::tui::_emit_outcome() { printf '%s' "${BM_PLAN_OUTCOME:-}" >&3 2>/dev/null ||
 
 # EXIT trap of an action's subshell: report the outcome, and clean up what
 # the action created there (its temp directory, a terminal left raw) — the
-# subshell does not run the program's own EXIT trap.
+# subshell does not run the program's own EXIT trap. A scratch directory the
+# subshell merely inherited belongs to the menu process and is left alone.
+BM_TUI_INHERITED_TMPDIR=""
 bm::tui::_action_exit() {
   bm::tui::_emit_outcome
+  if [[ -n "$BM_TMPDIR" && "$BM_TMPDIR" == "$BM_TUI_INHERITED_TMPDIR" ]]; then
+    BM_TMPDIR=""
+  fi
   bm::core::cleanup
 }
 
@@ -419,6 +424,7 @@ bm::tui::run() { # run <kind> <function> [args...]
   BM_UI_INTERRUPTED=0
   printf '\n' >&2
   out="$( (
+    BM_TUI_INHERITED_TMPDIR="$BM_TMPDIR"
     trap bm::tui::_action_exit EXIT
     if [[ "$kind" == change ]]; then
       bm::cli::preflight_mutate
