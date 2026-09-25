@@ -18,6 +18,10 @@ BM_NM_DBUS_IFACE="org.freedesktop.NetworkManager"
 # — this is what lets a rollback undo a *create*, not just an edit.
 BM_CKPT_FLAGS=6
 
+BM_CKPT_AFFECTED=""   # devices the armed change touches (saved in pending.state)
+BM_PENDING_AFFECTED=""
+BM_CKPT_IN_DEADMAN=0  # 1 inside the timer's own rollback (see deadman_cancel)
+
 bm::ckpt::state_file() { printf '%s/pending.state' "$BM_RUN_DIR"; }
 
 # Which tier can this host support right now?
@@ -95,6 +99,12 @@ bm::ckpt::deadman_arm() { # deadman_arm <timeout-secs> <snapshot-id> -> unit nam
 bm::ckpt::deadman_cancel() {
   local unit="$1"
   systemctl stop "${unit}.timer" >/dev/null 2>&1 || true
+  # The timer's own rollback runs as ${unit}.service. Stopping that service
+  # from inside it makes systemd kill every process of the unit, the
+  # rollback included, before it has restored anything.
+  if (( BM_CKPT_IN_DEADMAN )); then
+    return 0
+  fi
   systemctl stop "${unit}.service" >/dev/null 2>&1 || true
   systemctl reset-failed "${unit}.service" >/dev/null 2>&1 || true
 }
@@ -149,6 +159,7 @@ bm::ckpt::_write_state() {
     printf 'created=%s\n' "$(bm::core::timestamp)"
     printf 'pid=%s\n' "$$"
     printf 'summary=%s\n' "${BM_CKPT_SUMMARY:-}"
+    printf 'affected=%s\n' "${BM_CKPT_AFFECTED:-}"
   } >"$(bm::ckpt::state_file)"
   chmod 0640 "$(bm::ckpt::state_file)" 2>/dev/null || true
 }
@@ -160,6 +171,7 @@ bm::ckpt::load_pending() {
   [[ -f "$f" ]] || return 1
   BM_PENDING_TIER="" BM_PENDING_PATH="" BM_PENDING_UNIT=""
   BM_PENDING_SNAPSHOT="" BM_PENDING_DEADLINE="" BM_PENDING_SUMMARY=""
+  BM_PENDING_AFFECTED="" # absent in state written by 3.0
   local line
   while IFS= read -r line; do
     case "$line" in
@@ -169,6 +181,7 @@ bm::ckpt::load_pending() {
       snapshot=*) BM_PENDING_SNAPSHOT="${line#snapshot=}" ;;
       deadline=*) BM_PENDING_DEADLINE="${line#deadline=}" ;;
       summary=*) BM_PENDING_SUMMARY="${line#summary=}" ;;
+      affected=*) BM_PENDING_AFFECTED="${line#affected=}" ;;
     esac
   done <"$f"
   return 0
@@ -264,9 +277,165 @@ bm::ckpt::rollback_pending() {
       ;;
   esac
   if (( ! ok )) && [[ -n "$BM_PENDING_SNAPSHOT" ]]; then
+    local -a devs=()
+    read -r -a devs <<<"$BM_PENDING_AFFECTED" || true
+    local before=""
+    if (( ${#devs[@]} > 0 )); then
+      before="$(bm::ckpt::profiles_of "${devs[@]}")"
+    fi
     bm::snap::restore "$BM_PENDING_SNAPSHOT"
     ok=1
+    bm::ckpt::clear_pending
+    if (( ${#devs[@]} > 0 )); then
+      bm::ckpt::reapply "$before" || ok=0
+    else
+      bm::ckpt::_problem "the saved settings are restored, but this change did not record which connections it touched (it was armed by an older version): running connections keep their settings until brought up again, e.g. nmcli connection up NAME"
+    fi
   fi
   bm::ckpt::clear_pending
   (( ok ))
+}
+
+# ---- after a snapshot restore -------------------------------------------------
+# NetworkManager's reload only re-reads profiles: active connections keep
+# running with what the change applied, so a change that cut the SSH session
+# would stay live. The profiles of the devices the change touched are
+# fingerprinted before the restore; afterwards, in this order:
+#   1. a VLAN or bond device whose profile the restore removed (the change
+#      created it) is deleted;
+#   2. a port whose profile the restore removed but that is still in a bond
+#      is released;
+#   3. every profile the restore brought back or changed is brought up again:
+#      bonds first, then all of their ports and VLANs (NetworkManager does
+#      not reliably re-attach them to a re-activated bond), then other ports,
+#      then other VLANs.
+# Profiles the restore did not change are left alone: no needless blip on
+# the connection carrying the session.
+
+bm::ckpt::_problem() { # logged, and shown: a half-finished rollback must not go unnoticed
+  bm::log::warn "$1"
+  bm::log::say "$(bm::core::c_warn "WARNING: $1")"
+}
+
+bm::ckpt::profiles_of() { # profiles_of <dev...> -> "dev<US>uuid<US>type<US>sum" lines
+  local index d line ifname uuid type active pick psum
+  index="$(bm::nm::ifname_index)"
+  for d in "$@"; do
+    [[ -n "$d" ]] || continue
+    pick=""
+    while IFS=$'\x1f' read -r ifname uuid type active; do
+      [[ "$ifname" == "$d" ]] || continue
+      if [[ -z "$pick" || "$active" == "$d" ]]; then pick="$uuid"$'\x1f'"$type"; fi
+    done <<<"$index"
+    if [[ -n "$pick" ]]; then
+      psum="$(bm::nm::con_settings "${pick%%$'\x1f'*}" | cksum)"
+      printf '%s\x1f%s\x1f%s\n' "$d" "$pick" "$psum"
+    else
+      printf '%s\x1f\x1f\x1f\n' "$d"
+    fi
+  done
+}
+
+bm::ckpt::reapply() { # reapply <profiles_of output from before the restore>
+  local before="$1" after d buuid btype bsum auuid atype asum rec
+  local -a del_vlan=() del_bond=() release=() up_bond=() up_port=() up_vlan=()
+  local -A seen=()
+  local -a devs=()
+  while IFS=$'\x1f' read -r d _ _ _; do
+    [[ -n "$d" && -z "${seen[$d]:-}" ]] || continue
+    seen[$d]=1
+    devs+=("$d")
+  done <<<"$before"
+  (( ${#devs[@]} > 0 )) || return 0
+  after="$(bm::ckpt::profiles_of "${devs[@]}")"
+  local -A was_uuid=() was_type=() was_sum=()
+  while IFS=$'\x1f' read -r d buuid btype bsum; do
+    [[ -n "$d" ]] || continue
+    was_uuid[$d]="$buuid" was_type[$d]="$btype" was_sum[$d]="$bsum"
+  done <<<"$before"
+
+  while IFS=$'\x1f' read -r d auuid atype asum; do
+    [[ -n "$d" ]] || continue
+    buuid="${was_uuid[$d]:-}" btype="${was_type[$d]:-}" bsum="${was_sum[$d]:-}"
+    if [[ -n "$auuid" ]]; then
+      [[ "$auuid" == "$buuid" && "$asum" == "$bsum" ]] && continue # untouched
+      case "$atype" in
+        bond) up_bond+=("$d"$'\x1f'"$auuid") ;;
+        vlan) up_vlan+=("$d"$'\x1f'"$auuid") ;;
+        *) up_port+=("$d"$'\x1f'"$auuid") ;;
+      esac
+    elif [[ -n "$buuid" ]]; then
+      if bm::facts::bond_exists_kernel "$d"; then
+        del_bond+=("$d")
+      elif [[ "$btype" == vlan && -e "$BM_SYS_ROOT/class/net/$d" ]]; then
+        del_vlan+=("$d")
+      elif bm::facts::nic_info "$d" && [[ -n "$BM_NIC_MASTER" ]]; then
+        release+=("$d")
+      fi
+    fi
+  done <<<"$after"
+
+  # a re-activated bond takes its ports and VLANs down with it: bring every
+  # one of them back, changed or not
+  local rec2 puuid pname pdev vuuid vname vdev vid
+  for rec in "${up_bond[@]}"; do
+    d="${rec%%$'\x1f'*}"
+    while IFS= read -r rec2; do
+      IFS=$'\x1f' read -r puuid pname pdev <<<"$rec2"
+      [[ -n "$puuid" ]] && up_port+=("${pdev:-$pname}"$'\x1f'"$puuid")
+    done < <(bm::nm::port_cons "$d")
+    while IFS= read -r rec2; do
+      IFS=$'\x1f' read -r vuuid vname vdev vid <<<"$rec2"
+      [[ -n "$vuuid" ]] && up_vlan+=("${vdev:-$vname}"$'\x1f'"$vuuid")
+    done < <(bm::nm::vlan_cons "$d")
+  done
+
+  local failed=0
+  local -a done_del=() done_up=() done_rel=()
+  for d in "${del_vlan[@]}" "${del_bond[@]}"; do
+    [[ -n "$d" ]] || continue
+    if bm::nm::device_delete "$d" >/dev/null 2>&1; then
+      done_del+=("$d")
+    else
+      bm::ckpt::_problem "could not delete $d, which the change created - retry with: nmcli device delete $d"
+      failed=1
+    fi
+  done
+  for d in "${release[@]}"; do
+    [[ -n "$d" ]] || continue
+    if bm::nm::device_disconnect "$d" >/dev/null 2>&1; then
+      done_rel+=("$d")
+    else
+      bm::ckpt::_problem "could not take $d out of its bond - retry with: nmcli device disconnect $d"
+      failed=1
+    fi
+  done
+  local -A upped=()
+  local uuid
+  for rec in "${up_bond[@]}" "${up_port[@]}" "${up_vlan[@]}"; do
+    [[ -n "$rec" ]] || continue
+    d="${rec%%$'\x1f'*}" uuid="${rec#*$'\x1f'}"
+    [[ -z "${upped[$uuid]:-}" ]] || continue
+    upped[$uuid]=1
+    if [[ "$(bm::nm::con_get "$uuid" connection.autoconnect)" == no ]]; then
+      bm::log::say "left down (its profile does not start by itself): $d"
+      continue
+    fi
+    if bm::nm::up "$uuid" >/dev/null 2>&1; then
+      done_up+=("$d")
+    else
+      bm::ckpt::_problem "could not bring $d up again with the restored settings - retry with: nmcli connection up $uuid"
+      failed=1
+    fi
+  done
+  if (( ${#done_del[@]} > 0 )); then
+    bm::log::say "removed what the change created: $(bm::core::join ', ' "${done_del[@]}")"
+  fi
+  if (( ${#done_rel[@]} > 0 )); then
+    bm::log::say "taken out of their bond again: $(bm::core::join ', ' "${done_rel[@]}")"
+  fi
+  if (( ${#done_up[@]} > 0 )); then
+    bm::log::say "brought up again: $(bm::core::join ', ' "${done_up[@]}")"
+  fi
+  (( ! failed ))
 }

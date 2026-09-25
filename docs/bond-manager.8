@@ -542,6 +542,9 @@ runs
 .B bond\-manager rollback
 against the pre-change snapshot unless it is cancelled in time by
 .BR commit .
+After restoring the profiles it brings the affected bonds, their ports and
+VLANs up again with the restored settings, and deletes a bond or VLAN the
+change created, so a change that cut the session is really undone.
 .TP
 .B Tier 3: snapshot
 A tar snapshot of all connection profiles in both stores, with a manifest.

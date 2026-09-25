@@ -108,11 +108,20 @@ systemd-run --collect --unit bond-manager-deadman-<pid>-<epoch> \
 minute after its deadline, long after the operator was told the change
 would be undone.
 
-If you never commit, the timer fires and restores the pre-change snapshot,
-then reloads NetworkManager. `commit` stops the timer unit. This tier
-survives losing your session (systemd runs the rollback), but it is weaker
-than tier 1: the rollback is profile-level (snapshot restore + reload), and
-it depends on the timer actually firing on a functioning system.
+If you never commit, the timer fires, restores the pre-change snapshot,
+reloads NetworkManager, and then **puts the running network back** (see
+[Re-applying after a restore](#re-applying-after-a-restore)): a reload
+alone only re-reads the profiles, and an active bond would keep running
+with the settings that cut you off. `commit` stops the timer unit. This
+tier survives losing your session (systemd runs the rollback), but it is
+weaker than tier 1: it rebuilds the pre-change state from the saved
+profiles instead of NetworkManager restoring its own, and it depends on the
+timer actually firing on a functioning system.
+
+The rollback runs as the timer's own service, `<unit>.service`. Disarming
+the change from there stops only `<unit>.timer`: stopping the service would
+make systemd kill every process of the unit, the rollback included, before
+anything was restored. (Versions before 3.1 did exactly that.)
 
 The timer runs bond-manager from systemd, with no shell and no working
 directory, so the tool refuses to arm a deadman timer unless the path it
@@ -222,7 +231,12 @@ deadline=1787921730
 created=2026-08-25T14:15:30+0000
 pid=41337
 summary=create bond bond0 (802.3ad, members ens1f0,ens1f1)
+affected=bond0 ens1f0 ens1f1
 ```
+
+`affected` lists the devices the change touches, which a rollback re-applies
+(see below). State written by 3.0 has no such line; rolling that back
+restores the saved profiles and says to re-apply them by hand.
 
 Because the state is on disk, **commit and rollback work from a brand-new
 session** after a disconnect:
@@ -251,7 +265,37 @@ profiles. With no snapshots at all, the command stops with a precondition
 error (exit 3) instead of a confusing failure.
 
 A deadman timer that fires when nothing is pending — because the operator
-already committed or rolled back — logs that fact and does nothing.
+already committed or rolled back — logs that fact and does nothing. One
+armed for a different snapshot than the waiting change's does nothing
+either: that change has its own timer.
+
+### Re-applying after a restore
+
+A snapshot restore brings back the saved profiles, and NetworkManager's
+reload re-reads them, but connections that are already active keep running
+with whatever the change applied. Whenever a *pending change* is undone
+from its snapshot (the deadman timer, `rollback`, `U` at the gate, a failed
+step or verification on tiers 2 and 3, or a checkpoint that had already
+expired), bond-manager therefore compares the profiles of the `affected`
+devices before and after the restore, and then:
+
+1. deletes a VLAN or bond device whose profile the restore removed (the
+   change created it), VLANs first;
+2. takes a port out of its bond when the restore removed its profile (the
+   change added it) and NetworkManager has not already done so;
+3. brings up every profile the restore brought back or changed, bonds
+   first, then all of their ports and VLANs (NetworkManager does not
+   reliably re-attach them to a re-activated bond), then other ports and
+   VLANs.
+
+Profiles the restore did not change are left alone, so undoing a VLAN add
+deletes the VLAN without bouncing the bond under your session. A profile
+with `connection.autoconnect no` is left down. Every failure is shown (not
+only logged) with the command to retry, and the rollback exits non-zero.
+
+`rollback --snapshot ID` and `snapshot restore` of a *named* snapshot stay
+profile-level: they say that running connections keep their settings until
+brought up again.
 
 One honest caveat: `/run` is tmpfs. A reboot clears the pending state (and
 any checkpoint/timer with it). After a reboot, work from
@@ -406,7 +450,7 @@ prunable snapshots plus the pinned one, rather than nine.
 | Plan step fails mid-apply | Engine rolls back through the armed tier | Pre-change state, exit 5 |
 | Verification fails | Same | Pre-change state, exit 5 |
 | Change severs your SSH session — tier 1 | NM checkpoint expires server-side | NM restores device + profile state at the deadline; run `rollback` afterwards to clear the pending state |
-| Change severs your SSH session — tier 2 | Deadman timer | systemd runs `bond-manager rollback --snapshot ID`; profiles restored, NM reloaded |
+| Change severs your SSH session — tier 2 | Deadman timer | systemd runs `bond-manager rollback --snapshot ID --deadman`; profiles restored, NM reloaded, and the affected bond, ports and VLANs brought up again with the restored settings (a bond the change created is deleted) |
 | Change severs your SSH session — tier 3 | Guard refused this upfront (unless `--force-unsafe`) | You need console access; run `bond-manager rollback` there |
 | bond-manager process killed (SIGKILL, OOM) mid-window | Protection is armed *outside* the process | Checkpoint/timer fires at deadline; or commit/rollback from a new session via the state file |
 | Operator walks away without confirming | Auto-rollback deadline | Change reverted (tier 1/2); tier 3 waits for a manual decision |

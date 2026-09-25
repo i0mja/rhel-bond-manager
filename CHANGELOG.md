@@ -97,6 +97,19 @@ schema are unchanged.
 
 ### Fixed
 
+- **The deadman timer (tier 2) never undid anything.** Its rollback
+  disarmed the change by stopping `<unit>.service`, which is the service
+  running that very rollback, so systemd killed it before the snapshot was
+  restored. It now stops only the timer.
+- **A rollback from the snapshot left the running network as the change
+  set it** (tiers 2 and 3, and a checkpoint that had already expired).
+  NetworkManager's reload only re-reads profiles, so a change that cut the
+  SSH session stayed live. The pending state now records the devices a
+  change touches (`affected=`), and after the restore bond-manager deletes
+  what the change created and brings the restored bonds, their ports and
+  VLANs up again, showing any failure with the command to retry. Profiles
+  the restore did not change are left alone. See *Re-applying after a
+  restore* in docs/SAFETY.md.
 - **Deadman tier: an unanswered change was never undone.** When the
   countdown ran out at the interactive prompt, the gate announced "the
   change has been reverted" and cleared the pending state. The deadman

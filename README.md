@@ -429,7 +429,7 @@ available tier:
 | Tier | Mechanism | When it applies | If you never confirm |
 |---|---|---|---|
 | 1 `checkpoint` | NetworkManager D-Bus checkpoint (`CheckpointCreate` via `busctl`) | busctl present and NM answers on D-Bus (default on RHEL 8/9) | NM itself reverts device **and** profile state server-side — safe even if the change killed your SSH session |
-| 2 `deadman` | Transient systemd timer running `bond-manager rollback --snapshot ID` | No usable NM checkpoint (or `--no-checkpoint`), but `systemd-run` exists | The timer fires at the deadline and restores the snapshot |
+| 2 `deadman` | Transient systemd timer running `bond-manager rollback --snapshot ID` | No usable NM checkpoint (or `--no-checkpoint`), but `systemd-run` exists | The timer fires at the deadline, restores the snapshot and brings the affected connections up again with it |
 | 3 `snapshot` | tar snapshot only | Neither busctl nor systemd-run available | Nothing automatic — rollback is a manual `bond-manager rollback` |
 
 The auto-rollback window defaults to `ROLLBACK_WINDOW=120` seconds

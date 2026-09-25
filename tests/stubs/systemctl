@@ -2,10 +2,17 @@
 # systemctl PATH-shim.
 #   is-active [--quiet] NetworkManager -> rc $BM_STUB_NM_ACTIVE_RC (default 0)
 #   stop / reset-failed                -> rc 0
+#   stop $BM_STUB_SYSTEMCTL_SELF.service -> kills the caller: a command run
+#       inside a systemd unit that stops its own service is stopped with it
 set -u
 
 if [[ -n "${BM_TEST_CALLS:-}" ]]; then
   printf 'systemctl %s\n' "$*" >>"$BM_TEST_CALLS"
+fi
+
+if [[ -n "${BM_STUB_SYSTEMCTL_SELF:-}" && "$*" == "stop ${BM_STUB_SYSTEMCTL_SELF}.service" ]]; then
+  kill -TERM "$PPID" 2>/dev/null || true
+  exit 0
 fi
 
 case "$*" in

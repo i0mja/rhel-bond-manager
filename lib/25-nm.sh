@@ -227,6 +227,29 @@ bm::nm::delete() { bm::nm::run connection delete "$1"; }
 
 bm::nm::reload() { bm::nm::run connection reload; }
 
+bm::nm::device_delete() { bm::nm::run device delete "$1"; } # software devices only
+
+bm::nm::device_disconnect() { bm::nm::run device disconnect "$1"; }
+
+# Every profile with the interface it binds to: lines
+# "ifname<US>uuid<US>type<US>active-device".
+bm::nm::ifname_index() {
+  local rec uuid name type dev ifname
+  while IFS= read -r rec; do
+    IFS=$'\x1f' read -r uuid name type dev <<<"$rec"
+    ifname="$(bm::nm::con_get "$uuid" connection.interface-name)"
+    printf '%s\x1f%s\x1f%s\x1f%s\n' "${ifname:-$dev}" "$uuid" "$type" "$dev"
+  done < <(bm::nm::con_list)
+}
+
+# A profile's settings, for telling whether it changed: the lower-case
+# setting lines only (upper-case sections are runtime state), without the
+# activation timestamp.
+bm::nm::con_settings() { # con_settings <uuid>
+  nmcli -t connection show "$1" 2>/dev/null \
+    | grep -v -e '^[A-Z]' -e '^connection\.timestamp[:=]' | LC_ALL=C sort || true
+}
+
 # Build the nmcli property arguments for an IP spec and store them in the
 # global array BM_NM_IP_ARGS. family: 4|6; method: dhcp|auto|none|static.
 bm::nm::ip_args() { # ip_args <4|6> <method> <addrs> <gw> <dns>

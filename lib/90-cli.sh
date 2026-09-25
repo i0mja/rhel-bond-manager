@@ -950,6 +950,10 @@ bm::cli::cmd_rollback() {
   # The deadman timer runs this from systemd while the operator's session may
   # still hold the lock in the commit gate; that race is resolved by whoever
   # gets the lock first, so the deadman waits rather than acting concurrently.
+  if (( deadman )); then
+    # this process IS the timer's service: disarming must not stop it
+    BM_CKPT_IN_DEADMAN=1
+  fi
   bm::lock::acquire
   (( deadman )) && bm::log::warn "DEADMAN rollback fired — the operator never confirmed the change"
 
@@ -962,13 +966,20 @@ bm::cli::cmd_rollback() {
     bm::log::info "deadman: no pending change remains; nothing to roll back"
     return "$BM_EX_OK"
   fi
+  if (( deadman )); then
+    if [[ -n "$snapshot" && "$snapshot" != "${BM_PENDING_SNAPSHOT:-}" ]]; then
+      bm::log::warn "deadman: armed for snapshot $snapshot, but the waiting change is protected by snapshot ${BM_PENDING_SNAPSHOT:-?}; leaving it to its own timer"
+      return "$BM_EX_OK"
+    fi
+    snapshot="" # undo the waiting change as a whole: restore and re-apply
+  fi
 
   if [[ -z "$snapshot" ]] && (( had_pending )); then
     if bm::ckpt::rollback_pending; then
       bm::log::say "$(bm::core::c_ok "pending change rolled back")"
       return "$BM_EX_OK"
     fi
-    bm::core::die "rollback of pending change failed — inspect manually" "$BM_EX_ERR"
+    bm::core::die "the rollback of the pending change reported problems (see above) — inspect manually" "$BM_EX_ERR"
   fi
 
   [[ -n "$snapshot" ]] || snapshot="$(bm::snap::latest)"
@@ -994,6 +1005,7 @@ bm::cli::cmd_rollback() {
   fi
 
   bm::snap::restore "$snapshot"
+  bm::log::say "The saved profiles are back. Running connections keep their current settings until they are brought up again (nmcli connection up NAME)."
   return "$BM_EX_OK"
 }
 

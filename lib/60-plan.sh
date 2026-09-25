@@ -240,6 +240,8 @@ bm::plan::apply() {
   snap="$(bm::snap::create "$op")" || \
     bm::core::die "snapshot creation failed — aborting before any change" "$BM_EX_ERR"
   bm::log::say "snapshot: $snap"
+  # saved with the pending state: a rollback re-applies these connections
+  BM_CKPT_AFFECTED="${BM_PLAN_AFFECTED[*]:-}"
   bm::ckpt::arm "$window" "$snap" "$summary"
   if [[ "$BM_CKPT_TIER" != "$tier" ]]; then
     # arming fell back a tier; re-check the ssh guard under the real tier.
@@ -256,9 +258,13 @@ bm::plan::apply() {
   local failed_step=""
   if ! failed_step="$(bm::plan::execute)"; then
     bm::log::say "$(bm::core::c_err "step $((failed_step + 1)) failed — rolling back")"
-    bm::ckpt::rollback_pending || bm::log::warn "rollback reported problems; inspect manually"
-    bm::log::say "rolled back to snapshot $snap"
-    bm::log::say "Your network is back the way it was: the failed step above left nothing half-done."
+    if bm::ckpt::rollback_pending; then
+      bm::log::say "rolled back to snapshot $snap"
+      bm::log::say "Your network is back the way it was: the failed step above left nothing half-done."
+    else
+      bm::log::say "rolled back to snapshot $snap"
+      bm::log::warn "rollback reported problems (see above); inspect manually"
+    fi
     BM_PLAN_OUTCOME=rolled-back
     return "$BM_EX_VERIFY"
   fi
@@ -272,9 +278,13 @@ bm::plan::apply() {
 
   if bm::verify::failed; then
     bm::log::say "$(bm::core::c_err "verification FAILED — rolling back")"
-    bm::ckpt::rollback_pending || bm::log::warn "rollback reported problems; inspect manually"
-    bm::log::say "rolled back to snapshot $snap"
-    bm::log::say "Your network is back the way it was. The FAIL lines above say what did not check out."
+    if bm::ckpt::rollback_pending; then
+      bm::log::say "rolled back to snapshot $snap"
+      bm::log::say "Your network is back the way it was. The FAIL lines above say what did not check out."
+    else
+      bm::log::say "rolled back to snapshot $snap"
+      bm::log::warn "rollback reported problems (see above); inspect manually"
+    fi
     BM_PLAN_OUTCOME=rolled-back
     return "$BM_EX_VERIFY"
   fi
