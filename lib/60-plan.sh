@@ -433,9 +433,19 @@ bm::plan::_gate_report_settled() { # -> rc of the gate
       BM_PLAN_OUTCOME=rolled-back
       bm::log::say "$(bm::core::c_warn "The change was undone from another session.")"
       return "$BM_EX_VERIFY" ;;
-    restored)
+    restored | restoring)
       BM_PLAN_OUTCOME=rolled-back
-      bm::log::say "$(bm::core::c_warn "A backup copy was restored from another session; this change is no longer waiting.")"
+      bm::log::say "$(bm::core::c_warn "Another session is restoring a backup copy over this change, so it is no longer waiting. That session shows the result.")"
+      return "$BM_EX_VERIFY" ;;
+    lost)
+      BM_PLAN_OUTCOME=lost
+      bm::log::say "$(bm::core::c_err "Another session tried to keep it, but NetworkManager's checkpoint had already expired: the change has most likely been undone.")"
+      bm::log::say "Check with: $BM_PROG status"
+      return "$BM_EX_VERIFY" ;;
+    undone-partly | timer-partly)
+      if [[ "$BM_GATE_SETTLED" == timer-partly ]]; then BM_PLAN_OUTCOME=expired; else BM_PLAN_OUTCOME=rolled-back; fi
+      bm::log::say "$(bm::core::c_err "The saved settings were restored, but bringing the connections back up reported problems.")"
+      bm::log::say "Check with: $BM_PROG status   (the details are in the other session, or: journalctl -t bond-manager)"
       return "$BM_EX_VERIFY" ;;
     *)
       BM_PLAN_OUTCOME=gone
@@ -458,6 +468,25 @@ bm::plan::_gate_claim() { # _gate_claim <snapshot-id> [wait-seconds]
     return 1
   fi
   return 0
+}
+
+# At the deadline: take the lock, however long another session keeps it
+# (a restore waiting at its own question, say). Acting without it would
+# race the deadman timer or pull pending.state from under its holder.
+# rc 0 = go ahead (lock held), 1 = settled meanwhile (reported).
+bm::plan::_gate_claim_deadline() { # _gate_claim_deadline <snapshot-id>
+  local crc said=0
+  while :; do
+    crc=0
+    bm::plan::_gate_claim "$1" 10 || crc=$?
+    case "$crc" in
+      0 | 1) return "$crc" ;;
+    esac
+    if (( ! said )); then
+      bm::log::say "Time is up; waiting for another bond-manager on this server to finish first..."
+      said=1
+    fi
+  done
 }
 
 # Interactive commit gate: count down toward the auto-rollback deadline.
@@ -492,9 +521,10 @@ bm::plan::commit_gate() {
       remaining=999999 # no timer armed; purely manual decision
     fi
     if (( remaining <= 0 )); then
-      # the deadman timer may be restoring right now: wait for it
+      # the deadman timer (or another session) may be acting right now:
+      # wait for the lock, however long that takes - never act without it
       crc=0
-      bm::plan::_gate_claim "$snap" 120 || crc=$?
+      bm::plan::_gate_claim_deadline "$snap" || crc=$?
       if (( crc == 1 )); then return "$BM_GATE_RC"; fi
       bm::plan::_gate_expired "$snap"
       return $?
@@ -584,7 +614,7 @@ bm::plan::_gate_fancy() { # _gate_fancy <snapshot-id>
       bm::ui::_raw_off
       bm::ui::_commit_block
       crc=0
-      bm::plan::_gate_claim "$snap" 120 || crc=$?
+      bm::plan::_gate_claim_deadline "$snap" || crc=$?
       if (( crc == 1 )); then return "$BM_GATE_RC"; fi
       bm::plan::_gate_expired "$snap"
       return $?

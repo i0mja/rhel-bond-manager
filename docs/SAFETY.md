@@ -67,8 +67,14 @@ Notes on ordering that matter:
   it acts on K, U or E, and checks every second whether the change was
   settled elsewhere. If it was — kept or undone from another session, or
   undone by the deadman timer — it says which and exits (0 when kept, 5
-  when undone). `commit` and `rollback` leave that answer in
-  `/run/bond-manager/settled` for it.
+  otherwise). `commit` and `rollback` leave that answer in
+  `/run/bond-manager/settled` for it, and only once it is final: `kept`
+  (the checkpoint was really destroyed), `lost` (it had already expired),
+  `undone` or `timer` (with `-partly` when bringing the connections back
+  up failed; pending.state stays until that has been tried), and
+  `restoring` / `restored` for a backup copy restored over the change. At
+  the deadline the gate waits for the lock however long another session
+  holds it: it never acts without it.
 
 ## The three protection tiers
 

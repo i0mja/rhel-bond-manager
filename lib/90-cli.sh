@@ -1032,12 +1032,15 @@ bm::cli::cmd_rollback() {
   # disarm it first so nothing fires later on top of the restored profiles.
   if (( had_pending )); then
     bm::log::warn "disarming pending change protection before an explicit snapshot restore"
-    BM_CKPT_SETTLE_AS=restored
+    # "restoring", not "restored": the restore has not happened yet, and a
+    # gate waiting on this change reads the marker right away
+    BM_CKPT_SETTLE_AS=restoring
     bm::ckpt::commit >/dev/null 2>&1 || true
     BM_CKPT_SETTLE_AS=""
   fi
 
   bm::snap::restore "$snapshot"
+  if (( had_pending )); then bm::ckpt::_mark_settled restored; fi
   bm::log::say "The saved profiles are back. Running connections keep their current settings until they are brought up again (nmcli connection up NAME)."
   return "$BM_EX_OK"
 }

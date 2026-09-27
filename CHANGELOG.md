@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waits without the lock (the pending change still blocks any new one),
   takes it back before acting on K, U or E, and when the change is kept or
   undone elsewhere — or undone by the deadman timer — it says so and exits.
+  It never reports more than happened: a keep whose checkpoint had already
+  expired is "most likely undone", an undo whose connections would not come
+  back up says so, a backup copy being restored over the change is not
+  called finished, and at the deadline the gate waits for a lock another
+  session holds instead of acting without it.
 - **`-n bundle` and a support bundle in practice mode wrote the bundle**
   (and turned on file logging), although `-n` promises to write nothing.
   They now say where the bundle would go and what it would contain.

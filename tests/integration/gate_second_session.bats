@@ -87,3 +87,48 @@ gate_screen() {
   assert_contains "$screen" "The safety net undid the change: its time ran out."
   assert_contains "$screen" "PTY-EXIT 5"
 }
+
+@test "second session: keeping a change whose checkpoint had expired is not reported as kept" {
+  require_root
+  start_at_gate plain 3
+  BM_STUB_CKPT_DESTROY_RC=1 run "$BM_ARTIFACT" commit
+  [ "$status" -eq 5 ]
+  gate_screen
+  assert_contains "$screen" "checkpoint had already expired"
+  assert_not_contains "$screen" "kept from another session"
+  assert_contains "$screen" "PTY-EXIT 5"
+}
+
+@test "second session: restoring a backup copy over the waiting change is reported as such" {
+  require_root
+  start_at_gate plain 3
+  local snap
+  snap="$(sed -n 's/^snapshot=//p' "$BM_RUN_DIR/pending.state")"
+  run "$BM_ARTIFACT" rollback --snapshot "$snap" --yes
+  [ "$status" -eq 0 ]
+  gate_screen
+  assert_contains "$screen" "restoring a backup copy over this change"
+  assert_contains "$screen" "PTY-EXIT 5"
+  grep -q "how=restored$" "$BM_RUN_DIR/settled"
+}
+
+@test "deadline while another session holds the lock: the gate waits, it never acts without it" {
+  require_root
+  timeout 90 "$PTY" @expect:"Apply this plan?" 'y\r' @wait:40 -- \
+    env TERM=xterm LANG=C LC_ALL=C "$BM_ARTIFACT" --plain --rollback-window 10 modify bond0 --opt miimon=50 \
+    >"$BATS_TEST_TMPDIR/gate.out" 2>&1 &
+  GATE_PID=$!
+  local i
+  for i in $(seq 300); do
+    [[ -f "$BM_RUN_DIR/pending.state" ]] && flock -n "$BM_RUN_DIR/lock" true 2>/dev/null && break
+    sleep 0.1
+  done
+  exec 9>"$BM_RUN_DIR/lock"
+  flock 9                                  # another session holds the lock...
+  sleep 14                                 # ...past the 10 s deadline
+  [ -f "$BM_RUN_DIR/pending.state" ]       # the gate did not act without it
+  exec 9>&-
+  gate_screen                              # (the wait message: unit test)
+  assert_contains "$screen" "the change has been reverted"
+  assert_contains "$screen" "PTY-EXIT 5"
+}

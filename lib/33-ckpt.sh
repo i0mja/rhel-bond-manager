@@ -190,7 +190,10 @@ bm::ckpt::load_pending() {
 bm::ckpt::clear_pending() { rm -f "$(bm::ckpt::state_file)"; }
 
 # How the last waiting change ended, for a commit gate still waiting on it
-# in another process: "snapshot=<id> how=kept|undone|timer|restored".
+# in another process: "snapshot=<id> how=<how>", where how is kept, lost
+# (the checkpoint had expired), undone or timer (each with "-partly" when
+# bringing the connections back up failed), restoring or restored (a
+# backup copy replaced the change).
 BM_CKPT_SETTLE_AS="" # overrides "kept" when a commit only disarms (a restore)
 bm::ckpt::settled_file() { printf '%s/settled' "$BM_RUN_DIR"; }
 bm::ckpt::_mark_settled() { # _mark_settled <how>
@@ -267,8 +270,12 @@ bm::ckpt::commit() {
       [[ -n "$BM_PENDING_UNIT" ]] && bm::ckpt::deadman_cancel "$BM_PENDING_UNIT"
       ;;
   esac
-  # the marker first: a gate watching for pending.state to go must find it
-  bm::ckpt::_mark_settled "${BM_CKPT_SETTLE_AS:-kept}"
+  # the marker first: a gate watching for pending.state to go must find it.
+  # "kept" only when the checkpoint was really destroyed: a lost one means
+  # NetworkManager has most likely rolled the change back already.
+  local how="${BM_CKPT_SETTLE_AS:-kept}"
+  if (( rc != 0 )); then how=lost; fi
+  bm::ckpt::_mark_settled "$how"
   bm::ckpt::clear_pending
   if (( rc == 0 )); then
     bm::log::info "committed pending change (tier=$BM_PENDING_TIER)"
@@ -304,12 +311,17 @@ bm::ckpt::rollback_pending() {
     fi
     bm::snap::restore "$BM_PENDING_SNAPSHOT"
     ok=1
-    bm::ckpt::_mark_settled "$how"
-    bm::ckpt::clear_pending
+    # pending.state stays until the connections are back up: a gate waiting
+    # in another session must not report the undo before it is finished,
+    # nor as clean when bringing them back failed
     if (( ${#devs[@]} > 0 )); then
-      bm::ckpt::reapply "$before" || ok=0
+      if ! bm::ckpt::reapply "$before"; then
+        ok=0
+        how+="-partly"
+      fi
     else
       bm::ckpt::_problem "the saved settings are restored, but this change did not record which connections it touched (it was armed by an older version): running connections keep their settings until brought up again, e.g. nmcli connection up NAME"
+      how+="-partly"
     fi
   fi
   bm::ckpt::_mark_settled "$how"

@@ -233,3 +233,26 @@ leave_pending() { # leave_pending <answers> <command...>: apply, stop at the gat
   assert_not_called '^nmcli .*connection up'
   assert_contains "$output" "nmcli connection up"
 }
+
+@test "deadman with a failed re-apply: a gate still waiting reports the problem, not a clean undo" {
+  require_root
+  python3 -c 'import pty' 2>/dev/null || skip "needs python3 with the pty module"
+  timeout 90 "$TESTS_DIR/tools/pty-drive" @expect:"Apply this plan?" 'y\r' @wait:4 -- \
+    env TERM=xterm LANG=C LC_ALL=C "$BM_ARTIFACT" --plain modify bond0 --opt miimon=250 \
+    >"$BATS_TEST_TMPDIR/gate.out" 2>&1 &
+  local gate=$! i
+  for i in $(seq 300); do
+    [[ -f "$BM_RUN_DIR/pending.state" ]] && flock -n "$BM_RUN_DIR/lock" true 2>/dev/null && break
+    sleep 0.1
+  done
+  export BM_STUB_NMCLI_FAIL_RE="connection up $BOND0"
+  fire_deadman
+  [ "$status" -ne 0 ]
+  grep -q 'how=timer-partly$' "$BM_RUN_DIR/settled"
+  wait "$gate" || true
+  local screen
+  screen="$(tr -d '\r' <"$BATS_TEST_TMPDIR/gate.out")"
+  assert_contains "$screen" "bringing the connections back up reported problems"
+  assert_contains "$screen" "PTY-EXIT 5"
+}
+

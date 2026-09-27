@@ -1833,7 +1833,10 @@ bm::ckpt::load_pending() {
 bm::ckpt::clear_pending() { rm -f "$(bm::ckpt::state_file)"; }
 
 # How the last waiting change ended, for a commit gate still waiting on it
-# in another process: "snapshot=<id> how=kept|undone|timer|restored".
+# in another process: "snapshot=<id> how=<how>", where how is kept, lost
+# (the checkpoint had expired), undone or timer (each with "-partly" when
+# bringing the connections back up failed), restoring or restored (a
+# backup copy replaced the change).
 BM_CKPT_SETTLE_AS="" # overrides "kept" when a commit only disarms (a restore)
 bm::ckpt::settled_file() { printf '%s/settled' "$BM_RUN_DIR"; }
 bm::ckpt::_mark_settled() { # _mark_settled <how>
@@ -1910,8 +1913,12 @@ bm::ckpt::commit() {
       [[ -n "$BM_PENDING_UNIT" ]] && bm::ckpt::deadman_cancel "$BM_PENDING_UNIT"
       ;;
   esac
-  # the marker first: a gate watching for pending.state to go must find it
-  bm::ckpt::_mark_settled "${BM_CKPT_SETTLE_AS:-kept}"
+  # the marker first: a gate watching for pending.state to go must find it.
+  # "kept" only when the checkpoint was really destroyed: a lost one means
+  # NetworkManager has most likely rolled the change back already.
+  local how="${BM_CKPT_SETTLE_AS:-kept}"
+  if (( rc != 0 )); then how=lost; fi
+  bm::ckpt::_mark_settled "$how"
   bm::ckpt::clear_pending
   if (( rc == 0 )); then
     bm::log::info "committed pending change (tier=$BM_PENDING_TIER)"
@@ -1947,12 +1954,17 @@ bm::ckpt::rollback_pending() {
     fi
     bm::snap::restore "$BM_PENDING_SNAPSHOT"
     ok=1
-    bm::ckpt::_mark_settled "$how"
-    bm::ckpt::clear_pending
+    # pending.state stays until the connections are back up: a gate waiting
+    # in another session must not report the undo before it is finished,
+    # nor as clean when bringing them back failed
     if (( ${#devs[@]} > 0 )); then
-      bm::ckpt::reapply "$before" || ok=0
+      if ! bm::ckpt::reapply "$before"; then
+        ok=0
+        how+="-partly"
+      fi
     else
       bm::ckpt::_problem "the saved settings are restored, but this change did not record which connections it touched (it was armed by an older version): running connections keep their settings until brought up again, e.g. nmcli connection up NAME"
+      how+="-partly"
     fi
   fi
   bm::ckpt::_mark_settled "$how"
@@ -5145,9 +5157,19 @@ bm::plan::_gate_report_settled() { # -> rc of the gate
       BM_PLAN_OUTCOME=rolled-back
       bm::log::say "$(bm::core::c_warn "The change was undone from another session.")"
       return "$BM_EX_VERIFY" ;;
-    restored)
+    restored | restoring)
       BM_PLAN_OUTCOME=rolled-back
-      bm::log::say "$(bm::core::c_warn "A backup copy was restored from another session; this change is no longer waiting.")"
+      bm::log::say "$(bm::core::c_warn "Another session is restoring a backup copy over this change, so it is no longer waiting. That session shows the result.")"
+      return "$BM_EX_VERIFY" ;;
+    lost)
+      BM_PLAN_OUTCOME=lost
+      bm::log::say "$(bm::core::c_err "Another session tried to keep it, but NetworkManager's checkpoint had already expired: the change has most likely been undone.")"
+      bm::log::say "Check with: $BM_PROG status"
+      return "$BM_EX_VERIFY" ;;
+    undone-partly | timer-partly)
+      if [[ "$BM_GATE_SETTLED" == timer-partly ]]; then BM_PLAN_OUTCOME=expired; else BM_PLAN_OUTCOME=rolled-back; fi
+      bm::log::say "$(bm::core::c_err "The saved settings were restored, but bringing the connections back up reported problems.")"
+      bm::log::say "Check with: $BM_PROG status   (the details are in the other session, or: journalctl -t bond-manager)"
       return "$BM_EX_VERIFY" ;;
     *)
       BM_PLAN_OUTCOME=gone
@@ -5170,6 +5192,25 @@ bm::plan::_gate_claim() { # _gate_claim <snapshot-id> [wait-seconds]
     return 1
   fi
   return 0
+}
+
+# At the deadline: take the lock, however long another session keeps it
+# (a restore waiting at its own question, say). Acting without it would
+# race the deadman timer or pull pending.state from under its holder.
+# rc 0 = go ahead (lock held), 1 = settled meanwhile (reported).
+bm::plan::_gate_claim_deadline() { # _gate_claim_deadline <snapshot-id>
+  local crc said=0
+  while :; do
+    crc=0
+    bm::plan::_gate_claim "$1" 10 || crc=$?
+    case "$crc" in
+      0 | 1) return "$crc" ;;
+    esac
+    if (( ! said )); then
+      bm::log::say "Time is up; waiting for another bond-manager on this server to finish first..."
+      said=1
+    fi
+  done
 }
 
 # Interactive commit gate: count down toward the auto-rollback deadline.
@@ -5204,9 +5245,10 @@ bm::plan::commit_gate() {
       remaining=999999 # no timer armed; purely manual decision
     fi
     if (( remaining <= 0 )); then
-      # the deadman timer may be restoring right now: wait for it
+      # the deadman timer (or another session) may be acting right now:
+      # wait for the lock, however long that takes - never act without it
       crc=0
-      bm::plan::_gate_claim "$snap" 120 || crc=$?
+      bm::plan::_gate_claim_deadline "$snap" || crc=$?
       if (( crc == 1 )); then return "$BM_GATE_RC"; fi
       bm::plan::_gate_expired "$snap"
       return $?
@@ -5296,7 +5338,7 @@ bm::plan::_gate_fancy() { # _gate_fancy <snapshot-id>
       bm::ui::_raw_off
       bm::ui::_commit_block
       crc=0
-      bm::plan::_gate_claim "$snap" 120 || crc=$?
+      bm::plan::_gate_claim_deadline "$snap" || crc=$?
       if (( crc == 1 )); then return "$BM_GATE_RC"; fi
       bm::plan::_gate_expired "$snap"
       return $?
@@ -7513,12 +7555,15 @@ bm::cli::cmd_rollback() {
   # disarm it first so nothing fires later on top of the restored profiles.
   if (( had_pending )); then
     bm::log::warn "disarming pending change protection before an explicit snapshot restore"
-    BM_CKPT_SETTLE_AS=restored
+    # "restoring", not "restored": the restore has not happened yet, and a
+    # gate waiting on this change reads the marker right away
+    BM_CKPT_SETTLE_AS=restoring
     bm::ckpt::commit >/dev/null 2>&1 || true
     BM_CKPT_SETTLE_AS=""
   fi
 
   bm::snap::restore "$snapshot"
+  if (( had_pending )); then bm::ckpt::_mark_settled restored; fi
   bm::log::say "The saved profiles are back. Running connections keep their current settings until they are brought up again (nmcli connection up NAME)."
   return "$BM_EX_OK"
 }
