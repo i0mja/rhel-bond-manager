@@ -257,3 +257,11 @@ assert_nothing_touched() {
   [ "$status" -eq 0 ]
   assert_contains "$output" "VLAN 42 already exists on bond0"
 }
+
+@test "dry-run bundle: says where it would write and what it would collect, writes nothing" {
+  run_cli -n bundle --redact
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "[dry-run] would write a support bundle to $BM_SUPPORT_DIR/support_<time>.tar.gz (addresses redacted)"
+  [ -z "$(ls -A "$BM_SUPPORT_DIR" 2>/dev/null)" ]
+  [ ! -e "$BM_LOG_FILE" ]
+}

@@ -88,3 +88,12 @@ setup() {
   [ "$BM_PENDING_SNAPSHOT" = "20240101-000000" ]
   [ "$BM_PENDING_SUMMARY" = "modify bond0" ]
 }
+
+@test "deadline: a busy lock is waited for, never skipped" {
+  seed_pending checkpoint 20240101-000000
+  TRIES=0
+  bm::lock::retake() { TRIES=$(( TRIES + 1 )); (( TRIES >= 3 )); }
+  bm::plan::_gate_claim_deadline 20240101-000000 >"$BATS_TEST_TMPDIR/out" 2>&1
+  [ "$TRIES" -eq 3 ]
+  grep -q "waiting for another bond-manager" "$BATS_TEST_TMPDIR/out"
+}

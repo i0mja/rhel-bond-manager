@@ -648,14 +648,21 @@ Success, healthy, or nothing to do.
 Error.
 .TP
 .B 2
-Usage error (unknown command, missing or invalid arguments).
+Usage error (unknown command, missing or invalid arguments, or
+.B help
+with a word it does not know).
 .TP
 .B 3
 Precondition failed (not root, NetworkManager not active, missing tool,
 no pending change, ...).
 .TP
 .B 4
-Locked: another bond\-manager instance is running.
+Locked: another bond\-manager instance is running. (A change waiting at its
+commit gate does not hold the lock, so
+.B commit
+and
+.B rollback
+work from another session.)
 .TP
 .B 5
 The change failed verification and was rolled back.

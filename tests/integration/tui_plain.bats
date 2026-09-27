@@ -356,12 +356,12 @@ stub_bond0_with_gateway() {
   assert_not_contains "$output" "was not accepted"
 }
 
-@test "result: a support bundle made in practice mode is not called 'nothing was changed'" {
-  require_root   # the bundle is written as root
+@test "tools > support bundle in practice mode writes nothing, and says what it would collect" {
   tui 'tools\nbundle\nn\n\nq\nq\n' --dry-run
   [ "$status" -eq 0 ]
-  assert_contains "$output" "support bundle:"
-  assert_not_contains "$output" "nothing was changed"
+  assert_contains "$output" "[dry-run] would write a support bundle"
+  assert_contains "$output" "Practice run finished - nothing was changed."
+  [ -z "$(ls -A "$BM_SUPPORT_DIR" 2>/dev/null)" ]
 }
 
 @test "result: saying no to a snapshot restore is shown as cancelled, not finished" {

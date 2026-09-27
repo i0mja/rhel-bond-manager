@@ -286,6 +286,37 @@ bm::ui::block() { # block <text>
   done <<<"$1"
 }
 
+# Long text one screenful at a time, so its start does not scroll away on
+# consoles with little or no scrollback (a Linux VT, iLO/iDRAC, serial).
+# Only on a terminal: a piped session gets it all at once, as before.
+bm::ui::page() { # page <text>
+  bm::ui::_ensure_init
+  local -a plines=()
+  mapfile -t plines <<<"$1"
+  bm::ui::_size
+  local per=$(( BM_UI_ROWS - 3 )) i=0 ans rc
+  if [[ ! -t 0 ]] || (( per < 5 || ${#plines[@]} <= per + 1 )); then
+    bm::ui::block "$1"
+    return 0
+  fi
+  while (( i < ${#plines[@]} )); do
+    printf '  %s\n' "${plines[@]:i:per}" >&2
+    i=$(( i + per ))
+    (( i < ${#plines[@]} )) || break
+    printf '%s-- more: Enter for the next page, q to stop (%d of %d lines) --%s' \
+      "$BM_S_DIM" "$i" "${#plines[@]}" "$BM_S_RST" >&2
+    rc=0
+    bm::ui::_read_line || rc=$?
+    ans="$BM_UI_LINE"
+    printf '\r\033[K' >&2
+    if (( rc != 0 )) || [[ "${ans,,}" == q* ]]; then
+      (( rc == 1 )) && BM_UI_EOF=1
+      break
+    fi
+  done
+  return 0
+}
+
 # A bordered box. Lines are fitted to the width (never wrap).
 bm::ui::box() { # box [--title T] [--badge B] [--style ok|warn|err|info] -- line...
   bm::ui::_ensure_init
@@ -378,7 +409,9 @@ bm::ui::_raw_on() {
   if [[ -z "$BM_TTY_SAVED" ]]; then
     BM_TTY_SAVED="$(stty -g 2>/dev/null || true)"
   fi
-  stty -echo -icanon min 1 time 0 2>/dev/null || true
+  # susp undef: Ctrl-Z would stop the menus with the cursor hidden and the
+  # terminal raw; the saved settings bring it back when the menus let go
+  stty -echo -icanon min 1 time 0 susp undef 2>/dev/null || true
   printf '\033[?25l' >&2
   BM_TTY_CURSOR_HIDDEN=1
 }
@@ -1360,21 +1393,27 @@ bm::ui::msg() { # msg <text> — show text, then wait for Enter
 
 bm::ui::gate_intro() { # gate_intro <tier>
   bm::ui::_ensure_init
-  local tier="$1"
-  local -a lines=("$BM_S_GREEN$BM_G_OK All checks passed - your change is live.$BM_S_RST" "")
+  local tier="$1" t
+  local -a lines=("$BM_S_GREEN$BM_G_OK All checks passed - your change is live.$BM_S_RST" "") text=()
   if [[ "$tier" == snapshot ]]; then
-    lines+=("Nothing will undo it automatically on this server."
-      "  K  keep it       U  undo it now (restore the backup copy)")
+    text=("Nothing will undo it automatically on this server.")
   else
-    lines+=("If you do nothing, it is UNDONE automatically when the time runs out."
+    text=("If you do nothing, it is UNDONE automatically when the time runs out."
       "That is the safety net: if this change cut your connection, just wait.")
-    lines+=("")
-    if [[ "$tier" == checkpoint ]]; then
-      lines+=("  K  keep it       U  undo it now       E  5 more minutes")
-    else
-      lines+=("  K  keep it       U  undo it now")
-    fi
   fi
+  # wrapped, not cut: on a narrow terminal (a tmux split, a phone) these
+  # sentences are the point of the box
+  bm::ui::width
+  for t in "${text[@]}"; do
+    bm::ui::wrap $(( BM_UI_W - 4 )) "$t"
+    lines+=("${BM_UI_WRAPPED[@]}")
+  done
+  lines+=("")
+  case "$tier" in
+    snapshot) lines+=("  K  keep it       U  undo it now (restore the backup copy)") ;;
+    checkpoint) lines+=("  K  keep it       U  undo it now       E  5 more minutes") ;;
+    *) lines+=("  K  keep it       U  undo it now") ;;
+  esac
   printf '\n' >&2
   bm::ui::box --title "Keep this change?" --style ok -- "${lines[@]}"
   BM_UI_DRAWN=0
@@ -1394,5 +1433,6 @@ bm::ui::gate_status() { # gate_status <seconds-left> <tier> [message]
   elif (( left <= 60 )); then
     col="$BM_S_YELLOW"
   fi
-  bm::ui::_frame "$BM_S_BOLD""Keep this change?$BM_S_RST  [K]eep  [U]ndo$ext   Auto-undo in $col$BM_S_BOLD$BM_UI_FMT$BM_S_RST" "$note"
+  # the countdown first: on a narrow terminal the end of the line is cut
+  bm::ui::_frame "Auto-undo in $col$BM_S_BOLD$BM_UI_FMT$BM_S_RST   ${BM_S_BOLD}[K]eep  [U]ndo$ext$BM_S_RST" "$note"
 }
