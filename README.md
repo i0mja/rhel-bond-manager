@@ -898,7 +898,10 @@ The tour in this README is recorded, not drawn. `make tour` runs the real
 menus in a pseudo-terminal against a fake server (`build/tour/sandbox.sh`),
 saves every screen to `docs/tour/tour.json`, and renders the SVG pictures,
 the README chapters and the click-through page in `docs/tour/index.html`
-(served by GitHub Pages). Recording needs `pip install pyte`;
+(served by GitHub Pages once it is switched on: Settings > Pages > Source:
+GitHub Actions, or store a token with Administration and Pages write
+access as the Actions secret `PAGES_TOKEN` and the "Tour site" workflow
+switches it on itself). Recording needs `pip install pyte`;
 `make tour-render` only re-renders. Run it after changing anything the
 screens show.
 

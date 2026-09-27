@@ -1,9 +1,15 @@
 name: Tour site
 
 # Publishes docs/tour (the click-through tour linked from the README) to
-# GitHub Pages. Pages must be switched on once, by a repository admin:
-# Settings > Pages > Build and deployment > Source: GitHub Actions.
-# Until then this workflow says so and skips the deploy instead of failing.
+# GitHub Pages. Pages has to be switched on once, in either of two ways:
+#   - by hand: Settings > Pages > Build and deployment > Source: GitHub Actions
+#   - by this workflow: store a fine-grained token for this repository with
+#     "Administration: read and write" and "Pages: read and write" as the
+#     Actions secret PAGES_TOKEN, then run this workflow once. The built-in
+#     token cannot create a Pages site; after that first run it can deploy,
+#     and the secret can be deleted.
+# Until one of the two is done, this workflow says so and skips the deploy
+# instead of failing.
 
 on:
   push:
@@ -33,16 +39,28 @@ jobs:
         id: pages
         env:
           GH_TOKEN: ${{ github.token }}
+          HAVE_PAGES_TOKEN: ${{ secrets.PAGES_TOKEN != '' }}
         run: |
           source="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq .build_type 2>/dev/null || true)"
           if [[ "$source" == workflow ]]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "enable=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$HAVE_PAGES_TOKEN" == true ]]; then
+            # switched on below by configure-pages, with the PAGES_TOKEN secret
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "enable=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Tour not published::GitHub Pages is not set to deploy from GitHub Actions. Turn it on under Settings > Pages > Build and deployment > Source: GitHub Actions, then re-run this workflow."
+            echo "::notice title=Tour not published::GitHub Pages is not set to deploy from GitHub Actions. Either turn it on under Settings > Pages > Build and deployment > Source: GitHub Actions, or store a token with Administration and Pages write access as the Actions secret PAGES_TOKEN; then re-run this workflow."
           fi
       - uses: actions/checkout@v4
         if: steps.pages.outputs.enabled == 'true'
+      - name: Switch GitHub Pages on (source GitHub Actions)
+        if: steps.pages.outputs.enable == 'true'
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+          token: ${{ secrets.PAGES_TOKEN }}
       - uses: actions/configure-pages@v5
         if: steps.pages.outputs.enabled == 'true'
       - uses: actions/upload-pages-artifact@v3
