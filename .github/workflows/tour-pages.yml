@@ -1,15 +1,15 @@
 name: Tour site
 
 # Publishes docs/tour (the click-through tour linked from the README) to
-# GitHub Pages. Pages has to be switched on once, in either of two ways:
-#   - by hand: Settings > Pages > Build and deployment > Source: GitHub Actions
-#   - by this workflow: store a fine-grained token for this repository with
-#     "Administration: read and write" and "Pages: read and write" as the
-#     Actions secret PAGES_TOKEN, then run this workflow once. The built-in
-#     token cannot create a Pages site; after that first run it can deploy,
-#     and the secret can be deleted.
-# Until one of the two is done, this workflow says so and skips the deploy
-# instead of failing.
+# GitHub Pages, at https://i0mja.github.io/rhel-bond-manager/. It follows
+# whichever way Pages is set up under Settings > Pages > Build and deployment:
+#   - Source "Deploy from a branch", branch gh-pages (how this repository's
+#     Pages was switched on): docs/tour is committed to the gh-pages branch;
+#   - Source "GitHub Actions": docs/tour is deployed as a Pages artifact;
+#   - Pages off: it is switched on with source "GitHub Actions" when a
+#     fine-grained token with "Administration" and "Pages" write access is
+#     stored as the Actions secret PAGES_TOKEN (the built-in token cannot
+#     create a Pages site); otherwise the run says so and skips.
 
 on:
   push:
@@ -19,54 +19,91 @@ on:
       - '.github/workflows/tour-pages.yml'
   workflow_dispatch:
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
 concurrency:
   group: tour-pages
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
-  deploy:
+  setup:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+    permissions:
+      pages: read
+    outputs:
+      mode: ${{ steps.pages.outputs.mode }}
     steps:
-      - name: Check that GitHub Pages is switched on
+      - name: How is GitHub Pages set up?
         id: pages
         env:
           GH_TOKEN: ${{ github.token }}
           HAVE_PAGES_TOKEN: ${{ secrets.PAGES_TOKEN != '' }}
         run: |
-          source="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq .build_type 2>/dev/null || true)"
-          if [[ "$source" == workflow ]]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "enable=false" >> "$GITHUB_OUTPUT"
-          elif [[ "$HAVE_PAGES_TOKEN" == true ]]; then
-            # switched on below by configure-pages, with the PAGES_TOKEN secret
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "enable=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Tour not published::GitHub Pages is not set to deploy from GitHub Actions. Either turn it on under Settings > Pages > Build and deployment > Source: GitHub Actions, or store a token with Administration and Pages write access as the Actions secret PAGES_TOKEN; then re-run this workflow."
-          fi
+          setup="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.build_type + " " + (.source.branch // "")' 2>/dev/null || true)"
+          case "$setup" in
+            "legacy gh-pages") mode=branch ;;
+            "workflow "*)      mode=actions ;;
+            "")
+              if [[ "$HAVE_PAGES_TOKEN" == true ]]; then mode=enable; else mode=off; fi ;;
+            *)                 mode=other ;;
+          esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          case "$mode" in
+            off)   echo "::notice title=Tour not published::GitHub Pages is off. Turn it on under Settings > Pages (branch gh-pages, or source GitHub Actions), or store a token with Administration and Pages write access as the Actions secret PAGES_TOKEN; then re-run this workflow." ;;
+            other) echo "::notice title=Tour not published::GitHub Pages builds from '${setup}'. Set it to the gh-pages branch or to GitHub Actions for this workflow to publish the tour." ;;
+          esac
+
+  # Source "Deploy from a branch" (gh-pages): GitHub builds the site itself
+  # after the push.
+  branch:
+    needs: setup
+    if: needs.setup.outputs.mode == 'branch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
       - uses: actions/checkout@v4
-        if: steps.pages.outputs.enabled == 'true'
+      - name: Commit docs/tour to the gh-pages branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --depth=1 origin gh-pages
+          git worktree add --detach "$RUNNER_TEMP/site" FETCH_HEAD
+          cd "$RUNNER_TEMP/site"
+          git rm -rq --ignore-unmatch .
+          cp -R "$GITHUB_WORKSPACE/docs/tour/." .
+          touch .nojekyll
+          git add -A
+          if git diff --cached --quiet; then
+            echo "The gh-pages branch already has this tour."
+            exit 0
+          fi
+          git commit -q -m "Publish the click-through tour (docs/tour from main ${GITHUB_SHA::7})"
+          git push origin HEAD:gh-pages
+
+  # Source "GitHub Actions", or switching Pages on with PAGES_TOKEN.
+  deploy:
+    needs: setup
+    if: needs.setup.outputs.mode == 'actions' || needs.setup.outputs.mode == 'enable'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
       - name: Switch GitHub Pages on (source GitHub Actions)
-        if: steps.pages.outputs.enable == 'true'
+        if: needs.setup.outputs.mode == 'enable'
         uses: actions/configure-pages@v5
         with:
           enablement: true
           token: ${{ secrets.PAGES_TOKEN }}
       - uses: actions/configure-pages@v5
-        if: steps.pages.outputs.enabled == 'true'
       - uses: actions/upload-pages-artifact@v3
-        if: steps.pages.outputs.enabled == 'true'
         with:
           path: docs/tour
       - id: deploy
-        if: steps.pages.outputs.enabled == 'true'
         uses: actions/deploy-pages@v4
