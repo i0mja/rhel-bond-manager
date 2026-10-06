@@ -3,8 +3,9 @@ name: Tour site
 # Publishes docs/tour (the click-through tour linked from the README) to
 # GitHub Pages, at https://i0mja.github.io/rhel-bond-manager/. It follows
 # whichever way Pages is set up under Settings > Pages > Build and deployment:
-#   - Source "Deploy from a branch", branch gh-pages (how this repository's
-#     Pages was switched on): docs/tour is committed to the gh-pages branch;
+#   - Source "Deploy from a branch", branch gh-pages, folder / (root) (how
+#     this repository's Pages was switched on): docs/tour is committed to
+#     the gh-pages branch and a Pages build is requested;
 #   - Source "GitHub Actions": docs/tour is deployed as a Pages artifact;
 #   - Pages off: it is switched on with source "GitHub Actions" when a
 #     fine-grained token with "Administration" and "Pages" write access is
@@ -40,31 +41,34 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HAVE_PAGES_TOKEN: ${{ secrets.PAGES_TOKEN != '' }}
         run: |
-          setup="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.build_type + " " + (.source.branch // "")' 2>/dev/null || true)"
+          setup="$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.build_type + " " + (.source.branch // "") + " " + (.source.path // "")' 2>/dev/null || true)"
           case "$setup" in
-            "legacy gh-pages") mode=branch ;;
-            "workflow "*)      mode=actions ;;
+            "legacy gh-pages /") mode=branch ;;
+            "workflow "*)        mode=actions ;;
             "")
               if [[ "$HAVE_PAGES_TOKEN" == true ]]; then mode=enable; else mode=off; fi ;;
-            *)                 mode=other ;;
+            *)                   mode=other ;;
           esac
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           case "$mode" in
             off)   echo "::notice title=Tour not published::GitHub Pages is off. Turn it on under Settings > Pages (branch gh-pages, or source GitHub Actions), or store a token with Administration and Pages write access as the Actions secret PAGES_TOKEN; then re-run this workflow." ;;
-            other) echo "::notice title=Tour not published::GitHub Pages builds from '${setup}'. Set it to the gh-pages branch or to GitHub Actions for this workflow to publish the tour." ;;
+            other) echo "::notice title=Tour not published::GitHub Pages builds from '${setup}'. Set it to the gh-pages branch, folder / (root), or to GitHub Actions for this workflow to publish the tour." ;;
           esac
 
-  # Source "Deploy from a branch" (gh-pages): GitHub builds the site itself
-  # after the push.
+  # Source "Deploy from a branch" (gh-pages, folder / (root)). A push made
+  # with the built-in token is not guaranteed to start a Pages build, so
+  # the build is requested explicitly afterwards.
   branch:
     needs: setup
     if: needs.setup.outputs.mode == 'branch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pages: write
     steps:
       - uses: actions/checkout@v4
       - name: Commit docs/tour to the gh-pages branch
+        id: publish
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -81,6 +85,13 @@ jobs:
           fi
           git commit -q -m "Publish the click-through tour (docs/tour from main ${GITHUB_SHA::7})"
           git push origin HEAD:gh-pages
+          echo "published=true" >> "$GITHUB_OUTPUT"
+      - name: Build the site from the new gh-pages commit
+        if: steps.publish.outputs.published == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/pages/builds" --jq '"Pages build: " + .status'
 
   # Source "GitHub Actions", or switching Pages on with PAGES_TOKEN.
   deploy:
@@ -88,6 +99,7 @@ jobs:
     if: needs.setup.outputs.mode == 'actions' || needs.setup.outputs.mode == 'enable'
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       pages: write
       id-token: write
     environment:
